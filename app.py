@@ -3,28 +3,22 @@ from datetime import date
 
 
 def main():
-    from src.loaders import load_masters
+    from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
     from src.normalize import normalize_products, summarize_replenishment
     from src.dashboard import build_dashboard_frames
 
-    st.set_page_config(page_title="Florit OPS – Reposición & Operativa", layout="wide")
+    st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
     st.title("Florit OPS – Operativa diaria + reposición (amenities)")
 
     with st.expander("📌 Cómo usar", expanded=False):
         st.markdown("""
-**Diario (2 archivos):**
-- Avantio (Entradas)
-- Odoo (stock.quant)
+**Solo 2 archivos diarios:**
+- **Avantio (Entradas)**  
+- **Odoo (stock.quant)**
 
-**Maestros fijos:** se cargan desde `data/` del repo.  
-(En caso de probar cambios, puedes subirlos como override en la barra lateral.)
+Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automáticamente desde `data/` en GitHub.
 """)
-
-    st.sidebar.header("Maestros (opcional override)")
-    zonas_file = st.sidebar.file_uploader("Zonas (override)", type=["xlsx"])
-    apt_alm_file = st.sidebar.file_uploader("Apt↔Almacén (override)", type=["xlsx"])
-    cafe_file = st.sidebar.file_uploader("Café (override)", type=["xlsx"])
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas) .xls/.xlsx/.csv", type=["xls", "xlsx", "csv", "html"])
@@ -34,34 +28,41 @@ def main():
     ref_date = st.sidebar.date_input("Fecha de referencia", value=date.today())
     window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=5)
 
-    # Maestros desde repo (o override)
-    masters = load_masters(zonas_file=zonas_file, apt_alm_file=apt_alm_file, cafe_file=cafe_file)
+    # --- Maestros: SIEMPRE desde repo/data ---
+    masters = load_masters_repo()
+    st.sidebar.success("Maestros cargados desde GitHub ✅")
 
     if not (avantio_file and odoo_file):
         st.info("Sube Avantio + Odoo para generar el dashboard.")
         st.stop()
 
+    # 1) Parse diarios
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
 
+    # 2) Normalización productos (incluye cápsulas)
     odoo_norm = normalize_products(odoo_df)
 
+    # 3) Cruce Avantio → maestros
     ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
 
-    # Avantio → APARTAMENTO (asumimos mismo nombre; si no, luego metemos mapping)
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
+    # 4) Stock por ALMACEN + Amenity
     odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
     stock_by_alm = odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"].sum()
 
+    # 5) Reposición según min/max (desde data/Stock minimo por almacen.xlsx)
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
+    # Unclassified
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
+    # 6) Dashboard
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
         replenishment_df=rep,
@@ -70,6 +71,7 @@ def main():
         unclassified_products=unclassified
     )
 
+    # UI
     c1, c2, c3 = st.columns(3)
     c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
     c2.metric("Salidas hoy", int(dash["kpis"]["salidas_hoy"]))
