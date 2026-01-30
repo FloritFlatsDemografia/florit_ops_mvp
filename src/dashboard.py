@@ -1,10 +1,45 @@
 import pandas as pd
 from datetime import date, timedelta
 from io import BytesIO
+import re
 
 
 def _date_only(ts) -> pd.Series:
     return pd.to_datetime(ts, errors="coerce").dt.date
+
+
+COFFEE_AMENITIES = {
+    "Café molido",
+    "Cápsulas Nespresso",
+    "Cápsulas Tassimo",
+    "Cápsulas Dolce Gusto",
+    "Cápsulas Senseo",
+}
+
+
+def _allowed_coffee_amenity(cafe_tipo: str) -> str | None:
+    """
+    Mapea el CAFE_TIPO del maestro a la familia de café que debe considerarse.
+    Ajustado a valores típicos: Molido / Nespresso / Tassimo / Dolce Gusto.
+    """
+    t = (cafe_tipo or "").strip().lower()
+
+    if t == "":
+        return None
+
+    if "molido" in t:
+        return "Café molido"
+    if "tassimo" in t:
+        return "Cápsulas Tassimo"
+    if "dolce" in t or "gusto" in t:
+        return "Cápsulas Dolce Gusto"
+    if "senseo" in t:
+        return "Cápsulas Senseo"
+    if "nespresso" in t or "colombia" in t:
+        return "Cápsulas Nespresso"
+
+    # fallback conservador: si no sabemos, no filtramos (mejor verlo que esconderlo)
+    return None
 
 
 def build_dashboard_frames(
@@ -30,9 +65,27 @@ def build_dashboard_frames(
     df["Entra_prox"] = (df["entrada_d"] > ref_date) & (df["entrada_d"] <= end_d)
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
 
-    # --- Reposición por ALMACEN ---
+    # =========================================================
+    # REPOSICIÓN: filtrar café por apartamento (ALMACEN)
+    # =========================================================
     rep = replenishment_df.copy()
 
+    # Merge para conocer el CAFE_TIPO por ALMACEN
+    # (cada apartamento tiene un almacén; si hay duplicados, nos vale porque luego agrupamos)
+    rep = rep.merge(df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(), on="ALMACEN", how="left")
+
+    def keep_row(r):
+        amen = r.get("Amenity")
+        if amen not in COFFEE_AMENITIES:
+            return True
+        allowed = _allowed_coffee_amenity(r.get("CAFE_TIPO"))
+        if allowed is None:
+            return True  # no filtramos si no sabemos
+        return amen == allowed
+
+    rep = rep[rep.apply(keep_row, axis=1)].copy()
+
+    # Agregados por ALMACEN
     rep_agg = rep.groupby("ALMACEN", as_index=False).agg(
         faltantes_min=("Faltante_min", "sum"),
         unidades_reponer=("A_reponer", "sum"),
@@ -60,7 +113,7 @@ def build_dashboard_frames(
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
     # =========================================================
-    # 0) PICKING HOY – todo lo que hay que reponer
+    # 0) PICKING HOY
     # =========================================================
     picking_hoy = df[df["unidades_reponer"] > 0].copy()
 
@@ -79,16 +132,10 @@ def build_dashboard_frames(
         picking_hoy["Prioridad"] = picking_hoy.apply(prioridad_picking, axis=1)
         picking_hoy = picking_hoy[
             [
-                "APARTAMENTO",
-                "ZONA",
-                "CAFE_TIPO",
-                "Fecha entrada hora",
-                "Fecha salida hora",
-                "Prioridad",
-                "faltantes_min",
-                "unidades_reponer",
-                "Lista_reponer",
-                "ALMACEN",
+                "APARTAMENTO", "ZONA", "CAFE_TIPO",
+                "Fecha entrada hora", "Fecha salida hora",
+                "Prioridad", "faltantes_min", "unidades_reponer",
+                "Lista_reponer", "ALMACEN",
             ]
         ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
     else:
@@ -97,85 +144,52 @@ def build_dashboard_frames(
             "Prioridad", "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
         ])
 
-    # =========================================================
-    # 1) ENTRADAS HOY
-    # =========================================================
+    # 1) Entradas HOY
     entradas_hoy = df[df["Entra_hoy"]].copy()
-
-    def prioridad_entrada(row):
-        if row["faltantes_min"] > 0:
-            return "1_FALTANTE_MIN"
-        if row["unidades_reponer"] > 0:
-            return "2_REPONER"
-        return "3_OK"
-
     if not entradas_hoy.empty:
-        entradas_hoy["Prioridad"] = entradas_hoy.apply(prioridad_entrada, axis=1)
         entradas_hoy = entradas_hoy[
             [
-                "APARTAMENTO",
-                "ZONA",
-                "CAFE_TIPO",
-                "Fecha entrada hora",
-                "Fecha salida hora",
-                "Prioridad",
-                "faltantes_min",
-                "unidades_reponer",
-                "Lista_reponer",
-                "ALMACEN",
+                "APARTAMENTO", "ZONA", "CAFE_TIPO",
+                "Fecha entrada hora", "Fecha salida hora",
+                "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN",
             ]
-        ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
+        ].sort_values(["faltantes_min", "unidades_reponer"], ascending=False)
     else:
         entradas_hoy = entradas_hoy.reindex(columns=[
-            "APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora",
-            "Prioridad", "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
+            "APARTAMENTO", "ZONA", "CAFE_TIPO",
+            "Fecha entrada hora", "Fecha salida hora",
+            "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
         ])
 
-    # =========================================================
-    # 2) ENTRADAS PRÓXIMAS
-    # =========================================================
+    # 2) Entradas próximas
     entradas_proximas = df[df["Entra_prox"]].copy()
     entradas_proximas = entradas_proximas[
         [
-            "APARTAMENTO",
-            "ZONA",
-            "CAFE_TIPO",
-            "Fecha entrada hora",
-            "Fecha salida hora",
-            "faltantes_min",
-            "unidades_reponer",
-            "Lista_reponer",
-            "ALMACEN",
+            "APARTAMENTO", "ZONA", "CAFE_TIPO",
+            "Fecha entrada hora", "Fecha salida hora",
+            "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN",
         ]
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
-    # =========================================================
-    # 3) OCUPADOS con SALIDA PRÓXIMA
-    # =========================================================
+    # 3) Ocupados con salida próxima
     ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"]].copy()
     ocupados_salida = ocupados_salida[
         [
-            "APARTAMENTO",
-            "ZONA",
-            "CAFE_TIPO",
+            "APARTAMENTO", "ZONA", "CAFE_TIPO",
             "Fecha salida hora",
-            "faltantes_min",
-            "unidades_reponer",
-            "Lista_reponer",
-            "ALMACEN",
+            "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN",
         ]
     ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
 
     # QC
     qc_no_zona = df[df["ZONA"].isna()][["APARTAMENTO"]].drop_duplicates()
     qc_no_almacen = df[df["ALMACEN"].isna()][["APARTAMENTO", "ZONA"]].drop_duplicates()
-
     if unclassified_products is None or unclassified_products.empty:
         qc_unclassified = pd.DataFrame(columns=["ALMACEN", "Producto", "Cantidad"])
     else:
         qc_unclassified = unclassified_products.copy().sort_values(["ALMACEN", "Producto"])
 
-    # Excel export con todo
+    # Excel export
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         picking_hoy.to_excel(writer, index=False, sheet_name="PickingHoy")
@@ -185,8 +199,6 @@ def build_dashboard_frames(
         qc_no_zona.to_excel(writer, index=False, sheet_name="QC_SinZona")
         qc_no_almacen.to_excel(writer, index=False, sheet_name="QC_SinAlmacen")
         qc_unclassified.to_excel(writer, index=False, sheet_name="QC_NoClasificados")
-
-    excel_all = bio.getvalue()
 
     return {
         "kpis": {
@@ -201,5 +213,5 @@ def build_dashboard_frames(
         "qc_no_zona": qc_no_zona,
         "qc_no_almacen": qc_no_almacen,
         "qc_unclassified_products": qc_unclassified,
-        "excel_all": excel_all,
+        "excel_all": bio.getvalue(),
     }
