@@ -55,9 +55,7 @@ def build_dashboard_frames(
 
     df = avantio_df.copy()
 
-    # ---------------------------------------------------------
     # Fechas y estados
-    # ---------------------------------------------------------
     df["entrada_d"] = _date_only(df["Fecha_entrada_dt"])
     df["salida_d"] = _date_only(df["Fecha_salida_dt"])
 
@@ -68,13 +66,11 @@ def build_dashboard_frames(
     end_d = ref_date + timedelta(days=window_days)
     start_prox = ref_date + timedelta(days=1)
 
-    # ✅ Entradas próximas: desde MAÑANA (no incluye hoy)
+    # Entradas próximas: desde mañana
     df["Entra_prox"] = (df["entrada_d"] >= start_prox) & (df["entrada_d"] <= end_d)
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
 
-    # ---------------------------------------------------------
     # Reposición (filtrar café por CAFE_TIPO)
-    # ---------------------------------------------------------
     rep = replenishment_df.copy()
     rep = rep.merge(
         df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(),
@@ -119,40 +115,7 @@ def build_dashboard_frames(
     df["unidades_reponer"] = df["unidades_reponer"].fillna(0)
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
-    # ---------------------------------------------------------
-    # 0) PICKING HOY (SOLO entra hoy o sale hoy)
-    # ---------------------------------------------------------
-    mask_hoy = (df["Entra_hoy"] | df["Sale_hoy"])
-    picking_hoy = df[mask_hoy & (df["unidades_reponer"] > 0)].copy()
-
-    def evento(row):
-        if row["Entra_hoy"]:
-            return "1_ENTRA_HOY"
-        if row["Sale_hoy"]:
-            return "2_SALE_HOY"
-        return ""
-
-    if not picking_hoy.empty:
-        picking_hoy["Evento"] = picking_hoy.apply(evento, axis=1)
-        picking_hoy = picking_hoy[
-            [
-                "APARTAMENTO", "ZONA", "CAFE_TIPO",
-                "Fecha entrada hora", "Fecha salida hora",
-                "Evento", "faltantes_min",
-                "unidades_reponer", "Lista_reponer", "ALMACEN",
-            ]
-        ].sort_values(["Evento", "ZONA", "APARTAMENTO"])
-    else:
-        picking_hoy = picking_hoy.reindex(columns=[
-            "APARTAMENTO", "ZONA", "CAFE_TIPO",
-            "Fecha entrada hora", "Fecha salida hora",
-            "Evento", "faltantes_min",
-            "unidades_reponer", "Lista_reponer", "ALMACEN",
-        ])
-
-    # ---------------------------------------------------------
-    # 1) ENTRADAS HOY
-    # ---------------------------------------------------------
+    # 1) Entradas HOY
     entradas_hoy = df[df["Entra_hoy"] & (df["unidades_reponer"] > 0)].copy()
     entradas_hoy = entradas_hoy[
         [
@@ -162,9 +125,7 @@ def build_dashboard_frames(
         ]
     ].sort_values(["faltantes_min", "unidades_reponer"], ascending=False)
 
-    # ---------------------------------------------------------
-    # 2) ENTRADAS PRÓXIMAS (desde mañana)
-    # ---------------------------------------------------------
+    # 2) Entradas próximas (desde mañana)
     entradas_proximas = df[df["Entra_prox"] & (df["unidades_reponer"] > 0)].copy()
     entradas_proximas = entradas_proximas[
         [
@@ -174,9 +135,7 @@ def build_dashboard_frames(
         ]
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
-    # ---------------------------------------------------------
-    # 3) OCUPADOS con salida próxima
-    # ---------------------------------------------------------
+    # 3) Ocupados con salida próxima
     ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"] & (df["unidades_reponer"] > 0)].copy()
     ocupados_salida = ocupados_salida[
         [
@@ -186,12 +145,9 @@ def build_dashboard_frames(
         ]
     ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
 
-    # ---------------------------------------------------------
-    # Excel (sin QC)
-    # ---------------------------------------------------------
+    # Excel (solo dashboards)
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        picking_hoy.to_excel(writer, index=False, sheet_name="PickingHoy")
         entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas")
         ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalidaProx")
@@ -202,7 +158,6 @@ def build_dashboard_frames(
             "salidas_hoy": int(df["Sale_hoy"].sum()),
             "aptos_con_faltantes": int((rep_join["faltantes_min"] > 0).sum()),
         },
-        "picking_hoy": picking_hoy,
         "entradas_hoy": entradas_hoy,
         "entradas_proximas": entradas_proximas,
         "ocupados_salida_proxima": ocupados_salida,
