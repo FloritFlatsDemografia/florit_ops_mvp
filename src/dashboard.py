@@ -2,6 +2,7 @@ import pandas as pd
 from datetime import date, timedelta
 from io import BytesIO
 import re
+import math
 
 
 def _date_only(ts) -> pd.Series:
@@ -17,13 +18,23 @@ COFFEE_AMENITIES = {
 }
 
 
-def _allowed_coffee_amenity(cafe_tipo: str) -> str | None:
+def _safe_str(x) -> str:
+    # NaN puede venir como float
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, float) and math.isnan(x):
+            return ""
+    except Exception:
+        pass
+    return str(x)
+
+
+def _allowed_coffee_amenity(cafe_tipo) -> str | None:
     """
     Mapea el CAFE_TIPO del maestro a la familia de café que debe considerarse.
-    Ajustado a valores típicos: Molido / Nespresso / Tassimo / Dolce Gusto.
     """
-    t = (cafe_tipo or "").strip().lower()
-
+    t = _safe_str(cafe_tipo).strip().lower()
     if t == "":
         return None
 
@@ -38,7 +49,7 @@ def _allowed_coffee_amenity(cafe_tipo: str) -> str | None:
     if "nespresso" in t or "colombia" in t:
         return "Cápsulas Nespresso"
 
-    # fallback conservador: si no sabemos, no filtramos (mejor verlo que esconderlo)
+    # fallback: si no sabemos, no filtramos (mejor verlo que esconderlo)
     return None
 
 
@@ -71,7 +82,6 @@ def build_dashboard_frames(
     rep = replenishment_df.copy()
 
     # Merge para conocer el CAFE_TIPO por ALMACEN
-    # (cada apartamento tiene un almacén; si hay duplicados, nos vale porque luego agrupamos)
     rep = rep.merge(df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(), on="ALMACEN", how="left")
 
     def keep_row(r):
