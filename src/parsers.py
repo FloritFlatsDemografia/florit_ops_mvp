@@ -9,18 +9,11 @@ def _norm(s: str) -> str:
     s = s.replace("\n", " ")
     s = re.sub(r"\s+", " ", s)
     s = s.lower()
-    s = "".join(
-        c for c in unicodedata.normalize("NFD", s)
-        if unicodedata.category(c) != "Mn"
-    )
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
     return s
 
 
 def _row_score_as_header(values: list[str]) -> int:
-    """
-    Puntúa si una fila parece cabecera de Avantio.
-    Buscamos señales: alojamiento, fecha entrada, fecha salida (o variantes).
-    """
     txt = " | ".join(_norm(v) for v in values if v is not None)
     score = 0
     if "aloj" in txt:
@@ -29,36 +22,26 @@ def _row_score_as_header(values: list[str]) -> int:
         score += 3
     if "salida" in txt and "fecha" in txt:
         score += 3
-
-    # variantes frecuentes
     if "check-in" in txt or "check in" in txt:
         score += 1
     if "check-out" in txt or "check out" in txt:
         score += 1
     if "cliente" in txt:
         score += 1
-
     return score
 
 
 def _promote_best_header_row(df: pd.DataFrame, max_scan_rows: int = 15) -> pd.DataFrame:
-    """
-    Si las columnas son 0..N, buscamos dentro de las primeras filas
-    cuál parece cabecera y la promovemos.
-    """
     if df is None or df.empty:
         return df
 
-    # Si ya hay headers "buenos", no tocar
     cols_norm = [_norm(c) for c in df.columns]
     if any("aloj" in c for c in cols_norm) and any("entrada" in c for c in cols_norm):
         return df
 
-    # Escanear primeras filas
     scan_n = min(len(df), max_scan_rows)
     best_i = None
     best_score = -1
-
     for i in range(scan_n):
         row_vals = df.iloc[i].astype(str).tolist()
         sc = _row_score_as_header(row_vals)
@@ -66,7 +49,6 @@ def _promote_best_header_row(df: pd.DataFrame, max_scan_rows: int = 15) -> pd.Da
             best_score = sc
             best_i = i
 
-    # Si no hay señales suficientes, devolver tal cual
     if best_i is None or best_score < 3:
         return df
 
@@ -74,14 +56,10 @@ def _promote_best_header_row(df: pd.DataFrame, max_scan_rows: int = 15) -> pd.Da
     out = df.iloc[best_i + 1 :].copy()
     out.columns = [str(c).strip() for c in new_cols]
     out = out.reset_index(drop=True)
-
     return out
 
 
 def _find_required_columns(df: pd.DataFrame):
-    """
-    Encuentra columnas equivalentes aunque varíen.
-    """
     cols = list(df.columns)
     norm = {_norm(c): c for c in cols}
 
@@ -103,11 +81,6 @@ def _find_required_columns(df: pd.DataFrame):
 
 
 def _html_tables_to_dfs(raw_html: str) -> list[pd.DataFrame]:
-    """
-    Parser HTML robusto con lxml:
-    - extrae textos de th/td
-    - respeta colspan (repitiendo celdas vacías)
-    """
     root = html.fromstring(raw_html)
     tables = root.xpath("//table")
     dfs = []
@@ -115,7 +88,6 @@ def _html_tables_to_dfs(raw_html: str) -> list[pd.DataFrame]:
     for t in tables:
         rows = []
         max_len = 0
-
         for tr in t.xpath(".//tr"):
             cells = tr.xpath("./th|./td")
             row = []
@@ -126,11 +98,9 @@ def _html_tables_to_dfs(raw_html: str) -> list[pd.DataFrame]:
                     colspan = int(colspan) if colspan else 1
                 except Exception:
                     colspan = 1
-
                 row.append(txt)
                 for _ in range(colspan - 1):
                     row.append("")
-
             if row:
                 max_len = max(max_len, len(row))
                 rows.append(row)
@@ -140,8 +110,6 @@ def _html_tables_to_dfs(raw_html: str) -> list[pd.DataFrame]:
 
         norm_rows = [r + [""] * (max_len - len(r)) for r in rows]
         df = pd.DataFrame(norm_rows)
-
-        # Aquí está la clave: promover la fila correcta como header
         df = _promote_best_header_row(df, max_scan_rows=15)
         dfs.append(df)
 
@@ -155,18 +123,15 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
         raw = uploaded_file.getvalue()
         raw_html = None
         for enc in ("utf-8", "latin1", "cp1252"):
-            try:
-                raw_html = raw.decode(enc, errors="ignore")
+            raw_html = raw.decode(enc, errors="ignore")
+            if raw_html:
                 break
-            except Exception:
-                continue
 
         dfs = _html_tables_to_dfs(raw_html)
-
         if not dfs:
             raise ValueError("Avantio: no se detectaron tablas en el archivo .xls/.html")
 
-        # elegir tabla más probable por score de columnas
+        # elegir la mejor
         best = None
         best_score = -1
         for d in dfs:
@@ -197,7 +162,6 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
             f"Encontradas: alojamiento={c_aloj}, entrada={c_ent}, salida={c_sal}"
         )
 
-    # Renombrar a estándar interno
     df = df.rename(columns={
         c_aloj: "Alojamiento",
         c_ent: "Fecha entrada hora",
@@ -219,6 +183,7 @@ def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
+    # map
     colmap = {}
     for c in df.columns:
         cl = _norm(c)
@@ -241,6 +206,3 @@ def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
 
     df["Ubicación"] = df["Ubicación"].astype(str).str.strip()
     df["Producto"] = df["Producto"].astype(str).str.strip()
-    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
-
-    return df
