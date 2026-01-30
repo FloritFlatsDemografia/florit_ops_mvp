@@ -3,6 +3,7 @@ from datetime import date
 
 
 def main():
+    # Imports internos (para que si hay error se vea bien en Streamlit Cloud)
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
     from src.normalize import normalize_products, summarize_replenishment
@@ -12,27 +13,40 @@ def main():
     st.title("Florit OPS – Operativa diaria + reposición (amenities)")
 
     with st.expander("📌 Cómo usar", expanded=False):
-        st.markdown("""
+        st.markdown(
+            """
 **Sube 2 archivos diarios:**
-- **Avantio (Entradas)**
-- **Odoo (stock.quant)**
+- **Avantio (Entradas)**: .xls / .xlsx / .csv
+- **Odoo (stock.quant)**: .xlsx / .csv
 
-Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automáticamente desde `data/` en GitHub.
-""")
+📌 Los **maestros fijos** se cargan automáticamente desde `data/` en GitHub:
+- Zonas
+- Apt↔Almacén
+- Café por apartamento
+- Stock mínimo/máximo (thresholds)
+"""
+        )
 
-    # Sidebar uploads diarios
+    # Sidebar uploads
     st.sidebar.header("Archivos diarios")
-    avantio_file = st.sidebar.file_uploader("Avantio (Entradas) .xls/.xlsx/.csv", type=["xls", "xlsx", "csv", "html"])
-    odoo_file = st.sidebar.file_uploader("Odoo (stock.quant) .xlsx/.csv", type=["xlsx", "csv"])
+    avantio_file = st.sidebar.file_uploader(
+        "Avantio (Entradas) .xls/.xlsx/.csv",
+        type=["xls", "xlsx", "csv", "html"],
+    )
+    odoo_file = st.sidebar.file_uploader(
+        "Odoo (stock.quant) .xlsx/.csv",
+        type=["xlsx", "csv"],
+    )
 
     st.sidebar.header("Parámetros")
     ref_date = st.sidebar.date_input("Fecha de referencia", value=date.today())
-    window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=5)
+    window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=6)
 
-    # Maestros fijos desde repo/data
+    # Maestros fijos
     masters = load_masters_repo()
     st.sidebar.success("Maestros cargados desde GitHub ✅")
 
+    # Si falta algún diario, paramos
     if not (avantio_file and odoo_file):
         st.info("Sube Avantio + Odoo para generar el dashboard.")
         st.stop()
@@ -41,35 +55,51 @@ Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automá
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
 
-    # Normalización productos Odoo → Amenity
+    # Validación dura (evita NoneType)
+    if odoo_df is None or odoo_df.empty:
+        st.error("Odoo: no se pudieron leer datos del stock.quant (archivo vacío o columnas no detectadas).")
+        st.stop()
+
+    # Normalización Odoo → Amenity
     odoo_norm = normalize_products(odoo_df)
 
     # Map Apt → Almacén
     ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
+    ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # Avantio → APARTAMENTO (nombre) + cruces maestros
+    # Avantio → APARTAMENTO
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
+
+    # Cruces maestros en Avantio
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-    # Stock por almacén
+    # Stock por almacén (desde Odoo)
+    # NOTA: parse_odoo_stock devuelve "Ubicación" como almacén/ubicación
     odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
-    stock_by_alm = odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"].sum()
+    odoo_norm["ALMACEN"] = odoo_norm["ALMACEN"].astype(str).str.strip()
 
-    # Reposición min/max
+    stock_by_alm = (
+        odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"]
+        .sum()
+        .rename(columns={"Cantidad": "Cantidad"})
+    )
+
+    # Reposición min/max (thresholds)
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
     # Productos no clasificados
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
+    # Construcción dashboard
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
         replenishment_df=rep,
         ref_date=ref_date,
         window_days=window_days,
-        unclassified_products=unclassified
+        unclassified_products=unclassified,
     )
 
     # KPIs
@@ -80,7 +110,7 @@ Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automá
 
     st.divider()
 
-    # ✅ BLOQUE 0: PICKING HOY (lo que tú necesitas SIEMPRE)
+    # Bloque 0: Picking (siempre útil)
     st.subheader("0) PICKING HOY – Todo lo que hay que reponer")
     st.dataframe(dash["picking_hoy"], use_container_width=True, height=360)
 
@@ -93,25 +123,25 @@ Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automá
 
     st.divider()
 
-    # BLOQUE 1: Entradas HOY (si hoy hay 0, saldrá vacío y está bien)
+    # Bloque 1: Entradas hoy
     st.subheader("1) PRIMER PLANO – Entradas HOY (prioridad)")
     st.dataframe(dash["entradas_hoy"], use_container_width=True, height=320)
 
     st.divider()
 
-    # BLOQUE 2
+    # Bloque 2: Entradas próximas
     st.subheader("2) ENTRADAS PRÓXIMAS – según ventana")
     st.dataframe(dash["entradas_proximas"], use_container_width=True, height=320)
 
     st.divider()
 
-    # BLOQUE 3
+    # Bloque 3: Ocupados con salida próxima
     st.subheader("3) OCUPADOS con salida próxima – según ventana")
     st.dataframe(dash["ocupados_salida_proxima"], use_container_width=True, height=320)
 
     st.divider()
 
-    # QC
+    # Control de calidad
     st.subheader("Control de calidad")
     a, b = st.columns(2)
     with a:
@@ -125,9 +155,11 @@ Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automá
     st.dataframe(dash["qc_unclassified_products"], use_container_width=True, height=260)
 
 
-try:
-    main()
-except Exception as e:
-    st.set_page_config(page_title="Florit OPS – Error", layout="wide")
-    st.title("⚠️ Error en la app (detalle visible)")
-    st.exception(e)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # Mostrar error completo en Cloud
+        st.set_page_config(page_title="Florit OPS – Error", layout="wide")
+        st.title("⚠️ Error en la app (detalle visible)")
+        st.exception(e)
