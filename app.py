@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, timedelta
-from src.loaders import load_masters
+from datetime import date
+from src.loaders import load_masters_from_uploads
 from src.parsers import parse_avantio_entradas, parse_odoo_stock
 from src.normalize import normalize_products, summarize_replenishment
 from src.dashboard import build_dashboard_frames
@@ -13,11 +13,16 @@ st.title("Florit OPS – Operativa diaria + reposición (amenities)")
 with st.expander("📌 Cómo usar", expanded=False):
     st.markdown("""
 **Inputs diarios (2 archivos):**
-1. **Avantio**: export tipo *Entradas* (como tu `.xls`)
-2. **Odoo**: export `stock.quant` por ubicación/apartamento (tu `.xlsx`)
+1. **Avantio**: export tipo *Entradas* (tu `.xls`)
+2. **Odoo**: export `stock.quant` por ubicación/apartamento
+
+**Maestros (se suben una vez y ya):**
+- Zonas (Agrupación por zona)
+- Apt ↔ Almacén (Apartamentos e Inventarios)
+- Café por apartamento
 
 La app cruza:
-- `Alojamiento` (Avantio) → `APARTAMENTO` (maestro) → `ALMACEN`/`Ubicación` (Odoo)
+- `Alojamiento` (Avantio) → `APARTAMENTO` (maestro) → `ALMACEN` (Odoo)
 - Productos Odoo → **amenities genéricos** (reglas robustas por patrones)
 
 Luego genera 3 bloques:
@@ -26,7 +31,12 @@ Luego genera 3 bloques:
 3) **OCUPADOS con salida próxima**: fuera de grupos con entradas hoy
 """)
 
-st.sidebar.header("Archivos")
+st.sidebar.header("Maestros (obligatorios en Cloud)")
+zonas_file = st.sidebar.file_uploader("Zonas (Agrupacion apartamentos por zona.xlsx)", type=["xlsx"])
+apt_alm_file = st.sidebar.file_uploader("Apt↔Almacén (Apartamentos e Inventarios.xlsx)", type=["xlsx"])
+cafe_file = st.sidebar.file_uploader("Café por apto (Cafe por apartamento.xlsx)", type=["xlsx"])
+
+st.sidebar.header("Archivos diarios")
 avantio_file = st.sidebar.file_uploader("Avantio (Entradas) .xls/.xlsx/.csv", type=["xls","xlsx","csv","html"])
 odoo_file = st.sidebar.file_uploader("Odoo (stock.quant) .xlsx/.csv", type=["xlsx","csv"])
 
@@ -34,54 +44,54 @@ st.sidebar.header("Parámetros")
 ref_date = st.sidebar.date_input("Fecha de referencia", value=date.today())
 window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=5)
 
-st.sidebar.header("Maestros")
-masters = load_masters()
-st.sidebar.success("Maestros cargados desde el repo")
-
-if not avantio_file or not odoo_file:
-    st.info("Sube los 2 archivos (Avantio + Odoo) para generar el dashboard.")
+# 1) Maestros
+if not (zonas_file and apt_alm_file and cafe_file):
+    st.warning("En Streamlit Cloud debes subir los 3 maestros (Zonas, Apt↔Almacén, Café).")
     st.stop()
 
-# 1) Parse Avantio + Odoo
+masters = load_masters_from_uploads(zonas_file, apt_alm_file, cafe_file)
+st.sidebar.success("Maestros cargados ✅")
+
+# 2) Inputs diarios
+if not (avantio_file and odoo_file):
+    st.info("Sube los 2 archivos diarios (Avantio + Odoo) para generar el dashboard.")
+    st.stop()
+
+# Parse Avantio + Odoo
 avantio_df = parse_avantio_entradas(avantio_file)
 odoo_df = parse_odoo_stock(odoo_file)
 
-# 2) Normalización productos (incluye cápsulas de café)
+# Normalización productos (incluye cápsulas)
 odoo_norm = normalize_products(odoo_df)
 
-# 3) Enriquecimiento: unir maestros
-# Map Alojamiento (Avantio) -> APARTAMENTO (maestro). Por defecto asumimos que coincide.
-# Si no coincide, se reporta como "no mapeado".
+# Enriquecimiento: unir maestros
 ap_map = masters["apt_almacen"][["APARTAMENTO","ALMACEN"]].dropna().drop_duplicates()
 ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
 
-# Cruce Avantio a APARTAMENTO
+# Avantio → APARTAMENTO (por ahora asumimos que coincide)
 avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
 
 # Unir zona y café
-zona_map = masters["zonas"]
-cafe_map = masters["cafe"]
-
-avantio_df = avantio_df.merge(zona_map, on="APARTAMENTO", how="left")
-avantio_df = avantio_df.merge(cafe_map, on="APARTAMENTO", how="left")
+avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
+avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
 # Unir almacén
 avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-# Unir stock por ALMACEN
-# (odoo export usa columna "Ubicación"; la normalizamos a "ALMACEN")
+# Stock por ALMACEN + Amenity
 odoo_norm = odoo_norm.rename(columns={"Ubicación":"ALMACEN"})
 stock_by_alm = odoo_norm.groupby(["ALMACEN","Amenity"], as_index=False)["Cantidad"].sum()
 
-# 4) Reposición según min/max (por ahora global por amenity; editable en src/thresholds.py)
-rep = summarize_replenishment(stock_by_alm, masters["thresholds"], masters["cafe_capsule_rules"])
+# Reposición (min/max por amenity)
+rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
-# 5) Dashboard
+# Dashboard
 dash = build_dashboard_frames(
     avantio_df=avantio_df,
     replenishment_df=rep,
     ref_date=ref_date,
-    window_days=window_days
+    window_days=window_days,
+    unclassified_products=odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN","Producto","Cantidad"]].copy()
 )
 
 # ======== UI ========
