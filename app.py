@@ -77,7 +77,6 @@ def main():
 
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
-    # (se sigue calculando por si más adelante lo reintroduces, pero NO se muestra)
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     dash = build_dashboard_frames(
@@ -93,13 +92,8 @@ def main():
     c2.metric("Salidas hoy", int(dash["kpis"]["salidas_hoy"]))
     c3.metric("Aptos con faltantes (min)", int(dash["kpis"]["aptos_con_faltantes"]))
 
-    st.divider()
-
-    st.subheader("0) PICKING HOY – Todo lo que hay que reponer")
-    st.dataframe(dash["picking_hoy"], use_container_width=True, height=360)
-
     st.download_button(
-        "⬇️ Descargar Excel (Picking + dashboards)",
+        "⬇️ Descargar Excel (Dashboards)",
         data=dash["excel_all"],
         file_name=f"FloritOPS_{ref_date.isoformat()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -108,17 +102,17 @@ def main():
     st.divider()
 
     st.subheader("1) PRIMER PLANO – Entradas HOY (prioridad)")
-    st.dataframe(dash["entradas_hoy"], use_container_width=True, height=320)
+    st.dataframe(dash["entradas_hoy"], use_container_width=True, height=340)
 
     st.divider()
 
     st.subheader("2) ENTRADAS PRÓXIMAS – desde mañana (según ventana)")
-    st.dataframe(dash["entradas_proximas"], use_container_width=True, height=320)
+    st.dataframe(dash["entradas_proximas"], use_container_width=True, height=340)
 
     st.divider()
 
     st.subheader("3) OCUPADOS con salida próxima – según ventana")
-    st.dataframe(dash["ocupados_salida_proxima"], use_container_width=True, height=320)
+    st.dataframe(dash["ocupados_salida_proxima"], use_container_width=True, height=340)
 
 
 if __name__ == "__main__":
