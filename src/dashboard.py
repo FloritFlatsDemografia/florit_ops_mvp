@@ -4,10 +4,6 @@ from io import BytesIO
 import math
 
 
-def _date_only(ts) -> pd.Series:
-    return pd.to_datetime(ts, errors="coerce").dt.date
-
-
 COFFEE_AMENITIES = {
     "Café molido",
     "Cápsulas Nespresso",
@@ -50,37 +46,45 @@ def build_dashboard_frames(
     replenishment_df: pd.DataFrame,
     ref_date: date,
     window_days: int,
-    unclassified_products: pd.DataFrame
+    unclassified_products: pd.DataFrame,
 ) -> dict:
 
     df = avantio_df.copy()
 
-    # ---------------------------------------------------------
-    # Fechas y estados
-    # ---------------------------------------------------------
-    df["entrada_d"] = _date_only(df["Fecha_entrada_dt"])
-    df["salida_d"] = _date_only(df["Fecha_salida_dt"])
+    # =========================================================
+    # ✅ FUENTE ÚNICA DE VERDAD PARA FECHAS: columnas visibles
+    # =========================================================
+    entrada_dt = pd.to_datetime(df.get("Fecha entrada hora"), errors="coerce", dayfirst=True)
+    salida_dt = pd.to_datetime(df.get("Fecha salida hora"), errors="coerce", dayfirst=True)
 
+    df["entrada_d"] = entrada_dt.dt.date
+    df["salida_d"] = salida_dt.dt.date
+
+    # Estados
     df["Entra_hoy"] = df["entrada_d"] == ref_date
     df["Sale_hoy"] = df["salida_d"] == ref_date
     df["Ocupado_hoy"] = (df["entrada_d"] <= ref_date) & (ref_date < df["salida_d"])
 
-    end_d = ref_date + timedelta(days=window_days)
-    start_prox = ref_date + timedelta(days=1)
+    start_prox = ref_date + timedelta(days=1)                 # mañana
+    end_prox = ref_date + timedelta(days=window_days)         # fin ventana
 
-    # Entradas próximas: desde mañana
-    df["Entra_prox"] = (df["entrada_d"] >= start_prox) & (df["entrada_d"] <= end_d)
-    df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
+    # =========================================================
+    # ✅ Bloque 2: SOLO futuras, sin incluir hoy
+    # =========================================================
+    df["Entra_prox"] = (df["entrada_d"] >= start_prox) & (df["entrada_d"] <= end_prox)
+    df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_prox)
 
     # ---------------------------------------------------------
     # Reposición (filtrar café por CAFE_TIPO)
     # ---------------------------------------------------------
     rep = replenishment_df.copy()
-    rep = rep.merge(
-        df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(),
-        on="ALMACEN",
-        how="left"
-    )
+
+    if "ALMACEN" in df.columns and "ALMACEN" in rep.columns:
+        rep = rep.merge(
+            df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(),
+            on="ALMACEN",
+            how="left",
+        )
 
     def keep_row(r):
         amen = r.get("Amenity")
@@ -93,69 +97,58 @@ def build_dashboard_frames(
 
     rep = rep[rep.apply(keep_row, axis=1)].copy()
 
-    # Agregación y lista
-    rep_items = rep[rep["A_reponer"] > 0].copy()
-    rep_items["linea"] = (
-        rep_items["Amenity"].astype(str)
-        + " x"
-        + rep_items["A_reponer"].round(0).astype(int).astype(str)
-    )
+    rep_items = rep[rep.get("A_reponer", 0) > 0].copy()
+    if not rep_items.empty:
+        rep_items["linea"] = (
+            rep_items["Amenity"].astype(str)
+            + " x"
+            + rep_items["A_reponer"].round(0).astype(int).astype(str)
+        )
 
-    rep_items_agg = (
-        rep_items.groupby("ALMACEN")["linea"]
-        .apply(lambda s: ", ".join(s.tolist()[:30]))
-        .reset_index()
-        .rename(columns={"linea": "Lista_reponer"})
-    )
+        rep_items_agg = (
+            rep_items.groupby("ALMACEN")["linea"]
+            .apply(lambda s: ", ".join(s.tolist()[:30]))
+            .reset_index()
+            .rename(columns={"linea": "Lista_reponer"})
+        )
+    else:
+        rep_items_agg = pd.DataFrame(columns=["ALMACEN", "Lista_reponer"])
 
-    df = df.merge(rep_items_agg, on="ALMACEN", how="left")
+    if "ALMACEN" in df.columns:
+        df = df.merge(rep_items_agg, on="ALMACEN", how="left")
+    else:
+        df["Lista_reponer"] = ""
+
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
-    # Solo mostramos filas con algo que reponer (Lista no vacía)
-    df["tiene_reponer"] = df["Lista_reponer"].astype(str).str.strip().ne("")
-
     # ---------------------------------------------------------
-    # 1) Entradas HOY (vista limpia)
+    # 1) Entradas HOY (limpio)
     # ---------------------------------------------------------
-    entradas_hoy = df[df["Entra_hoy"] & df["tiene_reponer"]].copy()
+    entradas_hoy = df[df["Entra_hoy"]].copy()
     entradas_hoy = entradas_hoy[
-        [
-            "APARTAMENTO", "ZONA", "CAFE_TIPO",
-            "Fecha entrada hora", "Fecha salida hora",
-            "Lista_reponer",
-        ]
+        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora", "Lista_reponer"]
     ].sort_values(["ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
-    # 2) Entradas próximas (desde mañana) — vista limpia
+    # 2) Entradas PRÓXIMAS (desde mañana) (limpio)
     # ---------------------------------------------------------
-    entradas_proximas = df[     (df["entrada_d"] >= (ref_date + timedelta(days=1))) &     (df["entrada_d"] <= (ref_date + timedelta(days=window_days))) ].copy()
+    entradas_proximas = df[df["Entra_prox"]].copy()
     entradas_proximas = entradas_proximas[
-        [
-            "APARTAMENTO", "ZONA", "CAFE_TIPO",
-            "Fecha entrada hora", "Fecha salida hora",
-            "Lista_reponer",
-        ]
+        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora", "Lista_reponer"]
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
-    # 3) Ocupados con salida próxima — vista limpia
+    # 3) Ocupados con salida próxima (limpio)
     # ---------------------------------------------------------
-    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"] & df["tiene_reponer"]].copy()
+    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"]].copy()
     ocupados_salida = ocupados_salida[
-        [
-            "APARTAMENTO", "ZONA", "CAFE_TIPO",
-            "Fecha salida hora",
-            "Lista_reponer",
-        ]
+        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha salida hora", "Lista_reponer"]
     ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
 
-    # ---------------------------------------------------------
-    # KPIs (mantenemos aptos con faltantes como "tiene reponer")
-    # ---------------------------------------------------------
-    aptos_con_faltantes = int(df[df["tiene_reponer"]]["ALMACEN"].nunique())
+    # KPIs
+    aptos_con_faltantes = int(df[df["Lista_reponer"].astype(str).str.strip().ne("")]["APARTAMENTO"].nunique())
 
-    # Excel (solo dashboards)
+    # Excel
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
