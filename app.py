@@ -3,7 +3,6 @@ from datetime import date
 
 
 def main():
-    # Imports internos (para que si hay error se vea bien en Streamlit Cloud)
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
     from src.normalize import normalize_products, summarize_replenishment
@@ -27,7 +26,6 @@ def main():
 """
         )
 
-    # Sidebar uploads
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader(
         "Avantio (Entradas) .xls/.xlsx/.csv",
@@ -42,42 +40,32 @@ def main():
     ref_date = st.sidebar.date_input("Fecha de referencia", value=date.today())
     window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=6)
 
-    # Maestros fijos
     masters = load_masters_repo()
     st.sidebar.success("Maestros cargados desde GitHub ✅")
 
-    # Si falta algún diario, paramos
     if not (avantio_file and odoo_file):
         st.info("Sube Avantio + Odoo para generar el dashboard.")
         st.stop()
 
-    # Parse diarios
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
 
-    # Validación dura (evita NoneType)
     if odoo_df is None or odoo_df.empty:
         st.error("Odoo: no se pudieron leer datos del stock.quant (archivo vacío o columnas no detectadas).")
         st.stop()
 
-    # Normalización Odoo → Amenity
     odoo_norm = normalize_products(odoo_df)
 
-    # Map Apt → Almacén
     ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # Avantio → APARTAMENTO
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
 
-    # Cruces maestros en Avantio
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-    # Stock por almacén (desde Odoo)
-    # NOTA: parse_odoo_stock devuelve "Ubicación" como almacén/ubicación
     odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
     odoo_norm["ALMACEN"] = odoo_norm["ALMACEN"].astype(str).str.strip()
 
@@ -87,13 +75,11 @@ def main():
         .rename(columns={"Cantidad": "Cantidad"})
     )
 
-    # Reposición min/max (thresholds)
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
-    # Productos no clasificados
+    # (se sigue calculando por si más adelante lo reintroduces, pero NO se muestra)
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
-    # Construcción dashboard
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
         replenishment_df=rep,
@@ -102,7 +88,6 @@ def main():
         unclassified_products=unclassified,
     )
 
-    # KPIs
     c1, c2, c3 = st.columns(3)
     c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
     c2.metric("Salidas hoy", int(dash["kpis"]["salidas_hoy"]))
@@ -110,7 +95,6 @@ def main():
 
     st.divider()
 
-    # Bloque 0: Picking (siempre útil)
     st.subheader("0) PICKING HOY – Todo lo que hay que reponer")
     st.dataframe(dash["picking_hoy"], use_container_width=True, height=360)
 
@@ -123,43 +107,24 @@ def main():
 
     st.divider()
 
-    # Bloque 1: Entradas hoy
     st.subheader("1) PRIMER PLANO – Entradas HOY (prioridad)")
     st.dataframe(dash["entradas_hoy"], use_container_width=True, height=320)
 
     st.divider()
 
-    # Bloque 2: Entradas próximas
-    st.subheader("2) ENTRADAS PRÓXIMAS – según ventana")
+    st.subheader("2) ENTRADAS PRÓXIMAS – desde mañana (según ventana)")
     st.dataframe(dash["entradas_proximas"], use_container_width=True, height=320)
 
     st.divider()
 
-    # Bloque 3: Ocupados con salida próxima
     st.subheader("3) OCUPADOS con salida próxima – según ventana")
     st.dataframe(dash["ocupados_salida_proxima"], use_container_width=True, height=320)
-
-    st.divider()
-
-    # Control de calidad
-    st.subheader("Control de calidad")
-    a, b = st.columns(2)
-    with a:
-        st.markdown("**Apartamentos sin zona:**")
-        st.dataframe(dash["qc_no_zona"], use_container_width=True, height=220)
-    with b:
-        st.markdown("**Apartamentos sin almacén:**")
-        st.dataframe(dash["qc_no_almacen"], use_container_width=True, height=220)
-
-    st.markdown("**Productos Odoo sin clasificar:**")
-    st.dataframe(dash["qc_unclassified_products"], use_container_width=True, height=260)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Mostrar error completo en Cloud
         st.set_page_config(page_title="Florit OPS – Error", layout="wide")
         st.title("⚠️ Error en la app (detalle visible)")
         st.exception(e)
