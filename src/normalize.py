@@ -11,7 +11,6 @@ def _norm_txt(s: str) -> str:
     return s
 
 
-# Ordered rules: first match wins.
 AMENITY_RULES = [
     ("Gel de ducha", [r"gel.*duch", r"gel ducha", r"\bducha\b"]),
     ("Champú", [r"champu", r"shampoo"]),
@@ -27,7 +26,6 @@ AMENITY_RULES = [
     ("Mocho/Fregona", [r"fregona", r"mocho", r"mopa"]),
 ]
 
-# Coffee capsules: separate amenity keys (después filtraremos por CAFE_TIPO)
 COFFEE_CAPSULE_RULES = [
     ("Cápsulas Nespresso", [r"nespresso", r"\bcapsul.*nesp"]),
     ("Cápsulas Tassimo", [r"tassimo"]),
@@ -36,10 +34,9 @@ COFFEE_CAPSULE_RULES = [
 ]
 
 
-def classify_product(product_name: str) -> str | None:
+def classify_product(product_name: str):
     t = _norm_txt(product_name)
 
-    # Coffee capsules first
     for label, patterns in COFFEE_CAPSULE_RULES:
         for p in patterns:
             if re.search(p, t):
@@ -48,7 +45,6 @@ def classify_product(product_name: str) -> str | None:
     for label, patterns in AMENITY_RULES:
         for p in patterns:
             if re.search(p, t):
-                # evitar que "ducha" robe "manos"
                 if label == "Gel de ducha" and re.search(r"manos", t):
                     continue
                 return label
@@ -63,10 +59,6 @@ def normalize_products(odoo_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_replenishment(stock_by_alm: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
-    """
-    stock_by_alm columns: ALMACEN, Amenity, Cantidad
-    thresholds columns: Amenity, Minimo, Maximo
-    """
     thr = thresholds.copy()
     out = stock_by_alm.merge(thr, on="Amenity", how="left")
     out["Minimo"] = out["Minimo"].fillna(0)
