@@ -1,45 +1,116 @@
 import pandas as pd
 import re
-from io import BytesIO
-from datetime import datetime
+import unicodedata
+
+
+def _norm_col(s: str) -> str:
+    s = str(s or "").strip()
+    s = s.replace("\n", " ")
+    s = re.sub(r"\s+", " ", s)
+    s = s.lower()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    return s
+
+
+def _coerce_header_row(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Si el HTML/XLS viene con cabeceras dentro de la primera fila,
+    las promovemos a header.
+    """
+    if df is None or df.empty:
+        return df
+    # Si las columnas son tipo "Unnamed" o numéricas, y la primera fila contiene textos largos
+    col_norm = [_norm_col(c) for c in df.columns]
+    looks_bad = all(c.startswith("unnamed") or c.isdigit() or c == "" for c in col_norm)
+    if looks_bad:
+        first_row = df.iloc[0].astype(str).tolist()
+        if any("aloj" in _norm_col(x) or "fecha" in _norm_col(x) for x in first_row):
+            df2 = df.copy()
+            df2.columns = first_row
+            df2 = df2.iloc[1:].copy()
+            df2.columns = [str(c).strip() for c in df2.columns]
+            return df2
+    return df
+
+
+def _find_required_columns(df: pd.DataFrame):
+    """
+    Encuentra columnas equivalentes aunque cambien levemente.
+    Requisitos:
+    - Alojamiento (contiene 'aloj')
+    - Fecha entrada (contiene 'fecha' y 'entrada')
+    - Fecha salida (contiene 'fecha' y 'salida')
+    """
+    cols = list(df.columns)
+    norm = {_norm_col(c): c for c in cols}
+
+    def pick(patterns):
+        for nc, orig in norm.items():
+            ok = True
+            for p in patterns:
+                if re.search(p, nc) is None:
+                    ok = False
+                    break
+            if ok:
+                return orig
+        return None
+
+    c_aloj = pick([r"aloj"])
+    c_ent = pick([r"fecha", r"entrada"])
+    c_sal = pick([r"fecha", r"salida"])
+
+    return c_aloj, c_ent, c_sal
+
 
 def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
     name = (uploaded_file.name or "").lower()
 
-    # Avantio "xls" export is often HTML table.
     if name.endswith(".xls") or name.endswith(".html"):
-        content = uploaded_file.getvalue()
-        # read_html expects bytes decoded to str
-        html = content.decode("utf-8", errors="ignore")
+        # Avantio suele exportar xls como HTML
+        html = uploaded_file.getvalue().decode("utf-8", errors="ignore")
         tables = pd.read_html(html)
-        # Heuristic: pick the table that contains 'Alojamiento' and 'Fecha entrada hora'
+        # Elegir la tabla más probable
         best = None
+        best_score = -1
         for t in tables:
-            cols = [str(c).strip() for c in t.columns]
-            if ("Alojamiento" in cols) and ("Fecha entrada hora" in cols) and ("Fecha salida hora" in cols):
+            t = _coerce_header_row(t)
+            cols_norm = [_norm_col(c) for c in t.columns]
+            score = sum([
+                any("aloj" in c for c in cols_norm),
+                any(("fecha" in c and "entrada" in c) for c in cols_norm),
+                any(("fecha" in c and "salida" in c) for c in cols_norm),
+            ])
+            if score > best_score:
                 best = t
-                break
-        if best is None:
-            best = tables[-1]
+                best_score = score
         df = best.copy()
     elif name.endswith(".csv"):
         df = pd.read_csv(uploaded_file)
     else:
         df = pd.read_excel(uploaded_file)
 
-    # Standardize col names (keep original Spanish but ensure exact)
+    df = _coerce_header_row(df)
     df.columns = [str(c).strip() for c in df.columns]
 
-    needed = ["Alojamiento","Fecha entrada hora","Fecha salida hora"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Avantio: faltan columnas requeridas: {missing}")
+    c_aloj, c_ent, c_sal = _find_required_columns(df)
+    if not (c_aloj and c_ent and c_sal):
+        raise ValueError(
+            f"Avantio: faltan columnas requeridas. Detectadas={list(df.columns)[:30]} "
+            f"| Encontradas: alojamiento={c_aloj}, entrada={c_ent}, salida={c_sal}"
+        )
 
-    # Parse datetimes
+    # Renombrar a estándar interno
+    df = df.rename(columns={
+        c_aloj: "Alojamiento",
+        c_ent: "Fecha entrada hora",
+        c_sal: "Fecha salida hora",
+    })
+
     df["Fecha_entrada_dt"] = pd.to_datetime(df["Fecha entrada hora"], errors="coerce", dayfirst=True)
     df["Fecha_salida_dt"] = pd.to_datetime(df["Fecha salida hora"], errors="coerce", dayfirst=True)
 
     return df
+
 
 def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
     name = (uploaded_file.name or "").lower()
@@ -50,30 +121,28 @@ def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Common columns in Odoo exports: Ubicación, Producto, Cantidad
-    # Your sample matches these names.
+    # Columnas típicas Odoo: Ubicación, Producto, Cantidad
     colmap = {}
     for c in df.columns:
-        cl = c.lower()
-        if cl in ["ubicación","ubicacion","location","ubicacion completa","ubicación completa"]:
+        cl = _norm_col(c)
+        if cl in ["ubicacion", "ubicacion completa", "ubicacion/ubicacion", "location"]:
             colmap[c] = "Ubicación"
-        elif cl in ["producto","product","product name","product/variant"]:
+        elif cl in ["producto", "product", "product name", "product/variant"]:
             colmap[c] = "Producto"
-        elif cl in ["cantidad","quantity","on hand","qty","disponible"]:
+        elif cl in ["cantidad", "quantity", "on hand", "qty", "disponible"]:
             colmap[c] = "Cantidad"
     df = df.rename(columns=colmap)
 
-    required = ["Ubicación","Producto","Cantidad"]
+    required = ["Ubicación", "Producto", "Cantidad"]
     miss = [c for c in required if c not in df.columns]
     if miss:
-        raise ValueError(f"Odoo: faltan columnas requeridas: {miss}")
+        raise ValueError(f"Odoo: faltan columnas requeridas: {miss}. Columnas={list(df.columns)}")
 
-    # Filter out grouping/header rows: those have Producto empty OR Ubicación contains "(n)"
+    # Filtrar filas "cabecera" (Producto vacío) y ubicaciones tipo "(21)"
     df["Producto"] = df["Producto"].astype("string")
     df = df[df["Producto"].notna() & (df["Producto"].str.strip() != "")].copy()
     df = df[~df["Ubicación"].astype(str).str.contains(r"\(\d+\)", regex=True, na=False)].copy()
 
-    # Clean
     df["Ubicación"] = df["Ubicación"].astype(str).str.strip()
     df["Producto"] = df["Producto"].astype(str).str.strip()
     df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
