@@ -1,10 +1,9 @@
 import streamlit as st
-import pandas as pd
 from datetime import date
 
-# ===== Crash guard: si algo peta, lo muestra en pantalla =====
+
 def main():
-    from src.loaders import load_masters_from_uploads
+    from src.loaders import load_masters
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
     from src.normalize import normalize_products, summarize_replenishment
     from src.dashboard import build_dashboard_frames
@@ -14,20 +13,18 @@ def main():
 
     with st.expander("📌 Cómo usar", expanded=False):
         st.markdown("""
-**Inputs diarios (2 archivos):**
-1. **Avantio**: export tipo *Entradas* (tu `.xls`)
-2. **Odoo**: export `stock.quant` por ubicación/apartamento
+**Diario (2 archivos):**
+- Avantio (Entradas)
+- Odoo (stock.quant)
 
-**Maestros (obligatorios en Cloud):**
-- Zonas
-- Apt ↔ Almacén
-- Café por apartamento
+**Maestros fijos:** se cargan desde `data/` del repo.  
+(En caso de probar cambios, puedes subirlos como override en la barra lateral.)
 """)
 
-    st.sidebar.header("Maestros (Cloud)")
-    zonas_file = st.sidebar.file_uploader("Zonas (Agrupacion apartamentos por zona.xlsx)", type=["xlsx"])
-    apt_alm_file = st.sidebar.file_uploader("Apt↔Almacén (Apartamentos e Inventarios.xlsx)", type=["xlsx"])
-    cafe_file = st.sidebar.file_uploader("Café por apto (Cafe por apartamento.xlsx)", type=["xlsx"])
+    st.sidebar.header("Maestros (opcional override)")
+    zonas_file = st.sidebar.file_uploader("Zonas (override)", type=["xlsx"])
+    apt_alm_file = st.sidebar.file_uploader("Apt↔Almacén (override)", type=["xlsx"])
+    cafe_file = st.sidebar.file_uploader("Café (override)", type=["xlsx"])
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas) .xls/.xlsx/.csv", type=["xls", "xlsx", "csv", "html"])
@@ -37,17 +34,11 @@ def main():
     ref_date = st.sidebar.date_input("Fecha de referencia", value=date.today())
     window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=5)
 
-    # --- Maestros ---
-    if not (zonas_file and apt_alm_file and cafe_file):
-        st.warning("Sube los 3 maestros (Zonas, Apt↔Almacén, Café).")
-        st.stop()
+    # Maestros desde repo (o override)
+    masters = load_masters(zonas_file=zonas_file, apt_alm_file=apt_alm_file, cafe_file=cafe_file)
 
-    masters = load_masters_from_uploads(zonas_file, apt_alm_file, cafe_file)
-    st.sidebar.success("Maestros cargados ✅")
-
-    # --- Inputs diarios ---
     if not (avantio_file and odoo_file):
-        st.info("Sube los 2 archivos diarios (Avantio + Odoo) para generar el dashboard.")
+        st.info("Sube Avantio + Odoo para generar el dashboard.")
         st.stop()
 
     avantio_df = parse_avantio_entradas(avantio_file)
@@ -55,16 +46,15 @@ def main():
 
     odoo_norm = normalize_products(odoo_df)
 
-    # Cruces maestros
     ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
 
+    # Avantio → APARTAMENTO (asumimos mismo nombre; si no, luego metemos mapping)
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-    # Stock por ALMACEN + Amenity
     odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
     stock_by_alm = odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"].sum()
 
@@ -80,7 +70,6 @@ def main():
         unclassified_products=unclassified
     )
 
-    # UI
     c1, c2, c3 = st.columns(3)
     c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
     c2.metric("Salidas hoy", int(dash["kpis"]["salidas_hoy"]))
@@ -124,5 +113,4 @@ try:
 except Exception as e:
     st.set_page_config(page_title="Florit OPS – Error", layout="wide")
     st.title("⚠️ Error en la app (detalle visible)")
-    st.write("Copia este error y pégalo aquí. Con esto lo arreglo en un commit.")
     st.exception(e)
