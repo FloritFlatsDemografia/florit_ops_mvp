@@ -31,10 +31,6 @@ def build_dashboard_frames(
     df["Entra_prox"] = (df["entrada_d"] > ref_date) & (df["entrada_d"] <= end_d)
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
 
-    # --- Grupos con entradas hoy ---
-    entradas_hoy = df[df["Entra_hoy"]].copy()
-    grupos_hoy = set(entradas_hoy["ZONA"].dropna().unique().tolist())
-
     # --- Reposición por ALMACEN ---
     rep = replenishment_df.copy()
 
@@ -52,7 +48,7 @@ def build_dashboard_frames(
 
     rep_items_agg = (
         rep_items.groupby("ALMACEN")["linea"]
-        .apply(lambda s: ", ".join(s.tolist()[:12]))
+        .apply(lambda s: ", ".join(s.tolist()[:20]))
         .reset_index()
         .rename(columns={"linea": "Lista_reponer"})
     )
@@ -65,26 +61,23 @@ def build_dashboard_frames(
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
     # =========================================================
-    # 1) PRIMER PLANO – ENTRADAS HOY
+    # 1) PRIMER PLANO – PICKING DIARIO (TODO LO QUE FALTA)
     # =========================================================
-    primer = df[df["Entra_hoy"]].copy()
-
-    salidas_hoy_por_grupo = (
-        df[df["Sale_hoy"]].groupby("ZONA").size().to_dict()
-    )
+    primer_plano = df[df["unidades_reponer"] > 0].copy()
 
     def prioridad(row):
-        if row["Sale_hoy"]:
-            return "MAX"
-        if row["faltantes_min"] >= 2 or row["unidades_reponer"] >= 10:
-            return "ALTA"
-        if salidas_hoy_por_grupo.get(row["ZONA"], 0) > 0:
-            return "ALTA"
-        return "MEDIA"
+        # orden operativo: hoy > próximas entradas > próximas salidas > resto
+        if bool(row.get("Entra_hoy", False)):
+            return "1_HOY"
+        if bool(row.get("Entra_prox", False)):
+            return "2_PROX_ENTRADA"
+        if bool(row.get("Sale_prox", False)):
+            return "3_PROX_SALIDA"
+        return "4_RESTO"
 
-    primer["Prioridad"] = primer.apply(prioridad, axis=1)
+    primer_plano["Prioridad"] = primer_plano.apply(prioridad, axis=1)
 
-    primer_plano = primer[
+    primer_plano = primer_plano[
         [
             "APARTAMENTO",
             "ZONA",
@@ -100,11 +93,11 @@ def build_dashboard_frames(
     ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
 
     # =========================================================
-    # 2) ENTRADAS PRÓXIMAS (mismos grupos que hoy)
+    # 2) ENTRADAS PRÓXIMAS – SEGÚN VENTANA
     # =========================================================
-    entradas_proximas = df[
-        df["Entra_prox"] & df["ZONA"].isin(grupos_hoy)
-    ][
+    entradas_proximas = df[df["Entra_prox"]].copy()
+
+    entradas_proximas = entradas_proximas[
         [
             "APARTAMENTO",
             "ZONA",
@@ -116,16 +109,14 @@ def build_dashboard_frames(
             "Lista_reponer",
             "ALMACEN",
         ]
-    ].sort_values(["ZONA", "Fecha entrada hora"])
+    ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
     # =========================================================
-    # 3) OCUPADOS con SALIDA PRÓXIMA fuera del grupo de entradas
+    # 3) OCUPADOS con SALIDA PRÓXIMA – SEGÚN VENTANA
     # =========================================================
-    ocupados_salida = df[
-        df["Ocupado_hoy"]
-        & df["Sale_prox"]
-        & (~df["ZONA"].isin(grupos_hoy))
-    ][
+    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"]].copy()
+
+    ocupados_salida = ocupados_salida[
         [
             "APARTAMENTO",
             "ZONA",
@@ -136,7 +127,7 @@ def build_dashboard_frames(
             "Lista_reponer",
             "ALMACEN",
         ]
-    ].sort_values(["Fecha salida hora", "ZONA"])
+    ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
 
     # =========================================================
     # CONTROL DE CALIDAD
