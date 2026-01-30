@@ -131,7 +131,6 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
         if not dfs:
             raise ValueError("Avantio: no se detectaron tablas en el archivo .xls/.html")
 
-        # elegir la mejor
         best = None
         best_score = -1
         for d in dfs:
@@ -175,34 +174,60 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
 
 
 def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
+    """
+    Devuelve SIEMPRE un DataFrame o lanza ValueError.
+    Nunca devuelve None.
+    """
+    if uploaded_file is None:
+        raise ValueError("Odoo: no se ha subido archivo.")
+
     name = (uploaded_file.name or "").lower()
-    if name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        raise ValueError(f"Odoo: no pude leer el archivo ({e}).")
+
+    if df is None or df.empty:
+        raise ValueError("Odoo: el archivo está vacío o no tiene datos.")
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # map
-    colmap = {}
+    # Heurística flexible de columnas
+    col_ubi = col_prod = col_qty = None
     for c in df.columns:
         cl = _norm(c)
-        if cl in ["ubicacion", "ubicacion completa", "location"]:
-            colmap[c] = "Ubicación"
-        elif cl in ["producto", "product", "product name", "product/variant"]:
-            colmap[c] = "Producto"
-        elif cl in ["cantidad", "quantity", "on hand", "qty", "disponible"]:
-            colmap[c] = "Cantidad"
-    df = df.rename(columns=colmap)
+        if col_ubi is None and (("ubic" in cl) or ("location" in cl)):
+            col_ubi = c
+        if col_prod is None and (("producto" in cl) or ("product" in cl)):
+            col_prod = c
+        if col_qty is None and (("cantidad" in cl) or ("quantity" in cl) or ("qty" in cl) or ("on hand" in cl) or ("dispon" in cl)):
+            col_qty = c
 
-    required = ["Ubicación", "Producto", "Cantidad"]
-    miss = [c for c in required if c not in df.columns]
-    if miss:
-        raise ValueError(f"Odoo: faltan columnas requeridas: {miss}. Columnas={list(df.columns)}")
+    if not (col_ubi and col_prod and col_qty):
+        raise ValueError(f"Odoo: no detecto columnas. Encontradas: Ubicación={col_ubi}, Producto={col_prod}, Cantidad={col_qty}. Columnas={list(df.columns)}")
 
-    df["Producto"] = df["Producto"].astype("string")
-    df = df[df["Producto"].notna() & (df["Producto"].str.strip() != "")].copy()
-    df = df[~df["Ubicación"].astype(str).str.contains(r"\(\d+\)", regex=True, na=False)].copy()
+    df = df.rename(columns={
+        col_ubi: "Ubicación",
+        col_prod: "Producto",
+        col_qty: "Cantidad",
+    })
 
-    df["Ubicación"] = df["Ubicación"].astype(str).str.strip()
+    # Limpieza
     df["Producto"] = df["Producto"].astype(str).str.strip()
+    df["Ubicación"] = df["Ubicación"].astype(str).str.strip()
+    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
+
+    # Quitar agrupaciones tipo "(123)" en ubicación
+    df = df[~df["Ubicación"].str.contains(r"\(\d+\)", regex=True, na=False)].copy()
+
+    # Quitar filas sin producto
+    df = df[df["Producto"].notna() & (df["Producto"].str.strip() != "")].copy()
+
+    if df.empty:
+        raise ValueError("Odoo: tras limpiar, no quedó ninguna fila útil (Producto/Ubicación vacíos).")
+
+    return df
