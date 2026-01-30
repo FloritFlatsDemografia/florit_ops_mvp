@@ -66,7 +66,10 @@ def build_dashboard_frames(
     df["Ocupado_hoy"] = (df["entrada_d"] <= ref_date) & (ref_date < df["salida_d"])
 
     end_d = ref_date + timedelta(days=window_days)
-    df["Entra_prox"] = (df["entrada_d"] > ref_date) & (df["entrada_d"] <= end_d)
+    start_prox = ref_date + timedelta(days=1)
+
+    # ✅ Entradas próximas: desde MAÑANA (no incluye hoy)
+    df["Entra_prox"] = (df["entrada_d"] >= start_prox) & (df["entrada_d"] <= end_d)
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
 
     # ---------------------------------------------------------
@@ -160,7 +163,7 @@ def build_dashboard_frames(
     ].sort_values(["faltantes_min", "unidades_reponer"], ascending=False)
 
     # ---------------------------------------------------------
-    # 2) ENTRADAS PRÓXIMAS
+    # 2) ENTRADAS PRÓXIMAS (desde mañana)
     # ---------------------------------------------------------
     entradas_proximas = df[df["Entra_prox"] & (df["unidades_reponer"] > 0)].copy()
     entradas_proximas = entradas_proximas[
@@ -184,18 +187,7 @@ def build_dashboard_frames(
     ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
-    # QC
-    # ---------------------------------------------------------
-    qc_no_zona = df[df["ZONA"].isna()][["APARTAMENTO"]].drop_duplicates()
-    qc_no_almacen = df[df["ALMACEN"].isna()][["APARTAMENTO", "ZONA"]].drop_duplicates()
-
-    if unclassified_products is None or unclassified_products.empty:
-        qc_unclassified = pd.DataFrame(columns=["ALMACEN", "Producto", "Cantidad"])
-    else:
-        qc_unclassified = unclassified_products.copy().sort_values(["ALMACEN", "Producto"])
-
-    # ---------------------------------------------------------
-    # Excel
+    # Excel (sin QC)
     # ---------------------------------------------------------
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
@@ -203,9 +195,6 @@ def build_dashboard_frames(
         entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas")
         ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalidaProx")
-        qc_no_zona.to_excel(writer, index=False, sheet_name="QC_SinZona")
-        qc_no_almacen.to_excel(writer, index=False, sheet_name="QC_SinAlmacen")
-        qc_unclassified.to_excel(writer, index=False, sheet_name="QC_NoClasificados")
 
     return {
         "kpis": {
@@ -217,8 +206,5 @@ def build_dashboard_frames(
         "entradas_hoy": entradas_hoy,
         "entradas_proximas": entradas_proximas,
         "ocupados_salida_proxima": ocupados_salida,
-        "qc_no_zona": qc_no_zona,
-        "qc_no_almacen": qc_no_almacen,
-        "qc_unclassified_products": qc_unclassified,
         "excel_all": bio.getvalue(),
     }
