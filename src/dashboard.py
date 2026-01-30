@@ -1,7 +1,6 @@
 import pandas as pd
 from datetime import date, timedelta
 from io import BytesIO
-import re
 import math
 
 
@@ -19,7 +18,6 @@ COFFEE_AMENITIES = {
 
 
 def _safe_str(x) -> str:
-    # NaN puede venir como float
     if x is None:
         return ""
     try:
@@ -31,13 +29,9 @@ def _safe_str(x) -> str:
 
 
 def _allowed_coffee_amenity(cafe_tipo) -> str | None:
-    """
-    Mapea el CAFE_TIPO del maestro a la familia de café que debe considerarse.
-    """
     t = _safe_str(cafe_tipo).strip().lower()
     if t == "":
         return None
-
     if "molido" in t:
         return "Café molido"
     if "tassimo" in t:
@@ -48,9 +42,7 @@ def _allowed_coffee_amenity(cafe_tipo) -> str | None:
         return "Cápsulas Senseo"
     if "nespresso" in t or "colombia" in t:
         return "Cápsulas Nespresso"
-
-    # fallback: si no sabemos, no filtramos (mejor verlo que esconderlo)
-    return None
+    return None  # si no sabemos, no filtramos en keep_row
 
 
 def build_dashboard_frames(
@@ -77,11 +69,9 @@ def build_dashboard_frames(
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
 
     # =========================================================
-    # REPOSICIÓN: filtrar café por apartamento (ALMACEN)
+    # REPOSICIÓN: filtrar café por ALMACEN según CAFE_TIPO
     # =========================================================
     rep = replenishment_df.copy()
-
-    # Merge para conocer el CAFE_TIPO por ALMACEN
     rep = rep.merge(df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(), on="ALMACEN", how="left")
 
     def keep_row(r):
@@ -90,7 +80,7 @@ def build_dashboard_frames(
             return True
         allowed = _allowed_coffee_amenity(r.get("CAFE_TIPO"))
         if allowed is None:
-            return True  # no filtramos si no sabemos
+            return True  # si no sabemos el café, no filtramos
         return amen == allowed
 
     rep = rep[rep.apply(keep_row, axis=1)].copy()
@@ -123,39 +113,53 @@ def build_dashboard_frames(
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
     # =========================================================
-    # 0) PICKING HOY
+    # 0) PICKING HOY (solo lo relevante HOY)
+    #   - Entra hoy
+    #   - Sale hoy
+    #   - Ocupado hoy con salida en ventana
     # =========================================================
-    picking_hoy = df[df["unidades_reponer"] > 0].copy()
+    mask_hoy = (
+        df["Entra_hoy"]
+        | df["Sale_hoy"]
+        | (df["Ocupado_hoy"] & df["Sale_prox"])
+    )
 
-    def prioridad_picking(row):
+    picking_hoy = df[mask_hoy & (df["unidades_reponer"] > 0)].copy()
+
+    def evento(row):
         if row["Entra_hoy"]:
             return "1_ENTRA_HOY"
-        if row["Entra_prox"]:
-            return "2_ENTRA_PROX"
         if row["Sale_hoy"]:
-            return "3_SALE_HOY"
-        if row["Sale_prox"]:
-            return "4_SALE_PROX"
-        return "5_RESTO"
+            return "2_SALE_HOY"
+        if row["Ocupado_hoy"] and row["Sale_prox"]:
+            return "3_OCUPADO_SALE_PROX"
+        return "9_OTRO"
 
     if not picking_hoy.empty:
-        picking_hoy["Prioridad"] = picking_hoy.apply(prioridad_picking, axis=1)
+        picking_hoy["Evento"] = picking_hoy.apply(evento, axis=1)
+
         picking_hoy = picking_hoy[
             [
                 "APARTAMENTO", "ZONA", "CAFE_TIPO",
                 "Fecha entrada hora", "Fecha salida hora",
-                "Prioridad", "faltantes_min", "unidades_reponer",
+                "Evento",
+                "faltantes_min", "unidades_reponer",
                 "Lista_reponer", "ALMACEN",
             ]
-        ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
+        ].sort_values(["Evento", "ZONA", "APARTAMENTO"])
     else:
         picking_hoy = picking_hoy.reindex(columns=[
-            "APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora",
-            "Prioridad", "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
+            "APARTAMENTO", "ZONA", "CAFE_TIPO",
+            "Fecha entrada hora", "Fecha salida hora",
+            "Evento",
+            "faltantes_min", "unidades_reponer",
+            "Lista_reponer", "ALMACEN",
         ])
 
+    # =========================================================
     # 1) Entradas HOY
-    entradas_hoy = df[df["Entra_hoy"]].copy()
+    # =========================================================
+    entradas_hoy = df[df["Entra_hoy"] & (df["unidades_reponer"] > 0)].copy()
     if not entradas_hoy.empty:
         entradas_hoy = entradas_hoy[
             [
@@ -168,11 +172,13 @@ def build_dashboard_frames(
         entradas_hoy = entradas_hoy.reindex(columns=[
             "APARTAMENTO", "ZONA", "CAFE_TIPO",
             "Fecha entrada hora", "Fecha salida hora",
-            "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
+            "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN",
         ])
 
-    # 2) Entradas próximas
-    entradas_proximas = df[df["Entra_prox"]].copy()
+    # =========================================================
+    # 2) Entradas próximas (ventana)
+    # =========================================================
+    entradas_proximas = df[df["Entra_prox"] & (df["unidades_reponer"] > 0)].copy()
     entradas_proximas = entradas_proximas[
         [
             "APARTAMENTO", "ZONA", "CAFE_TIPO",
@@ -181,8 +187,10 @@ def build_dashboard_frames(
         ]
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
-    # 3) Ocupados con salida próxima
-    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"]].copy()
+    # =========================================================
+    # 3) Ocupados con salida próxima (ventana)
+    # =========================================================
+    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"] & (df["unidades_reponer"] > 0)].copy()
     ocupados_salida = ocupados_salida[
         [
             "APARTAMENTO", "ZONA", "CAFE_TIPO",
