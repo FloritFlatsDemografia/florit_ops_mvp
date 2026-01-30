@@ -78,7 +78,7 @@ Los **maestros fijos** (Zonas, Apt↔Almacén, Café, Min/Max) se cargan automá
     c3.metric("Aptos con faltantes (min)", int(dash["kpis"]["aptos_con_faltantes"]))
 
     st.divider()
-    st.subheader("1) PRIMER PLANO – Entradas diarias (prioridad)")
+    st.subheader("1) PRIMER PLANO – Entradas HOY (prioridad)")
     st.dataframe(dash["primer_plano"], use_container_width=True, height=360)
 
     st.download_button(
