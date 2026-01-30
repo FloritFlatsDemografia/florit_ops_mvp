@@ -14,34 +14,47 @@ def _norm_txt(s: str) -> str:
 AMENITY_RULES = [
     ("Gel de ducha", [r"gel.*duch", r"gel ducha", r"\bducha\b"]),
     ("Champú", [r"champu", r"shampoo"]),
-    ("Jabón de manos", [r"(jabon|gel)\s+de\s+manos", r"hand\s+soap"]),
+    ("Jabón de manos", [r"(jabon|gel)\s+de\s+manos", r"gel de manos", r"hand\s+soap"]),
     ("Azúcar", [r"azucar"]),
-    ("Té/Infusión", [r"infus", r"rooibos", r"manzanilla", r"\btilo\b", r"menta", r"earl", r"english"]),
+    ("Té/Infusión", [r"infus", r"\bte\b", r"rooibos", r"manzanilla", r"\btilo\b", r"menta", r"earl", r"english"]),
     ("Insecticida", [r"insectic", r"raid", r"mosquit", r"cucarach", r"hormig"]),
     ("Detergente", [r"detergente", r"lavadora", r"capsula.*deterg", r"capsu.*deterg"]),
     ("Vinagre", [r"vinagre"]),
     ("Abrillantador", [r"abrillantador"]),
     ("Sal lavavajillas", [r"sal.*lavavaj"]),
+    ("Sal de mesa", [r"sal fina", r"sal de mesa"]),
     ("Escoba", [r"escoba"]),
     ("Mocho/Fregona", [r"fregona", r"mocho", r"mopa"]),
 ]
 
+COFFEE_RULES = [
+    ("Café molido", [r"cafe.*molido", r"molido", r"cafe natural molido"]),
+]
+
 COFFEE_CAPSULE_RULES = [
-    ("Cápsulas Nespresso", [r"nespresso", r"\bcapsul.*nesp"]),
+    ("Cápsulas Nespresso", [r"nespresso", r"\bcapsul.*nesp", r"capsula colombia", r"capsula.*colombia"]),
     ("Cápsulas Tassimo", [r"tassimo"]),
-    ("Cápsulas Dolce Gusto", [r"dolce\s*gusto", r"dolcegusto", r"\bgusto\b"]),
+    ("Cápsulas Dolce Gusto", [r"dolce\s*gusto", r"dolcegusto"]),
     ("Cápsulas Senseo", [r"senseo"]),
 ]
 
 
-def classify_product(product_name: str):
+def classify_product(product_name: str) -> str | None:
     t = _norm_txt(product_name)
 
+    # Coffee (molido)
+    for label, patterns in COFFEE_RULES:
+        for p in patterns:
+            if re.search(p, t):
+                return label
+
+    # Coffee capsules
     for label, patterns in COFFEE_CAPSULE_RULES:
         for p in patterns:
             if re.search(p, t):
                 return label
 
+    # Amenities
     for label, patterns in AMENITY_RULES:
         for p in patterns:
             if re.search(p, t):
@@ -61,6 +74,7 @@ def normalize_products(odoo_df: pd.DataFrame) -> pd.DataFrame:
 def summarize_replenishment(stock_by_alm: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
     thr = thresholds.copy()
     out = stock_by_alm.merge(thr, on="Amenity", how="left")
+
     out["Minimo"] = out["Minimo"].fillna(0)
     out["Maximo"] = out["Maximo"].fillna(0)
 
