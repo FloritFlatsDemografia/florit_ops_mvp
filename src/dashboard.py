@@ -17,16 +17,16 @@ def build_dashboard_frames(
 
     df = avantio_df.copy()
 
-    # --- Fechas ---
+    # --- Fechas (solo día) ---
     df["entrada_d"] = _date_only(df["Fecha_entrada_dt"])
     df["salida_d"] = _date_only(df["Fecha_salida_dt"])
 
-    # --- Estados ---
+    # --- Estados diarios ---
     df["Entra_hoy"] = df["entrada_d"] == ref_date
     df["Sale_hoy"] = df["salida_d"] == ref_date
     df["Ocupado_hoy"] = (df["entrada_d"] <= ref_date) & (ref_date < df["salida_d"])
 
-    # --- Ventana próximos días ---
+    # --- Ventana próximos días (incluye desde mañana hasta ref_date+N) ---
     end_d = ref_date + timedelta(days=window_days)
     df["Entra_prox"] = (df["entrada_d"] > ref_date) & (df["entrada_d"] <= end_d)
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
@@ -61,36 +61,39 @@ def build_dashboard_frames(
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
     # =========================================================
-    # 1) PRIMER PLANO – PICKING DIARIO (TODO LO QUE FALTA)
+    # 1) PRIMER PLANO – ENTRADAS HOY (solo los que entran hoy)
     # =========================================================
-    primer_plano = df[df["unidades_reponer"] > 0].copy()
+    primer_plano = df[df["Entra_hoy"]].copy()
 
-    def prioridad(row):
-        # orden operativo: hoy > próximas entradas > próximas salidas > resto
-        if bool(row.get("Entra_hoy", False)):
-            return "1_HOY"
-        if bool(row.get("Entra_prox", False)):
-            return "2_PROX_ENTRADA"
-        if bool(row.get("Sale_prox", False)):
-            return "3_PROX_SALIDA"
-        return "4_RESTO"
+    def prioridad_entrada(row):
+        # Dentro de entradas hoy, priorizamos los que tienen más reposición / faltantes
+        if row["faltantes_min"] > 0:
+            return "1_FALTANTE_MIN"
+        if row["unidades_reponer"] > 0:
+            return "2_REPONER"
+        return "3_OK"
 
-    primer_plano["Prioridad"] = primer_plano.apply(prioridad, axis=1)
-
-    primer_plano = primer_plano[
-        [
-            "APARTAMENTO",
-            "ZONA",
-            "CAFE_TIPO",
-            "Fecha entrada hora",
-            "Fecha salida hora",
-            "Prioridad",
-            "faltantes_min",
-            "unidades_reponer",
-            "Lista_reponer",
-            "ALMACEN",
-        ]
-    ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
+    if not primer_plano.empty:
+        primer_plano["Prioridad"] = primer_plano.apply(prioridad_entrada, axis=1)
+        primer_plano = primer_plano[
+            [
+                "APARTAMENTO",
+                "ZONA",
+                "CAFE_TIPO",
+                "Fecha entrada hora",
+                "Fecha salida hora",
+                "Prioridad",
+                "faltantes_min",
+                "unidades_reponer",
+                "Lista_reponer",
+                "ALMACEN",
+            ]
+        ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
+    else:
+        primer_plano = primer_plano.reindex(columns=[
+            "APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora",
+            "Prioridad", "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
+        ])
 
     # =========================================================
     # 2) ENTRADAS PRÓXIMAS – SEGÚN VENTANA
@@ -146,7 +149,7 @@ def build_dashboard_frames(
     # =========================================================
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        primer_plano.to_excel(writer, index=False, sheet_name="PrimerPlano")
+        primer_plano.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas")
         ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalidaProx")
 
