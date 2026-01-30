@@ -129,7 +129,7 @@ def build_dashboard_frames(
     # ---------------------------------------------------------
     # 2) Entradas próximas (desde mañana) — vista limpia
     # ---------------------------------------------------------
-    entradas_proximas = df[df["Entra_prox"] & df["tiene_reponer"]].copy()
+    entradas_proximas = df[     (df["entrada_d"] >= (ref_date + timedelta(days=1))) &     (df["entrada_d"] <= (ref_date + timedelta(days=window_days))) ].copy()
     entradas_proximas = entradas_proximas[
         [
             "APARTAMENTO", "ZONA", "CAFE_TIPO",
