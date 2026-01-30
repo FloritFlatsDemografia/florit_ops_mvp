@@ -118,11 +118,10 @@ def build_dashboard_frames(
     #   - Sale hoy
     #   - Ocupado hoy con salida en ventana
     # =========================================================
-    mask_hoy = (
-        df["Entra_hoy"]
-        | df["Sale_hoy"]
-        | (df["Ocupado_hoy"] & df["Sale_prox"])
-    )
+
+ mask_hoy = (df["Entra_hoy"] | df["Sale_hoy"])
+
+picking_hoy = df[mask_hoy & (df["unidades_reponer"] > 0)].copy()
 
     picking_hoy = df[mask_hoy & (df["unidades_reponer"] > 0)].copy()
 
