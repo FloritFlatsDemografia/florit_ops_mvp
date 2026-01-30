@@ -17,16 +17,15 @@ def build_dashboard_frames(
 
     df = avantio_df.copy()
 
-    # --- Fechas (solo día) ---
+    # --- Fechas ---
     df["entrada_d"] = _date_only(df["Fecha_entrada_dt"])
     df["salida_d"] = _date_only(df["Fecha_salida_dt"])
 
-    # --- Estados diarios ---
+    # --- Estados ---
     df["Entra_hoy"] = df["entrada_d"] == ref_date
     df["Sale_hoy"] = df["salida_d"] == ref_date
     df["Ocupado_hoy"] = (df["entrada_d"] <= ref_date) & (ref_date < df["salida_d"])
 
-    # --- Ventana próximos días (desde mañana hasta ref_date+N) ---
     end_d = ref_date + timedelta(days=window_days)
     df["Entra_prox"] = (df["entrada_d"] > ref_date) & (df["entrada_d"] <= end_d)
     df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
@@ -61,16 +60,11 @@ def build_dashboard_frames(
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
     # =========================================================
-    # 0) PICKING HOY – TODO LO QUE HAY QUE REPONER (OPERATIVO)
+    # 0) PICKING HOY – todo lo que hay que reponer
     # =========================================================
     picking_hoy = df[df["unidades_reponer"] > 0].copy()
 
     def prioridad_picking(row):
-        # Prioridad logística:
-        # 1) Entradas hoy
-        # 2) Entradas próximas
-        # 3) Salidas hoy
-        # 4) Salidas próximas
         if row["Entra_hoy"]:
             return "1_ENTRA_HOY"
         if row["Entra_prox"]:
@@ -104,9 +98,9 @@ def build_dashboard_frames(
         ])
 
     # =========================================================
-    # 1) PRIMER PLANO – ENTRADAS HOY (solo los que entran hoy)
+    # 1) ENTRADAS HOY
     # =========================================================
-    primer_plano = df[df["Entra_hoy"]].copy()
+    entradas_hoy = df[df["Entra_hoy"]].copy()
 
     def prioridad_entrada(row):
         if row["faltantes_min"] > 0:
@@ -115,9 +109,9 @@ def build_dashboard_frames(
             return "2_REPONER"
         return "3_OK"
 
-    if not primer_plano.empty:
-        primer_plano["Prioridad"] = primer_plano.apply(prioridad_entrada, axis=1)
-        primer_plano = primer_plano[
+    if not entradas_hoy.empty:
+        entradas_hoy["Prioridad"] = entradas_hoy.apply(prioridad_entrada, axis=1)
+        entradas_hoy = entradas_hoy[
             [
                 "APARTAMENTO",
                 "ZONA",
@@ -132,13 +126,13 @@ def build_dashboard_frames(
             ]
         ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
     else:
-        primer_plano = primer_plano.reindex(columns=[
+        entradas_hoy = entradas_hoy.reindex(columns=[
             "APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora",
             "Prioridad", "faltantes_min", "unidades_reponer", "Lista_reponer", "ALMACEN"
         ])
 
     # =========================================================
-    # 2) ENTRADAS PRÓXIMAS – SEGÚN VENTANA
+    # 2) ENTRADAS PRÓXIMAS
     # =========================================================
     entradas_proximas = df[df["Entra_prox"]].copy()
     entradas_proximas = entradas_proximas[
@@ -156,7 +150,7 @@ def build_dashboard_frames(
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
     # =========================================================
-    # 3) OCUPADOS con SALIDA PRÓXIMA – SEGÚN VENTANA
+    # 3) OCUPADOS con SALIDA PRÓXIMA
     # =========================================================
     ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"]].copy()
     ocupados_salida = ocupados_salida[
@@ -172,27 +166,27 @@ def build_dashboard_frames(
         ]
     ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
 
-    # =========================================================
-    # CONTROL DE CALIDAD
-    # =========================================================
+    # QC
     qc_no_zona = df[df["ZONA"].isna()][["APARTAMENTO"]].drop_duplicates()
     qc_no_almacen = df[df["ALMACEN"].isna()][["APARTAMENTO", "ZONA"]].drop_duplicates()
 
     if unclassified_products is None or unclassified_products.empty:
         qc_unclassified = pd.DataFrame(columns=["ALMACEN", "Producto", "Cantidad"])
     else:
-        qc_unclassified = unclassified_products.copy()
-        qc_unclassified = qc_unclassified.sort_values(["ALMACEN", "Producto"])
+        qc_unclassified = unclassified_products.copy().sort_values(["ALMACEN", "Producto"])
 
-    # =========================================================
-    # EXPORT EXCEL
-    # =========================================================
+    # Excel export con todo
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         picking_hoy.to_excel(writer, index=False, sheet_name="PickingHoy")
-        primer_plano.to_excel(writer, index=False, sheet_name="EntradasHoy")
+        entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas")
         ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalidaProx")
+        qc_no_zona.to_excel(writer, index=False, sheet_name="QC_SinZona")
+        qc_no_almacen.to_excel(writer, index=False, sheet_name="QC_SinAlmacen")
+        qc_unclassified.to_excel(writer, index=False, sheet_name="QC_NoClasificados")
+
+    excel_all = bio.getvalue()
 
     return {
         "kpis": {
@@ -201,11 +195,11 @@ def build_dashboard_frames(
             "aptos_con_faltantes": int((rep_join["faltantes_min"] > 0).sum()),
         },
         "picking_hoy": picking_hoy,
-        "primer_plano": primer_plano,
+        "entradas_hoy": entradas_hoy,
         "entradas_proximas": entradas_proximas,
         "ocupados_salida_proxima": ocupados_salida,
         "qc_no_zona": qc_no_zona,
         "qc_no_almacen": qc_no_almacen,
         "qc_unclassified_products": qc_unclassified,
-        "primer_plano_xlsx": bio.getvalue(),
+        "excel_all": excel_all,
     }
