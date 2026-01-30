@@ -5,7 +5,8 @@ from io import BytesIO
 def _date_only(ts) -> pd.Series:
     return pd.to_datetime(ts, errors="coerce").dt.date
 
-def build_dashboard_frames(avantio_df: pd.DataFrame, replenishment_df: pd.DataFrame, ref_date: date, window_days: int) -> dict:
+def build_dashboard_frames(avantio_df: pd.DataFrame, replenishment_df: pd.DataFrame, ref_date: date, window_days: int, unclassified_products: pd.DataFrame) -> dict:
+
     df = avantio_df.copy()
 
     df["entrada_d"] = _date_only(df["Fecha_entrada_dt"])
@@ -97,7 +98,7 @@ def build_dashboard_frames(avantio_df: pd.DataFrame, replenishment_df: pd.DataFr
     # Unclassified products list
     # For this, we need original unclassified list; we approximate by detecting empty Lista_reponer not possible
     # Better: in app we pass it; but keep here minimal (placeholder from replenishment side doesn't have raw names).
-    qc_unclassified = pd.DataFrame(columns=["Producto","Ubicación","Cantidad"])
+    qc_unclassified = unclassified_products.copy() qc_unclassified = qc_unclassified.sort_values(["ALMACEN","Producto"])
 
     # Export primer plano to xlsx
     bio = BytesIO()
