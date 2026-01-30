@@ -1,162 +1,128 @@
+import streamlit as st
 import pandas as pd
-from datetime import date, timedelta
-from io import BytesIO
+from datetime import date
 
-def _date_only(ts) -> pd.Series:
-    return pd.to_datetime(ts, errors="coerce").dt.date
+# ===== Crash guard: si algo peta, lo muestra en pantalla =====
+def main():
+    from src.loaders import load_masters_from_uploads
+    from src.parsers import parse_avantio_entradas, parse_odoo_stock
+    from src.normalize import normalize_products, summarize_replenishment
+    from src.dashboard import build_dashboard_frames
 
+    st.set_page_config(page_title="Florit OPS – Reposición & Operativa", layout="wide")
+    st.title("Florit OPS – Operativa diaria + reposición (amenities)")
 
-def build_dashboard_frames(
-    avantio_df: pd.DataFrame,
-    replenishment_df: pd.DataFrame,
-    ref_date: date,
-    window_days: int,
-    unclassified_products: pd.DataFrame
-) -> dict:
+    with st.expander("📌 Cómo usar", expanded=False):
+        st.markdown("""
+**Inputs diarios (2 archivos):**
+1. **Avantio**: export tipo *Entradas* (tu `.xls`)
+2. **Odoo**: export `stock.quant` por ubicación/apartamento
 
-    df = avantio_df.copy()
+**Maestros (obligatorios en Cloud):**
+- Zonas
+- Apt ↔ Almacén
+- Café por apartamento
+""")
 
-    df["entrada_d"] = _date_only(df["Fecha_entrada_dt"])
-    df["salida_d"] = _date_only(df["Fecha_salida_dt"])
+    st.sidebar.header("Maestros (Cloud)")
+    zonas_file = st.sidebar.file_uploader("Zonas (Agrupacion apartamentos por zona.xlsx)", type=["xlsx"])
+    apt_alm_file = st.sidebar.file_uploader("Apt↔Almacén (Apartamentos e Inventarios.xlsx)", type=["xlsx"])
+    cafe_file = st.sidebar.file_uploader("Café por apto (Cafe por apartamento.xlsx)", type=["xlsx"])
 
-    # Estados
-    df["Entra_hoy"] = df["entrada_d"] == ref_date
-    df["Sale_hoy"] = df["salida_d"] == ref_date
-    df["Ocupado_hoy"] = (df["entrada_d"] <= ref_date) & (ref_date < df["salida_d"])
+    st.sidebar.header("Archivos diarios")
+    avantio_file = st.sidebar.file_uploader("Avantio (Entradas) .xls/.xlsx/.csv", type=["xls", "xlsx", "csv", "html"])
+    odoo_file = st.sidebar.file_uploader("Odoo (stock.quant) .xlsx/.csv", type=["xlsx", "csv"])
 
-    # Ventana próxima
-    end_d = ref_date + timedelta(days=window_days)
-    df["Entra_prox"] = (df["entrada_d"] > ref_date) & (df["entrada_d"] <= end_d)
-    df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_d)
+    st.sidebar.header("Parámetros")
+    ref_date = st.sidebar.date_input("Fecha de referencia", value=date.today())
+    window_days = st.sidebar.slider("Ventana próximos días", min_value=1, max_value=14, value=5)
 
-    # Grupos con entradas hoy
-    entradas_hoy = df[df["Entra_hoy"]].copy()
-    grupos_hoy = set(entradas_hoy["ZONA"].dropna().unique().tolist())
+    # --- Maestros ---
+    if not (zonas_file and apt_alm_file and cafe_file):
+        st.warning("Sube los 3 maestros (Zonas, Apt↔Almacén, Café).")
+        st.stop()
 
-    # Reposición por almacén
-    rep = replenishment_df.copy()
-    rep_agg = rep.groupby("ALMACEN", as_index=False).agg(
-        faltantes_min=("Faltante_min", "sum"),
-        unidades_reponer=("A_reponer", "sum"),
+    masters = load_masters_from_uploads(zonas_file, apt_alm_file, cafe_file)
+    st.sidebar.success("Maestros cargados ✅")
+
+    # --- Inputs diarios ---
+    if not (avantio_file and odoo_file):
+        st.info("Sube los 2 archivos diarios (Avantio + Odoo) para generar el dashboard.")
+        st.stop()
+
+    avantio_df = parse_avantio_entradas(avantio_file)
+    odoo_df = parse_odoo_stock(odoo_file)
+
+    odoo_norm = normalize_products(odoo_df)
+
+    # Cruces maestros
+    ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
+    ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
+
+    avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
+    avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
+    avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
+    avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
+
+    # Stock por ALMACEN + Amenity
+    odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
+    stock_by_alm = odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"].sum()
+
+    rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
+
+    unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
+
+    dash = build_dashboard_frames(
+        avantio_df=avantio_df,
+        replenishment_df=rep,
+        ref_date=ref_date,
+        window_days=window_days,
+        unclassified_products=unclassified
     )
 
-    rep_items = rep[rep["A_reponer"] > 0].copy()
-    rep_items["linea"] = (
-        rep_items["Amenity"].astype(str)
-        + " x"
-        + rep_items["A_reponer"].round(0).astype(int).astype(str)
+    # UI
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
+    c2.metric("Salidas hoy", int(dash["kpis"]["salidas_hoy"]))
+    c3.metric("Aptos con faltantes (min)", int(dash["kpis"]["aptos_con_faltantes"]))
+
+    st.divider()
+    st.subheader("1) PRIMER PLANO – Entradas diarias (prioridad)")
+    st.dataframe(dash["primer_plano"], use_container_width=True, height=360)
+
+    st.download_button(
+        "⬇️ Descargar picking (Primer plano)",
+        data=dash["primer_plano_xlsx"],
+        file_name=f"Picking_PrimerPlano_{ref_date.isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    rep_items_agg = (
-        rep_items.groupby("ALMACEN")["linea"]
-        .apply(lambda s: ", ".join(s.tolist()[:12]))
-        .reset_index()
-        .rename(columns={"linea": "Lista_reponer"})
-    )
+    st.divider()
+    st.subheader("2) ENTRADAS PRÓXIMAS – mismos grupos de las entradas de hoy")
+    st.dataframe(dash["entradas_proximas"], use_container_width=True, height=320)
 
-    rep_join = rep_agg.merge(rep_items_agg, on="ALMACEN", how="left")
+    st.divider()
+    st.subheader("3) OCUPADOS con salida próxima – fuera del grupo de entradas")
+    st.dataframe(dash["ocupados_salida_proxima"], use_container_width=True, height=320)
 
-    df = df.merge(rep_join, on="ALMACEN", how="left")
-    df["faltantes_min"] = df["faltantes_min"].fillna(0).astype(int)
-    df["unidades_reponer"] = df["unidades_reponer"].fillna(0)
-    df["Lista_reponer"] = df["Lista_reponer"].fillna("")
+    st.divider()
+    st.subheader("Control de calidad")
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**Apartamentos sin zona:**")
+        st.dataframe(dash["qc_no_zona"], use_container_width=True, height=220)
+    with b:
+        st.markdown("**Apartamentos sin almacén:**")
+        st.dataframe(dash["qc_no_almacen"], use_container_width=True, height=220)
 
-    # ---------- PRIMER PLANO ----------
-    primer = df[df["Entra_hoy"]].copy()
+    st.markdown("**Productos Odoo sin clasificar:**")
+    st.dataframe(dash["qc_unclassified_products"], use_container_width=True, height=260)
 
-    salidas_hoy_por_grupo = (
-        df[df["Sale_hoy"]].groupby("ZONA").size().to_dict()
-    )
 
-    def prioridad(row):
-        if row["Sale_hoy"]:
-            return "MAX"
-        if row["faltantes_min"] >= 2 or row["unidades_reponer"] >= 10:
-            return "ALTA"
-        if salidas_hoy_por_grupo.get(row["ZONA"], 0) > 0:
-            return "ALTA"
-        return "MEDIA"
-
-    primer["Prioridad"] = primer.apply(prioridad, axis=1)
-
-    primer_plano = primer[
-        [
-            "APARTAMENTO",
-            "ZONA",
-            "CAFE_TIPO",
-            "Fecha entrada hora",
-            "Fecha salida hora",
-            "Prioridad",
-            "faltantes_min",
-            "unidades_reponer",
-            "Lista_reponer",
-            "ALMACEN",
-        ]
-    ].sort_values(["Prioridad", "ZONA", "APARTAMENTO"])
-
-    # ---------- ENTRADAS PRÓXIMAS ----------
-    entradas_proximas = df[
-        df["Entra_prox"] & df["ZONA"].isin(grupos_hoy)
-    ][
-        [
-            "APARTAMENTO",
-            "ZONA",
-            "CAFE_TIPO",
-            "Fecha entrada hora",
-            "Fecha salida hora",
-            "faltantes_min",
-            "unidades_reponer",
-            "Lista_reponer",
-            "ALMACEN",
-        ]
-    ].sort_values(["ZONA", "Fecha entrada hora"])
-
-    # ---------- OCUPADOS CON SALIDA PRÓXIMA ----------
-    ocupados_salida = df[
-        df["Ocupado_hoy"]
-        & df["Sale_prox"]
-        & (~df["ZONA"].isin(grupos_hoy))
-    ][
-        [
-            "APARTAMENTO",
-            "ZONA",
-            "CAFE_TIPO",
-            "Fecha salida hora",
-            "faltantes_min",
-            "unidades_reponer",
-            "Lista_reponer",
-            "ALMACEN",
-        ]
-    ].sort_values(["Fecha salida hora", "ZONA"])
-
-    # ---------- QC ----------
-    qc_no_zona = df[df["ZONA"].isna()][["APARTAMENTO"]].drop_duplicates()
-    qc_no_almacen = df[df["ALMACEN"].isna()][["APARTAMENTO", "ZONA"]].drop_duplicates()
-
-    qc_unclassified = (
-        unclassified_products.copy()
-        if unclassified_products is not None
-        else pd.DataFrame(columns=["ALMACEN", "Producto", "Cantidad"])
-    )
-
-    # ---------- EXPORT ----------
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        primer_plano.to_excel(writer, index=False, sheet_name="PrimerPlano")
-        entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas")
-        ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalidaProx")
-
-    return {
-        "kpis": {
-            "entradas_hoy": int(df["Entra_hoy"].sum()),
-            "salidas_hoy": int(df["Sale_hoy"].sum()),
-            "aptos_con_faltantes": int((rep_join["faltantes_min"] > 0).sum()),
-        },
-        "primer_plano": primer_plano,
-        "entradas_proximas": entradas_proximas,
-        "ocupados_salida_proxima": ocupados_salida,
-        "qc_no_zona": qc_no_zona,
-        "qc_no_almacen": qc_no_almacen,
-        "qc_unclassified_products": qc_unclassified,
-        "primer_plano_xlsx": bio.getvalue(),
-    }
+try:
+    main()
+except Exception as e:
+    st.set_page_config(page_title="Florit OPS – Error", layout="wide")
+    st.title("⚠️ Error en la app (detalle visible)")
+    st.write("Copia este error y pégalo aquí. Con esto lo arreglo en un commit.")
+    st.exception(e)
