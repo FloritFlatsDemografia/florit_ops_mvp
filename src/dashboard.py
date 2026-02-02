@@ -51,7 +51,7 @@ def build_dashboard_frames(
       - HOY = fecha local Europe/Madrid
       - Bloque 1: entradas HOY
       - Bloque 2: entradas desde mañana hasta +7 días (incluido)
-      - Bloque 3 NUEVO: apartamentos LIBRES desde mañana hasta +3 días (incluido),
+      - Bloque 3: apartamentos LIBRES HOY..+3 (incluido),
         agrupables por zona en UI, y SOLO si tienen Lista_reponer
 
     Bloque 1 y 2 columnas:
@@ -71,8 +71,8 @@ def build_dashboard_frames(
     start_7 = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()  # mañana
     end_7 = (pd.Timestamp(today) + pd.Timedelta(days=7)).date()    # +7
 
-    # Bloque 3: mañana..+3 (incluido)
-    start_3 = start_7
+    # Bloque 3: HOY..+3 (incluido)
+    start_3 = today
     end_3 = (pd.Timestamp(today) + pd.Timedelta(days=3)).date()
 
     # --- Parse fechas ---
@@ -85,9 +85,6 @@ def build_dashboard_frames(
     # --- Flags ---
     df["Entra_hoy"] = df["entrada_d"] == today
     df["Entra_prox_7d"] = (df["entrada_d"] >= start_7) & (df["entrada_d"] <= end_7)
-
-    # Ocupado hoy (incluye estancias que empezaron antes)
-    df["Ocupado_hoy"] = (df["entrada_d"] <= today) & (today < df["salida_d"])
 
     # ---------------------------------------------------------
     # Lista_reponer por ALMACEN (filtrando café por CAFE_TIPO)
@@ -156,7 +153,7 @@ def build_dashboard_frames(
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
-    # BLOQUE 3 NUEVO: LIBRES (mañana..+3) + con reposición
+    # BLOQUE 3: LIBRES (HOY..+3) + con reposición
     #  - "Libre" = NO existe ninguna reserva que solape la ventana
     #  - Solape si: entrada < (end+1) y salida > start
     # ---------------------------------------------------------
@@ -169,7 +166,6 @@ def build_dashboard_frames(
         .size()[["APARTAMENTO"]]
     )
 
-    # base única por apartamento (con zona/café/lista_reponer ya mapeados)
     base_ap = df.drop_duplicates("APARTAMENTO").copy()
 
     libres_3d = base_ap.merge(ocupados_en_ventana, on="APARTAMENTO", how="left", indicator=True)
@@ -201,7 +197,7 @@ def build_dashboard_frames(
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas_7d")
-        libres_3d.to_excel(writer, index=False, sheet_name="LibresReposicion_3d")
+        libres_3d.to_excel(writer, index=False, sheet_name="LibresReposicion_HoyMas3")
 
     return {
         "kpis": kpis,
