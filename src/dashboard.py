@@ -51,13 +51,14 @@ def build_dashboard_frames(
       - HOY = fecha local Europe/Madrid
       - Bloque 1: entradas HOY
       - Bloque 2: entradas desde mañana hasta +7 días (incluido)
-      - Bloque 3: ocupados hoy con salida desde mañana hasta +7 días (incluido)
+      - Bloque 3 NUEVO: apartamentos LIBRES desde mañana hasta +3 días (incluido),
+        agrupables por zona en UI, y SOLO si tienen Lista_reponer
 
-    Columnas:
-      Bloque 1 y 2:
-        APARTAMENTO, ZONA, CAFE_TIPO, Fecha entrada hora, Fecha salida hora, Lista_reponer
-      Bloque 3:
-        APARTAMENTO, ZONA, CAFE_TIPO, Fecha salida hora, Lista_reponer
+    Bloque 1 y 2 columnas:
+      APARTAMENTO, ZONA, CAFE_TIPO, Fecha entrada hora, Fecha salida hora, Lista_reponer
+
+    Bloque 3 columnas:
+      ZONA, APARTAMENTO, CAFE_TIPO, Lista_reponer
     """
 
     df = avantio_df.copy()
@@ -65,22 +66,28 @@ def build_dashboard_frames(
     # --- Hoy (Europe/Madrid) ---
     tz = ZoneInfo("Europe/Madrid")
     today = pd.Timestamp.now(tz=tz).normalize().date()
-    start = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()  # mañana
-    end = (pd.Timestamp(today) + pd.Timedelta(days=7)).date()    # +7 días
 
-    # --- Parse fechas desde columnas visibles ---
+    # Ventanas
+    start_7 = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()  # mañana
+    end_7 = (pd.Timestamp(today) + pd.Timedelta(days=7)).date()    # +7
+
+    # Bloque 3: mañana..+3 (incluido)
+    start_3 = start_7
+    end_3 = (pd.Timestamp(today) + pd.Timedelta(days=3)).date()
+
+    # --- Parse fechas ---
     entrada_dt = pd.to_datetime(df.get("Fecha entrada hora"), errors="coerce", dayfirst=True)
     salida_dt = pd.to_datetime(df.get("Fecha salida hora"), errors="coerce", dayfirst=True)
 
     df["entrada_d"] = entrada_dt.dt.date
     df["salida_d"] = salida_dt.dt.date
 
-    # --- Estados ---
+    # --- Flags ---
     df["Entra_hoy"] = df["entrada_d"] == today
-    df["Entra_prox_7d"] = (df["entrada_d"] >= start) & (df["entrada_d"] <= end)
+    df["Entra_prox_7d"] = (df["entrada_d"] >= start_7) & (df["entrada_d"] <= end_7)
 
+    # Ocupado hoy (incluye estancias que empezaron antes)
     df["Ocupado_hoy"] = (df["entrada_d"] <= today) & (today < df["salida_d"])
-    df["Sale_prox_7d"] = (df["salida_d"] >= start) & (df["salida_d"] <= end)
 
     # ---------------------------------------------------------
     # Lista_reponer por ALMACEN (filtrando café por CAFE_TIPO)
@@ -94,7 +101,6 @@ def build_dashboard_frames(
             how="left",
         )
 
-    # Si faltan columnas críticas en rep, no romper
     if "Amenity" in rep.columns and "A_reponer" in rep.columns:
         def keep_row(r):
             amen = r.get("Amenity")
@@ -119,7 +125,7 @@ def build_dashboard_frames(
 
         rep_items_agg = (
             rep_items.groupby("ALMACEN")["linea"]
-            .apply(lambda s: ", ".join(s.tolist()[:30]))
+            .apply(lambda s: ", ".join(s.tolist()[:60]))
             .reset_index()
             .rename(columns={"linea": "Lista_reponer"})
         )
@@ -150,12 +156,33 @@ def build_dashboard_frames(
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
-    # BLOQUE 3: Ocupados HOY con salida (mañana..+7)
+    # BLOQUE 3 NUEVO: LIBRES (mañana..+3) + con reposición
+    #  - "Libre" = NO existe ninguna reserva que solape la ventana
+    #  - Solape si: entrada < (end+1) y salida > start
     # ---------------------------------------------------------
-    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox_7d"]].copy()
-    ocupados_salida = ocupados_salida[
-        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha salida hora", "Lista_reponer"]
-    ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
+    end_3_plus1 = (pd.Timestamp(end_3) + pd.Timedelta(days=1)).date()
+    df["solapa_3d"] = (df["entrada_d"] < end_3_plus1) & (df["salida_d"] > start_3)
+
+    ocupados_en_ventana = (
+        df[df["solapa_3d"]]
+        .groupby("APARTAMENTO", as_index=False)
+        .size()[["APARTAMENTO"]]
+    )
+
+    # base única por apartamento (con zona/café/lista_reponer ya mapeados)
+    base_ap = df.drop_duplicates("APARTAMENTO").copy()
+
+    libres_3d = base_ap.merge(ocupados_en_ventana, on="APARTAMENTO", how="left", indicator=True)
+    libres_3d = libres_3d[libres_3d["_merge"] == "left_only"].copy()
+    libres_3d.drop(columns=["_merge"], inplace=True)
+
+    # Solo si tienen algo que reponer
+    libres_3d["Lista_reponer"] = libres_3d["Lista_reponer"].fillna("")
+    libres_3d = libres_3d[libres_3d["Lista_reponer"].astype(str).str.strip().ne("")].copy()
+
+    libres_3d = libres_3d[
+        ["ZONA", "APARTAMENTO", "CAFE_TIPO", "Lista_reponer"]
+    ].sort_values(["ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
     # KPIs
@@ -163,24 +190,24 @@ def build_dashboard_frames(
     kpis = {
         "entradas_hoy": int(df["Entra_hoy"].sum()),
         "entradas_proximas_7d": int(df["Entra_prox_7d"].sum()),
-        "ocupados_salida_prox_7d": int((df["Ocupado_hoy"] & df["Sale_prox_7d"]).sum()),
+        "libres_reposicion_3d": int(libres_3d["APARTAMENTO"].nunique()),
     }
 
     # ---------------------------------------------------------
-    # Excel
+    # Excel export
     # ---------------------------------------------------------
     filename = f"FloritOPS_{today.isoformat()}.xlsx"
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas_7d")
-        ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalida_7d")
+        libres_3d.to_excel(writer, index=False, sheet_name="LibresReposicion_3d")
 
     return {
         "kpis": kpis,
         "entradas_hoy": entradas_hoy,
         "entradas_proximas": entradas_proximas,
-        "ocupados_salida_proxima": ocupados_salida,
+        "libres_reposicion_3d": libres_3d,
         "excel_all": bio.getvalue(),
         "excel_filename": filename,
     }
