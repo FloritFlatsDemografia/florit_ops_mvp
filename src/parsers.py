@@ -1,233 +1,195 @@
 import pandas as pd
+from io import BytesIO
 import re
-import unicodedata
-from lxml import html
 
 
-def _norm(s: str) -> str:
-    s = str(s or "").strip()
-    s = s.replace("\n", " ")
-    s = re.sub(r"\s+", " ", s)
-    s = s.lower()
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    return s
+REQUIRED_AVANTIO_COLS = ["Alojamiento", "Fecha entrada hora", "Fecha salida hora"]
 
 
-def _row_score_as_header(values: list[str]) -> int:
-    txt = " | ".join(_norm(v) for v in values if v is not None)
-    score = 0
-    if "aloj" in txt:
-        score += 3
-    if "entrada" in txt and "fecha" in txt:
-        score += 3
-    if "salida" in txt and "fecha" in txt:
-        score += 3
-    if "check-in" in txt or "check in" in txt:
-        score += 1
-    if "check-out" in txt or "check out" in txt:
-        score += 1
-    if "cliente" in txt:
-        score += 1
-    return score
+def _is_html_bytes(b: bytes) -> bool:
+    head = b[:2000].lower()
+    return (b"<html" in head) or (b"rec-html40" in head) or (b"<table" in head)
 
 
-def _promote_best_header_row(df: pd.DataFrame, max_scan_rows: int = 15) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    cols_norm = [_norm(c) for c in df.columns]
-    if any("aloj" in c for c in cols_norm) and any("entrada" in c for c in cols_norm):
-        return df
-
-    scan_n = min(len(df), max_scan_rows)
-    best_i = None
-    best_score = -1
-    for i in range(scan_n):
-        row_vals = df.iloc[i].astype(str).tolist()
-        sc = _row_score_as_header(row_vals)
-        if sc > best_score:
-            best_score = sc
-            best_i = i
-
-    if best_i is None or best_score < 3:
-        return df
-
-    new_cols = df.iloc[best_i].astype(str).tolist()
-    out = df.iloc[best_i + 1 :].copy()
-    out.columns = [str(c).strip() for c in new_cols]
-    out = out.reset_index(drop=True)
-    return out
-
-
-def _find_required_columns(df: pd.DataFrame):
-    cols = list(df.columns)
-    norm = {_norm(c): c for c in cols}
-
-    def pick(patterns):
-        for nc, orig in norm.items():
-            ok = True
-            for p in patterns:
-                if re.search(p, nc) is None:
-                    ok = False
-                    break
-            if ok:
-                return orig
-        return None
-
-    c_aloj = pick([r"aloj"])
-    c_ent = pick([r"fecha", r"entrada"])
-    c_sal = pick([r"fecha", r"salida"])
-    return c_aloj, c_ent, c_sal
-
-
-def _html_tables_to_dfs(raw_html: str) -> list[pd.DataFrame]:
-    root = html.fromstring(raw_html)
-    tables = root.xpath("//table")
-    dfs = []
+def _clean_avantio_html_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Avantio exporta .xls que en realidad es HTML con muchas tablas.
+    Cada tabla suele tener:
+      fila 0: "Lunes, 2 Febrero 2026"
+      fila 1: cabecera real ("ID Reserva", "Localizador", "Alojamiento", ...)
+      filas 2..n: reservas
+    """
+    frames = []
 
     for t in tables:
-        rows = []
-        max_len = 0
-        for tr in t.xpath(".//tr"):
-            cells = tr.xpath("./th|./td")
-            row = []
-            for cell in cells:
-                txt = cell.text_content().strip()
-                colspan = cell.get("colspan")
-                try:
-                    colspan = int(colspan) if colspan else 1
-                except Exception:
-                    colspan = 1
-                row.append(txt)
-                for _ in range(colspan - 1):
-                    row.append("")
-            if row:
-                max_len = max(max_len, len(row))
-                rows.append(row)
-
-        if not rows or max_len <= 3:
+        if t is None or t.empty:
             continue
 
-        norm_rows = [r + [""] * (max_len - len(r)) for r in rows]
-        df = pd.DataFrame(norm_rows)
-        df = _promote_best_header_row(df, max_scan_rows=15)
-        dfs.append(df)
+        # Normalizamos: quitamos filas totalmente vacías
+        t = t.dropna(how="all")
+        if t.empty:
+            continue
 
-    return dfs
+        # Buscamos fila cabecera real: donde aparezca "ID Reserva"
+        # (suele estar en la primera columna)
+        header_idx = None
+        for i in range(min(len(t), 15)):
+            row = t.iloc[i].astype(str).str.strip().tolist()
+            if any(x == "ID Reserva" for x in row):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        header = t.iloc[header_idx].astype(str).str.strip().tolist()
+        data = t.iloc[header_idx + 1 :].copy()
+
+        # Si la tabla está “desplazada”, forzamos igual nº columnas
+        if data.shape[1] != len(header):
+            # Ajuste defensivo: recorta o rellena
+            n = min(data.shape[1], len(header))
+            data = data.iloc[:, :n]
+            header = header[:n]
+
+        data.columns = header
+
+        # Filtramos filas basura (cabeceras repetidas, etc.)
+        if "ID Reserva" in data.columns:
+            data = data[data["ID Reserva"].astype(str).str.strip().ne("ID Reserva")]
+
+        # Quitamos filas sin alojamiento (a veces hay separadores)
+        if "Alojamiento" in data.columns:
+            data = data[data["Alojamiento"].notna()]
+
+        if not data.empty:
+            frames.append(data)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Limpieza básica de texto
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+            df[c] = df[c].replace({"nan": None, "None": None, "": None})
+
+    return df
 
 
 def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
-    name = (uploaded_file.name or "").lower()
+    """
+    Acepta:
+      - .xls HTML (Avantio típico)
+      - .xlsx real
+      - .csv
+    Devuelve DataFrame con las columnas originales de Avantio (incluyendo REQUIRED_AVANTIO_COLS).
+    """
+    # Leemos bytes
+    b = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
 
-    if name.endswith(".xls") or name.endswith(".html"):
-        raw = uploaded_file.getvalue()
-        raw_html = None
-        for enc in ("utf-8", "latin1", "cp1252"):
-            raw_html = raw.decode(enc, errors="ignore")
-            if raw_html:
-                break
-
-        dfs = _html_tables_to_dfs(raw_html)
-        if not dfs:
-            raise ValueError("Avantio: no se detectaron tablas en el archivo .xls/.html")
-
-        best = None
-        best_score = -1
-        for d in dfs:
-            d.columns = [str(c).strip() for c in d.columns]
-            cols_norm = [_norm(c) for c in d.columns]
-            score = sum([
-                any("aloj" in c for c in cols_norm),
-                any(("fecha" in c and "entrada" in c) for c in cols_norm),
-                any(("fecha" in c and "salida" in c) for c in cols_norm),
-            ])
-            if score > best_score:
-                best = d
-                best_score = score
-
-        df = best.copy()
-
-    elif name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+    # Caso CSV
+    name = getattr(uploaded_file, "name", "") or ""
+    if name.lower().endswith(".csv"):
+        df = pd.read_csv(BytesIO(b))
     else:
-        df = pd.read_excel(uploaded_file)
+        # Caso HTML disguised .xls
+        if _is_html_bytes(b):
+            tables = pd.read_html(BytesIO(b))
+            df = _clean_avantio_html_tables(tables)
+        else:
+            # Excel real
+            df = pd.read_excel(BytesIO(b))
 
+    if df is None or df.empty:
+        raise ValueError("Avantio: no se han podido leer datos (archivo vacío o formato no soportado).")
+
+    # Normalizamos nombres por si vienen con espacios raros
     df.columns = [str(c).strip() for c in df.columns]
 
-    c_aloj, c_ent, c_sal = _find_required_columns(df)
-    if not (c_aloj and c_ent and c_sal):
+    # Validación columnas requeridas
+    detected = list(df.columns)
+    missing = [c for c in REQUIRED_AVANTIO_COLS if c not in df.columns]
+
+    if missing:
+        # Debug claro
         raise ValueError(
-            f"Avantio: faltan columnas requeridas. Detectadas={list(df.columns)[:50]} | "
-            f"Encontradas: alojamiento={c_aloj}, entrada={c_ent}, salida={c_sal}"
+            f"Avantio: faltan columnas requeridas: {missing}. Detectadas={detected[:50]}"
         )
 
-    df = df.rename(columns={
-        c_aloj: "Alojamiento",
-        c_ent: "Fecha entrada hora",
-        c_sal: "Fecha salida hora",
-    })
+    # Convertimos fechas (dejamos como columna original, pero que pandas pueda trabajar)
+    df["Fecha entrada hora"] = pd.to_datetime(df["Fecha entrada hora"], errors="coerce", dayfirst=True)
+    df["Fecha salida hora"] = pd.to_datetime(df["Fecha salida hora"], errors="coerce", dayfirst=True)
 
-    df["Fecha_entrada_dt"] = pd.to_datetime(df["Fecha entrada hora"], errors="coerce", dayfirst=True)
-    df["Fecha_salida_dt"] = pd.to_datetime(df["Fecha salida hora"], errors="coerce", dayfirst=True)
+    # Limpieza alojamiento
+    df["Alojamiento"] = df["Alojamiento"].astype(str).str.strip()
 
     return df
 
 
 def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
     """
-    Devuelve SIEMPRE un DataFrame o lanza ValueError.
-    Nunca devuelve None.
+    Espera:
+      - xlsx/csv con columnas al menos: 'Ubicación' y 'Producto' y 'Cantidad' (o similar)
+    Si tu export de Odoo tiene nombres distintos, aquí se adapta.
     """
-    if uploaded_file is None:
-        raise ValueError("Odoo: no se ha subido archivo.")
+    b = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    name = getattr(uploaded_file, "name", "") or ""
 
-    name = (uploaded_file.name or "").lower()
-
-    try:
-        if name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-    except Exception as e:
-        raise ValueError(f"Odoo: no pude leer el archivo ({e}).")
+    if name.lower().endswith(".csv"):
+        df = pd.read_csv(BytesIO(b))
+    else:
+        df = pd.read_excel(BytesIO(b))
 
     if df is None or df.empty:
-        raise ValueError("Odoo: el archivo está vacío o no tiene datos.")
+        return pd.DataFrame()
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Heurística flexible de columnas
-    col_ubi = col_prod = col_qty = None
+    # Intento de detección flexible
+    col_ubic = None
     for c in df.columns:
-        cl = _norm(c)
-        if col_ubi is None and (("ubic" in cl) or ("location" in cl)):
-            col_ubi = c
-        if col_prod is None and (("producto" in cl) or ("product" in cl)):
+        if c.lower() in ["ubicación", "ubicacion", "location", "ubicacion/stock", "ubicación"]:
+            col_ubic = c
+            break
+        if "ubic" in c.lower():
+            col_ubic = c
+            break
+
+    col_prod = None
+    for c in df.columns:
+        if c.lower() in ["producto", "product", "nombre producto", "product name"]:
             col_prod = c
-        if col_qty is None and (("cantidad" in cl) or ("quantity" in cl) or ("qty" in cl) or ("on hand" in cl) or ("dispon" in cl)):
+            break
+        if "product" in c.lower() or "producto" in c.lower():
+            col_prod = c
+            break
+
+    col_qty = None
+    for c in df.columns:
+        if c.lower() in ["cantidad", "quantity", "qty", "on hand", "disponible"]:
             col_qty = c
+            break
+        if "cant" in c.lower() or "quant" in c.lower() or "qty" in c.lower():
+            col_qty = c
+            break
 
-    if not (col_ubi and col_prod and col_qty):
-        raise ValueError(f"Odoo: no detecto columnas. Encontradas: Ubicación={col_ubi}, Producto={col_prod}, Cantidad={col_qty}. Columnas={list(df.columns)}")
+    if not (col_ubic and col_prod and col_qty):
+        raise ValueError(
+            f"Odoo: no se detectan columnas. Encontradas={list(df.columns)} | "
+            f"Detectadas: ubic={col_ubic}, prod={col_prod}, qty={col_qty}"
+        )
 
-    df = df.rename(columns={
-        col_ubi: "Ubicación",
-        col_prod: "Producto",
-        col_qty: "Cantidad",
-    })
+    out = df[[col_ubic, col_prod, col_qty]].copy()
+    out.columns = ["Ubicación", "Producto", "Cantidad"]
+
+    # Cantidad numérica
+    out["Cantidad"] = pd.to_numeric(out["Cantidad"], errors="coerce").fillna(0)
 
     # Limpieza
-    df["Producto"] = df["Producto"].astype(str).str.strip()
-    df["Ubicación"] = df["Ubicación"].astype(str).str.strip()
-    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
+    out["Ubicación"] = out["Ubicación"].astype(str).str.strip()
+    out["Producto"] = out["Producto"].astype(str).str.strip()
 
-    # Quitar agrupaciones tipo "(123)" en ubicación
-    df = df[~df["Ubicación"].str.contains(r"\(\d+\)", regex=True, na=False)].copy()
-
-    # Quitar filas sin producto
-    df = df[df["Producto"].notna() & (df["Producto"].str.strip() != "")].copy()
-
-    if df.empty:
-        raise ValueError("Odoo: tras limpiar, no quedó ninguna fila útil (Producto/Ubicación vacíos).")
-
-    return df
+    return out
