@@ -14,7 +14,7 @@ def main():
         st.markdown(
             """
 **Sube 2 archivos diarios:**
-- **Avantio (Entradas)**: .xls / .xlsx / .csv
+- **Avantio (Entradas)**: .xls / .xlsx / .csv / (xls HTML de Avantio)
 - **Odoo (stock.quant)**: .xlsx / .csv
 
 📌 Los **maestros fijos** se cargan automáticamente desde `data/` en GitHub:
@@ -53,7 +53,7 @@ def main():
     # ---------- Normaliza Odoo ----------
     odoo_norm = normalize_products(odoo_df)
 
-    # ---------- Mapea apt -> almacén ----------
+    # ---------- Mapa apt -> almacén ----------
     ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
@@ -80,7 +80,7 @@ def main():
     # Reposición min/max
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
-    # No lo mostramos, pero se lo pasamos por compatibilidad (si lo vuelves a activar)
+    # Productos sin clasificar (no se muestran)
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # ---------- Dashboard ----------
@@ -94,7 +94,7 @@ def main():
     c1, c2, c3 = st.columns(3)
     c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
     c2.metric("Entradas próximas (7 días)", int(dash["kpis"]["entradas_proximas_7d"]))
-    c3.metric("Ocupados con salida próxima (7 días)", int(dash["kpis"]["ocupados_salida_prox_7d"]))
+    c3.metric("Libres para reposición (3 días)", int(dash["kpis"]["libres_reposicion_3d"]))
 
     st.download_button(
         "⬇️ Descargar Excel (Dashboards)",
@@ -105,7 +105,7 @@ def main():
 
     st.divider()
 
-    st.subheader("1) PRIMER PLANO – Entradas HOY")
+    st.subheader("1) PRIMER PLANO – Entradas HOY (prioridad)")
     st.dataframe(dash["entradas_hoy"], use_container_width=True, height=340)
 
     st.divider()
@@ -115,8 +115,19 @@ def main():
 
     st.divider()
 
-    st.subheader("3) OCUPADOS con salida próxima – 7 días (desde mañana)")
-    st.dataframe(dash["ocupados_salida_proxima"], use_container_width=True, height=340)
+    st.subheader("3) LIBRES para reposición – 3 días (desde mañana) · agrupado por ZONA")
+
+    libres = dash["libres_reposicion_3d"].copy()
+    if libres.empty:
+        st.info("No hay apartamentos libres en la ventana de 3 días (desde mañana) con algo que reponer.")
+    else:
+        # Mostrar por secciones de zona (agrupado visual)
+        for zona, zdf in libres.groupby("ZONA", dropna=False):
+            zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
+            st.markdown(f"### {zona_label}")
+            st.dataframe(zdf.drop(columns=["ZONA"]), use_container_width=True, height=min(360, 40 + 35 * len(zdf)))
+
+    # (sin panel de control de calidad: eliminado)
 
 
 if __name__ == "__main__":
