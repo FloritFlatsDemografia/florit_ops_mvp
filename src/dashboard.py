@@ -1,7 +1,8 @@
 import pandas as pd
-from datetime import date, timedelta
+from datetime import timedelta
 from io import BytesIO
 import math
+from zoneinfo import ZoneInfo
 
 
 COFFEE_AMENITIES = {
@@ -9,6 +10,7 @@ COFFEE_AMENITIES = {
     "Cápsulas Nespresso",
     "Cápsulas Tassimo",
     "Cápsulas Dolce Gusto",
+    "Cápsulas Senseo",
 }
 
 
@@ -43,38 +45,44 @@ def _allowed_coffee_amenity(cafe_tipo) -> str | None:
 def build_dashboard_frames(
     avantio_df: pd.DataFrame,
     replenishment_df: pd.DataFrame,
-    ref_date: date,
-    window_days: int,
-    unclassified_products: pd.DataFrame,
+    unclassified_products: pd.DataFrame | None = None,
 ) -> dict:
+    """
+    Criterios fijos:
+      - HOY = fecha local Europe/Madrid
+      - Bloque 1: entradas HOY
+      - Bloque 2: entradas desde mañana hasta +7 días (incluido)
+      - Bloque 3: ocupados hoy con salida desde mañana hasta +7 días (incluido)
+
+    Columnas (limpias) en los 3 bloques:
+      - APARTAMENTO, ZONA, CAFE_TIPO, Fecha entrada hora, Fecha salida hora, Lista_reponer
+      (en bloque 3 no mostramos fecha entrada, solo salida)
+    """
 
     df = avantio_df.copy()
 
-    # =========================================================
-    # ✅ FUENTE ÚNICA DE VERDAD PARA FECHAS: columnas visibles
-    # =========================================================
+    # --- Hoy (Europe/Madrid) ---
+    tz = ZoneInfo("Europe/Madrid")
+    today = pd.Timestamp.now(tz=tz).normalize().date()
+    start = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()      # mañana
+    end = (pd.Timestamp(today) + pd.Timedelta(days=7)).date()        # +7 días
+
+    # --- Parse fechas desde columnas visibles ---
     entrada_dt = pd.to_datetime(df.get("Fecha entrada hora"), errors="coerce", dayfirst=True)
     salida_dt = pd.to_datetime(df.get("Fecha salida hora"), errors="coerce", dayfirst=True)
 
     df["entrada_d"] = entrada_dt.dt.date
     df["salida_d"] = salida_dt.dt.date
 
-    # Estados
-    df["Entra_hoy"] = df["entrada_d"] == ref_date
-    df["Sale_hoy"] = df["salida_d"] == ref_date
-    df["Ocupado_hoy"] = (df["entrada_d"] <= ref_date) & (ref_date < df["salida_d"])
+    # --- Estados ---
+    df["Entra_hoy"] = df["entrada_d"] == today
+    df["Entra_prox_7d"] = (df["entrada_d"] >= start) & (df["entrada_d"] <= end)
 
-    start_prox = ref_date + timedelta(days=1)                 # mañana
-    end_prox = ref_date + timedelta(days=window_days)         # fin ventana
-
-    # =========================================================
-    # ✅ Bloque 2: SOLO futuras, sin incluir hoy
-    # =========================================================
-    df["Entra_prox"] = (df["entrada_d"] >= start_prox) & (df["entrada_d"] <= end_prox)
-    df["Sale_prox"] = (df["salida_d"] > ref_date) & (df["salida_d"] <= end_prox)
+    df["Ocupado_hoy"] = (df["entrada_d"] <= today) & (today < df["salida_d"])
+    df["Sale_prox_7d"] = (df["salida_d"] >= start) & (df["salida_d"] <= end)
 
     # ---------------------------------------------------------
-    # Reposición (filtrar café por CAFE_TIPO)
+    # Lista_reponer por ALMACEN (filtrando café por CAFE_TIPO)
     # ---------------------------------------------------------
     rep = replenishment_df.copy()
 
@@ -82,7 +90,7 @@ def build_dashboard_frames(
         rep = rep.merge(
             df[["ALMACEN", "CAFE_TIPO"]].drop_duplicates(),
             on="ALMACEN",
-            how="left",
+            how="left"
         )
 
     def keep_row(r):
@@ -94,9 +102,13 @@ def build_dashboard_frames(
             return True
         return amen == allowed
 
-    rep = rep[rep.apply(keep_row, axis=1)].copy()
+    # Si no existe Amenity/A_reponer por cualquier motivo, no romper
+    if "Amenity" in rep.columns and "A_reponer" in rep.columns:
+        rep = rep[rep.apply(keep_row, axis=1)].copy()
+        rep_items = rep[rep["A_reponer"] > 0].copy()
+    else:
+        rep_items = pd.DataFrame(columns=["ALMACEN", "Amenity", "A_reponer"])
 
-    rep_items = rep[rep.get("A_reponer", 0) > 0].copy()
     if not rep_items.empty:
         rep_items["linea"] = (
             rep_items["Amenity"].astype(str)
@@ -121,47 +133,8 @@ def build_dashboard_frames(
     df["Lista_reponer"] = df["Lista_reponer"].fillna("")
 
     # ---------------------------------------------------------
-    # 1) Entradas HOY (limpio)
+    # BLOQUE 1: Entradas HOY (solo hoy)
     # ---------------------------------------------------------
     entradas_hoy = df[df["Entra_hoy"]].copy()
     entradas_hoy = entradas_hoy[
-        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora", "Lista_reponer"]
-    ].sort_values(["ZONA", "APARTAMENTO"])
-
-    # ---------------------------------------------------------
-    # 2) Entradas PRÓXIMAS (desde mañana) (limpio)
-    # ---------------------------------------------------------
-    entradas_proximas = df[df["Entra_prox"]].copy()
-    entradas_proximas = entradas_proximas[
-        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha entrada hora", "Fecha salida hora", "Lista_reponer"]
-    ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
-
-    # ---------------------------------------------------------
-    # 3) Ocupados con salida próxima (limpio)
-    # ---------------------------------------------------------
-    ocupados_salida = df[df["Ocupado_hoy"] & df["Sale_prox"]].copy()
-    ocupados_salida = ocupados_salida[
-        ["APARTAMENTO", "ZONA", "CAFE_TIPO", "Fecha salida hora", "Lista_reponer"]
-    ].sort_values(["Fecha salida hora", "ZONA", "APARTAMENTO"])
-
-    # KPIs
-    aptos_con_faltantes = int(df[df["Lista_reponer"].astype(str).str.strip().ne("")]["APARTAMENTO"].nunique())
-
-    # Excel
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
-        entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas")
-        ocupados_salida.to_excel(writer, index=False, sheet_name="OcupadosSalidaProx")
-
-    return {
-        "kpis": {
-            "entradas_hoy": int(df["Entra_hoy"].sum()),
-            "salidas_hoy": int(df["Sale_hoy"].sum()),
-            "aptos_con_faltantes": aptos_con_faltantes,
-        },
-        "entradas_hoy": entradas_hoy,
-        "entradas_proximas": entradas_proximas,
-        "ocupados_salida_proxima": ocupados_salida,
-        "excel_all": bio.getvalue(),
-    }
+        ["APART
