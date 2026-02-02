@@ -9,7 +9,6 @@ COFFEE_AMENITIES = {
     "Cápsulas Nespresso",
     "Cápsulas Tassimo",
     "Cápsulas Dolce Gusto",
-    "Cápsulas Senseo",
 }
 
 
