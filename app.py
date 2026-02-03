@@ -94,7 +94,7 @@ def main():
     c1, c2, c3 = st.columns(3)
     c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
     c2.metric("Entradas próximas (7 días)", int(dash["kpis"]["entradas_proximas_7d"]))
-    c3.metric("Libres para reposición (3 días)", int(dash["kpis"]["libres_reposicion_3d"]))
+    val = dash.get("kpis", {}).get("libres_reposicion_3d", None)  if val is None:     c3.metric("Libres para reposición (3 días)", "—")     st.warning("KPI 'libres_reposicion_3d' no disponible (faltan datos o no se calculó).") else:     c3.metric("Libres para reposición (3 días)", int(val))
 
     st.download_button(
         "⬇️ Descargar Excel (Dashboards)",
