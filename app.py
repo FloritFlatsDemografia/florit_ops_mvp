@@ -1,4 +1,26 @@
 import streamlit as st
+import pandas as pd
+
+
+def _style_operativa(df: pd.DataFrame):
+    """
+    Colorea filas según Estado.
+    """
+    colors = {
+        "ENTRADA+SALIDA": "#FFF3BF",  # amarillo suave
+        "ENTRADA": "#D3F9D8",         # verde suave
+        "SALIDA": "#FFE8CC",          # naranja suave
+        "OCUPADO": "#E7F5FF",         # azul suave
+        "VACIO": "#F1F3F5",           # gris suave
+    }
+
+    def row_style(row):
+        bg = colors.get(str(row.get("Estado", "")), "")
+        if bg:
+            return [f"background-color: {bg}"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(row_style, axis=1)
 
 
 def main():
@@ -8,7 +30,7 @@ def main():
     from src.dashboard import build_dashboard_frames
 
     st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
-    st.title("Florit OPS – Operativa diaria + reposición (amenities)")
+    st.title("Florit OPS – Parte diario (Operativa + Reposición)")
 
     with st.expander("📌 Cómo usar", expanded=False):
         st.markdown(
@@ -22,6 +44,11 @@ def main():
 - Apt↔Almacén
 - Café por apartamento
 - Stock mínimo/máximo (thresholds)
+
+✅ Resultado: un **parte operativo por día** con:
+- Entradas / Salidas / Ocupados / Vacíos (por apartamento)
+- Reposición (Lista_reponer)
+- Próxima entrada futura
 """
         )
 
@@ -35,11 +62,19 @@ def main():
         type=["xlsx", "csv"],
     )
 
+    st.sidebar.divider()
+    st.sidebar.header("Periodo operativo")
+    period_start = st.sidebar.date_input("Inicio", value=pd.Timestamp.today().date())
+    period_days = st.sidebar.number_input("Nº días", min_value=1, max_value=14, value=2, step=1)
+
+    st.sidebar.divider()
+    only_replenishment = st.sidebar.checkbox("Mostrar SOLO apartamentos con reposición", value=True)
+
     masters = load_masters_repo()
     st.sidebar.success("Maestros cargados desde GitHub ✅")
 
     if not (avantio_file and odoo_file):
-        st.info("Sube Avantio + Odoo para generar el dashboard.")
+        st.info("Sube Avantio + Odoo para generar el parte operativo.")
         st.stop()
 
     # ---------- Parse ----------
@@ -80,7 +115,7 @@ def main():
     # Reposición min/max
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
-    # Productos sin clasificar (no se muestran)
+    # Productos sin clasificar (por si luego quieres mostrarlo)
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # ---------- Dashboard ----------
@@ -88,28 +123,21 @@ def main():
         avantio_df=avantio_df,
         replenishment_df=rep,
         unclassified_products=unclassified,
+        period_start=period_start,
+        period_days=period_days,
     )
 
-    # ---------- KPIs (robustos) ----------
+    # ---------- KPIs ----------
     kpis = dash.get("kpis", {})
-
-    c1, c2, c3 = st.columns(3)
-
-    entradas_hoy = kpis.get("entradas_hoy", 0)
-    entradas_7d = kpis.get("entradas_proximas_7d", 0)
-    libres_3d_kpi = kpis.get("libres_reposicion_3d", None)
-
-    c1.metric("Entradas hoy", int(entradas_hoy) if entradas_hoy is not None else 0)
-    c2.metric("Entradas próximas (7 días)", int(entradas_7d) if entradas_7d is not None else 0)
-
-    if libres_3d_kpi is None:
-        c3.metric("Libres para reposición (3 días)", "—")
-        st.warning("KPI 'libres_reposicion_3d' no disponible (faltan datos o no se calculó).")
-    else:
-        c3.metric("Libres para reposición (3 días)", int(libres_3d_kpi))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
+    c2.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
+    c3.metric("Turnovers", kpis.get("turnovers_dia", 0))
+    c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
+    c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
     st.download_button(
-        "⬇️ Descargar Excel (Dashboards)",
+        "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
         file_name=dash["excel_filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -117,36 +145,34 @@ def main():
 
     st.divider()
 
-    st.subheader("1) PRIMER PLANO – Entradas HOY (prioridad)")
-    st.dataframe(dash["entradas_hoy"], use_container_width=True, height=340)
+    st.subheader("PARTE OPERATIVO · Entradas / Salidas / Ocupación / Vacíos + Reposición")
+    st.caption(f"Periodo: {dash['period_start']} → {dash['period_end']} · Prioridad: Entradas arriba · Agrupado por ZONA")
 
-    st.divider()
+    operativa = dash["operativa"].copy()
 
-    st.subheader("2) ENTRADAS PRÓXIMAS – 7 días (desde mañana)")
-    st.dataframe(dash["entradas_proximas"], use_container_width=True, height=340)
+    # Filtro solo con reposición (opcional)
+    if only_replenishment and "Lista_reponer" in operativa.columns:
+        operativa = operativa[operativa["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
-    st.divider()
+    # Orden global: Día, ZONA, prioridad, apartamento
+    operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
 
-    st.subheader("3) LIBRES para reposición – 3 días (desde mañana) · agrupado por ZONA")
+    # Mostrar por día y por zona
+    for dia, ddf in operativa.groupby("Día", dropna=False):
+        st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
+        if ddf.empty:
+            st.info("Sin datos.")
+            continue
 
-    # OJO: aquí también debe ser robusto si la clave no existe
-    libres = dash.get("libres_reposicion_3d", None)
-    if libres is None:
-        st.info("No disponible: 'libres_reposicion_3d' no viene en el dashboard (revisar build_dashboard_frames).")
-        st.stop()
-
-    libres = libres.copy()
-    if libres.empty:
-        st.info("No hay apartamentos libres en la ventana de 3 días (desde mañana) con algo que reponer.")
-    else:
-        # Mostrar por secciones de zona (agrupado visual)
-        for zona, zdf in libres.groupby("ZONA", dropna=False):
+        for zona, zdf in ddf.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
-            st.markdown(f"### {zona_label}")
+            st.markdown(f"#### {zona_label}")
+
+            show_df = zdf.drop(columns=["ZONA", "__prio"], errors="ignore").copy()
             st.dataframe(
-                zdf.drop(columns=["ZONA"]),
+                _style_operativa(show_df),
                 use_container_width=True,
-                height=min(360, 40 + 35 * len(zdf)),
+                height=min(520, 40 + 35 * len(show_df)),
             )
 
 
