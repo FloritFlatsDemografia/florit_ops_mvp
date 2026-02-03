@@ -51,14 +51,14 @@ def build_dashboard_frames(
       - HOY = fecha local Europe/Madrid
       - Bloque 1: entradas HOY
       - Bloque 2: entradas desde mañana hasta +7 días (incluido)
-      - Bloque 3: apartamentos LIBRES HOY..+3 (incluido),
+      - Bloque 3: apartamentos LIBRES HOY..mañana (incluido),
         agrupables por zona en UI, y SOLO si tienen Lista_reponer
 
     Bloque 1 y 2 columnas:
       APARTAMENTO, ZONA, CAFE_TIPO, Fecha entrada hora, Fecha salida hora, Lista_reponer
 
     Bloque 3 columnas:
-      ZONA, APARTAMENTO, CAFE_TIPO, Lista_reponer
+      ZONA, APARTAMENTO, CAFE_TIPO, Proxima_Entrada, Lista_reponer
     """
 
     df = avantio_df.copy()
@@ -71,7 +71,7 @@ def build_dashboard_frames(
     start_7 = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()  # mañana
     end_7 = (pd.Timestamp(today) + pd.Timedelta(days=7)).date()    # +7
 
-    # Bloque 3: HOY..+3 (incluido)
+    # Bloque 3: HOY..mañana (incluido)
     start_3 = today
     end_3 = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
 
@@ -81,6 +81,17 @@ def build_dashboard_frames(
 
     df["entrada_d"] = entrada_dt.dt.date
     df["salida_d"] = salida_dt.dt.date
+
+    # ---------------------------------------------------------
+    # Próxima entrada FUTURA por apartamento (mínima entrada_d > today)
+    # (Si un apt no tiene futuras, queda vacío)
+    # ---------------------------------------------------------
+    next_entry = (
+        df[df["entrada_d"] > today]
+        .groupby("APARTAMENTO", as_index=False)["entrada_d"]
+        .min()
+        .rename(columns={"entrada_d": "Proxima_Entrada"})
+    )
 
     # --- Flags ---
     df["Entra_hoy"] = df["entrada_d"] == today
@@ -99,6 +110,7 @@ def build_dashboard_frames(
         )
 
     if "Amenity" in rep.columns and "A_reponer" in rep.columns:
+
         def keep_row(r):
             amen = r.get("Amenity")
             if amen not in COFFEE_AMENITIES:
@@ -153,7 +165,7 @@ def build_dashboard_frames(
     ].sort_values(["Fecha entrada hora", "ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
-    # BLOQUE 3: LIBRES (HOY..+3) + con reposición
+    # BLOQUE 3: LIBRES (HOY..mañana) + con reposición
     #  - "Libre" = NO existe ninguna reserva que solape la ventana
     #  - Solape si: entrada < (end+1) y salida > start
     # ---------------------------------------------------------
@@ -172,12 +184,15 @@ def build_dashboard_frames(
     libres_3d = libres_3d[libres_3d["_merge"] == "left_only"].copy()
     libres_3d.drop(columns=["_merge"], inplace=True)
 
+    # Añadir próxima entrada (si existe)
+    libres_3d = libres_3d.merge(next_entry, on="APARTAMENTO", how="left")
+
     # Solo si tienen algo que reponer
     libres_3d["Lista_reponer"] = libres_3d["Lista_reponer"].fillna("")
     libres_3d = libres_3d[libres_3d["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
     libres_3d = libres_3d[
-        ["ZONA", "APARTAMENTO", "CAFE_TIPO", "Lista_reponer"]
+        ["ZONA", "APARTAMENTO", "CAFE_TIPO", "Proxima_Entrada", "Lista_reponer"]
     ].sort_values(["ZONA", "APARTAMENTO"])
 
     # ---------------------------------------------------------
@@ -197,7 +212,7 @@ def build_dashboard_frames(
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         entradas_hoy.to_excel(writer, index=False, sheet_name="EntradasHoy")
         entradas_proximas.to_excel(writer, index=False, sheet_name="EntradasProximas_7d")
-        libres_3d.to_excel(writer, index=False, sheet_name="LibresReposicion_HoyMas3")
+        libres_3d.to_excel(writer, index=False, sheet_name="LibresReposicion_HoyManana")
 
     return {
         "kpis": kpis,
