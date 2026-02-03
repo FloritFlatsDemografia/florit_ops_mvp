@@ -90,11 +90,23 @@ def main():
         unclassified_products=unclassified,
     )
 
-    # KPIs
+    # ---------- KPIs (robustos) ----------
+    kpis = dash.get("kpis", {})
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Entradas hoy", int(dash["kpis"]["entradas_hoy"]))
-    c2.metric("Entradas próximas (7 días)", int(dash["kpis"]["entradas_proximas_7d"]))
-    val = dash.get("kpis", {}).get("libres_reposicion_3d", None)  if val is None:     c3.metric("Libres para reposición (3 días)", "—")     st.warning("KPI 'libres_reposicion_3d' no disponible (faltan datos o no se calculó).") else:     c3.metric("Libres para reposición (3 días)", int(val))
+
+    entradas_hoy = kpis.get("entradas_hoy", 0)
+    entradas_7d = kpis.get("entradas_proximas_7d", 0)
+    libres_3d_kpi = kpis.get("libres_reposicion_3d", None)
+
+    c1.metric("Entradas hoy", int(entradas_hoy) if entradas_hoy is not None else 0)
+    c2.metric("Entradas próximas (7 días)", int(entradas_7d) if entradas_7d is not None else 0)
+
+    if libres_3d_kpi is None:
+        c3.metric("Libres para reposición (3 días)", "—")
+        st.warning("KPI 'libres_reposicion_3d' no disponible (faltan datos o no se calculó).")
+    else:
+        c3.metric("Libres para reposición (3 días)", int(libres_3d_kpi))
 
     st.download_button(
         "⬇️ Descargar Excel (Dashboards)",
@@ -117,7 +129,13 @@ def main():
 
     st.subheader("3) LIBRES para reposición – 3 días (desde mañana) · agrupado por ZONA")
 
-    libres = dash["libres_reposicion_3d"].copy()
+    # OJO: aquí también debe ser robusto si la clave no existe
+    libres = dash.get("libres_reposicion_3d", None)
+    if libres is None:
+        st.info("No disponible: 'libres_reposicion_3d' no viene en el dashboard (revisar build_dashboard_frames).")
+        st.stop()
+
+    libres = libres.copy()
     if libres.empty:
         st.info("No hay apartamentos libres en la ventana de 3 días (desde mañana) con algo que reponer.")
     else:
@@ -125,15 +143,16 @@ def main():
         for zona, zdf in libres.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"### {zona_label}")
-            st.dataframe(zdf.drop(columns=["ZONA"]), use_container_width=True, height=min(360, 40 + 35 * len(zdf)))
-
-    # (sin panel de control de calidad: eliminado)
+            st.dataframe(
+                zdf.drop(columns=["ZONA"]),
+                use_container_width=True,
+                height=min(360, 40 + 35 * len(zdf)),
+            )
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        st.set_page_config(page_title="Florit OPS – Error", layout="wide")
         st.title("⚠️ Error en la app (detalle visible)")
         st.exception(e)
