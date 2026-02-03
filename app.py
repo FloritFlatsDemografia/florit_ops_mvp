@@ -1,7 +1,68 @@
 import streamlit as st
 import pandas as pd
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 
+# =========================
+# Config ruta (Google Maps)
+# =========================
+ORIGIN_LAT = 39.45702028460933
+ORIGIN_LNG = -0.38498336081567713
+
+
+def _coord_str(lat, lng):
+    try:
+        return f"{float(lat):.8f},{float(lng):.8f}"
+    except Exception:
+        return None
+
+
+def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=False):
+    """
+    coords: lista de strings "lat,lng" (paradas).
+    - return_to_base=True: destination = origen, waypoints = paradas
+    - return_to_base=False: destination = última parada, waypoints = resto
+    """
+    # limpiar y deduplicar manteniendo orden
+    clean = []
+    seen = set()
+    for c in coords:
+        if isinstance(c, str) and "," in c and c not in seen:
+            seen.add(c)
+            clean.append(c)
+
+    if not clean:
+        return None
+
+    origin = f"{ORIGIN_LAT:.8f},{ORIGIN_LNG:.8f}"
+
+    if return_to_base:
+        destination = origin
+        waypoints = clean
+    else:
+        destination = clean[-1]
+        waypoints = clean[:-1]
+
+    wp = "|".join(waypoints)
+
+    url = "https://www.google.com/maps/dir/?api=1"
+    url += f"&origin={quote(origin)}"
+    url += f"&destination={quote(destination)}"
+    if wp:
+        url += f"&waypoints={quote(wp)}"
+    url += f"&travelmode={quote(travelmode)}"
+    return url
+
+
+def chunk_list(xs, n):
+    for i in range(0, len(xs), n):
+        yield xs[i : i + n]
+
+
+# =========================
+# Estilos tabla operativa
+# =========================
 def _style_operativa(df: pd.DataFrame):
     """
     Colorea filas según Estado.
@@ -41,7 +102,7 @@ def main():
 
 📌 Los **maestros fijos** se cargan automáticamente desde `data/` en GitHub:
 - Zonas
-- Apt↔Almacén
+- Apt↔Almacén (incluye Localizacion lat,lng)
 - Café por apartamento
 - Stock mínimo/máximo (thresholds)
 
@@ -49,6 +110,8 @@ def main():
 - Entradas / Salidas / Ocupados / Vacíos (por apartamento)
 - Reposición (Lista_reponer)
 - Próxima entrada futura
+
+📍 NUEVO: **Ruta Google Maps** para reposición HOY y MAÑANA, por ZONA (salida: Florit Flats).
 """
         )
 
@@ -70,6 +133,11 @@ def main():
     st.sidebar.divider()
     only_replenishment = st.sidebar.checkbox("Mostrar SOLO apartamentos con reposición", value=True)
 
+    st.sidebar.divider()
+    st.sidebar.header("Ruta (reposiciones hoy + mañana)")
+    travelmode = st.sidebar.selectbox("Modo", ["walking", "driving"], index=0)
+    return_to_base = st.sidebar.checkbox("Volver a Florit Flats al final", value=False)
+
     masters = load_masters_repo()
     st.sidebar.success("Maestros cargados desde GitHub ✅")
 
@@ -88,10 +156,31 @@ def main():
     # ---------- Normaliza Odoo ----------
     odoo_norm = normalize_products(odoo_df)
 
-    # ---------- Mapa apt -> almacén ----------
-    ap_map = masters["apt_almacen"][["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates()
+    # ---------- Mapa apt -> almacén + localización ----------
+    # Se asume que el maestro apt_almacen ya tiene columna "Localizacion" con "lat,lng"
+    apt_master = masters["apt_almacen"].copy()
+
+    # Intento robusto: si por cualquier motivo la columna viniera con acento
+    if "Localizacion" not in apt_master.columns and "Localización" in apt_master.columns:
+        apt_master = apt_master.rename(columns={"Localización": "Localizacion"})
+
+    required_cols = {"APARTAMENTO", "ALMACEN", "Localizacion"}
+    missing_cols = required_cols - set(apt_master.columns)
+    if missing_cols:
+        st.error(f"Faltan columnas en maestro apt_almacen: {missing_cols}. Revisa el Excel de GitHub.")
+        st.stop()
+
+    ap_map = apt_master[["APARTAMENTO", "ALMACEN", "Localizacion"]].copy()
+    ap_map = ap_map.dropna(subset=["APARTAMENTO"]).drop_duplicates()
+
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
+
+    # Parse Localizacion -> LAT/LNG
+    loc = ap_map["Localizacion"].astype(str).str.replace(" ", "", regex=False)
+    parts = loc.str.split(",", n=1, expand=True)
+    ap_map["LAT"] = pd.to_numeric(parts[0], errors="coerce")
+    ap_map["LNG"] = pd.to_numeric(parts[1], errors="coerce")
 
     # Avantio -> APARTAMENTO
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
@@ -99,7 +188,9 @@ def main():
     # Cruces maestros
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
-    avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
+
+    # añade almacén + coords
+    avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
 
     # Odoo -> ALMACEN (desde Ubicación)
     odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
@@ -143,6 +234,14 @@ def main():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    # Aviso si faltan coordenadas en el maestro (de cara a rutas)
+    missing_coords = ap_map[ap_map["LAT"].isna() | ap_map["LNG"].isna()]["APARTAMENTO"].dropna().unique().tolist()
+    if missing_coords:
+        st.warning(
+            f"Faltan coordenadas en {len(missing_coords)} apartamentos (no entrarán en rutas). "
+            f"Ej: {', '.join(missing_coords[:8])}"
+        )
+
     st.divider()
 
     st.subheader("PARTE OPERATIVO · Entradas / Salidas / Ocupación / Vacíos + Reposición")
@@ -150,6 +249,58 @@ def main():
 
     operativa = dash["operativa"].copy()
 
+    # ============
+    # RUTAS: reposición HOY y MAÑANA (corto plazo)
+    # ============
+    st.divider()
+    st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
+    st.caption("Incluye solo apartamentos con Lista_reponer y coordenadas. Salida: Florit Flats.")
+
+    tz = ZoneInfo("Europe/Madrid")
+    today = pd.Timestamp.now(tz=tz).normalize().date()
+    tomorrow = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
+
+    # Solo hoy y mañana + con reposición
+    short_df = operativa.copy()
+    if "Lista_reponer" in short_df.columns:
+        short_df = short_df[short_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
+    short_df = short_df[short_df["Día"].isin([today, tomorrow])].copy()
+
+    # Añadir coords a operativa (merge por APARTAMENTO desde ap_map)
+    short_df = short_df.merge(ap_map[["APARTAMENTO", "LAT", "LNG"]], on="APARTAMENTO", how="left")
+    short_df["COORD"] = short_df.apply(
+        lambda r: _coord_str(r["LAT"], r["LNG"]) if pd.notna(r.get("LAT")) and pd.notna(r.get("LNG")) else None,
+        axis=1
+    )
+
+    # Si quieres solo rutas para mañana (por ejemplo), lo cambias aquí.
+    if short_df.empty:
+        st.info("No hay reposiciones previstas para HOY y MAÑANA en el periodo seleccionado (o no hay Lista_reponer).")
+    else:
+        MAX_STOPS = 20  # por seguridad (waypoints en Google Maps)
+        # Por cada día, por cada zona
+        for dia, ddf in short_df.groupby("Día", dropna=False):
+            st.markdown(f"### {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
+            for zona, zdf in ddf.groupby("ZONA", dropna=False):
+                zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
+                coords = [c for c in zdf["COORD"].tolist() if c]
+
+                # Si no hay coords suficientes, aviso
+                if not coords:
+                    st.info(f"{zona_label}: sin coordenadas suficientes para generar ruta.")
+                    continue
+
+                # Dividir en tramos si hay muchos puntos
+                for idx, chunk in enumerate(chunk_list(coords, MAX_STOPS), start=1):
+                    url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
+                    if url:
+                        st.markdown(f"**{zona_label} · Ruta (tramo {idx})**: {url}")
+
+    st.divider()
+
+    # ============
+    # Tablas operativas (lo que ya tenías)
+    # ============
     # Filtro solo con reposición (opcional)
     if only_replenishment and "Lista_reponer" in operativa.columns:
         operativa = operativa[operativa["Lista_reponer"].astype(str).str.strip().ne("")].copy()
