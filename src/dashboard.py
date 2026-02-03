@@ -73,7 +73,7 @@ def build_dashboard_frames(
 
     # Bloque 3: HOY..+3 (incluido)
     start_3 = today
-    end_3 = (pd.Timestamp(today) + pd.Timedelta(days=3)).date()
+    end_3 = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
 
     # --- Parse fechas ---
     entrada_dt = pd.to_datetime(df.get("Fecha entrada hora"), errors="coerce", dayfirst=True)
