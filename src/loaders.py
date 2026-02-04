@@ -1,269 +1,177 @@
 # src/loaders.py
 from __future__ import annotations
 
-from functools import lru_cache
 from pathlib import Path
 import pandas as pd
 
 
-def _norm(s: str) -> str:
-    s = str(s).strip().lower()
-    s = (
-        s.replace("ó", "o")
-        .replace("í", "i")
-        .replace("á", "a")
-        .replace("é", "e")
-        .replace("ú", "u")
-        .replace("ñ", "n")
-    )
-    s = s.replace(" ", "").replace("_", "").replace("-", "")
-    return s
+def _repo_root() -> Path:
+    # src/loaders.py -> src -> repo root
+    return Path(__file__).resolve().parents[1]
 
 
-def _pick_file(data_dir: Path, patterns: list[str]) -> Path:
-    for pat in patterns:
-        hits = sorted(data_dir.glob(pat))
-        if hits:
-            return hits[0]
-    raise FileNotFoundError(
-        f"No encuentro archivo en data/ con patrones: {patterns}. "
-        f"Archivos actuales: {[p.name for p in sorted(data_dir.iterdir()) if p.is_file()]}"
-    )
+def _data_dir() -> Path:
+    return _repo_root() / "data"
 
 
-def _pick_sheet_by_cols(xls: pd.ExcelFile, required_norm_cols: set[str]) -> str:
-    best = None
-    best_score = -1
-    for sh in xls.sheet_names:
-        hdr = xls.parse(sheet_name=sh, nrows=0)
-        cols = {_norm(c) for c in hdr.columns}
-        score = len(required_norm_cols.intersection(cols))
-        if score > best_score:
-            best_score = score
-            best = sh
-    return best or xls.sheet_names[0]
+def _read_excel_first_sheet(path: Path) -> pd.DataFrame:
+    return pd.read_excel(path, sheet_name=0, engine="openpyxl")
 
 
-def _read_excel_best_sheet(path: Path, required_norm_cols: set[str]) -> pd.DataFrame:
-    xls = pd.ExcelFile(path)
-    sh = _pick_sheet_by_cols(xls, required_norm_cols)
-    df = pd.read_excel(path, sheet_name=sh)
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def _rename(df: pd.DataFrame, mapping_norm_to_std: dict[str, str]) -> pd.DataFrame:
-    norm_map = {_norm(c): c for c in df.columns}
-    ren = {}
-    for nk, std in mapping_norm_to_std.items():
-        if nk in norm_map:
-            ren[norm_map[nk]] = std
-    return df.rename(columns=ren)
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = {str(c).strip().lower(): str(c).strip() for c in df.columns}
+    for cand in candidates:
+        k = cand.strip().lower()
+        if k in cols:
+            return cols[k]
+    return None
 
 
-def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]
-    rows = []
-    for zcol in cols:
-        s = df[zcol].dropna()
-        for v in s.tolist():
-            apt = str(v).strip()
-            if not apt or apt.lower() == "nan":
-                continue
-            rows.append({"APARTAMENTO": apt, "ZONA": str(zcol).strip()})
-    out = pd.DataFrame(rows).drop_duplicates()
-    if not out.empty:
-        out["ZONA"] = out["ZONA"].str.replace(r"^Zona\s+", "", regex=True).str.strip()
-    return out
+def _load_zonas(path: Path) -> pd.DataFrame:
+    df = _norm_cols(_read_excel_first_sheet(path))
 
+    c_ap = _find_col(df, ["APARTAMENTO", "Apartamento", "APARTAMENTOS"])
+    c_z = _find_col(df, ["ZONA", "Zona"])
 
-def _cafe_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
-
-    df = df.loc[:, [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]]
-
-    d1 = _rename(
-        df,
-        {
-            "apartamento": "APARTAMENTO",
-            "cafe_tipo": "CAFE_TIPO",
-            "cafetipo": "CAFE_TIPO",
-            "cafe": "CAFE_TIPO",
-            "tipocafe": "CAFE_TIPO",
-        },
-    )
-    if "APARTAMENTO" in d1.columns and "CAFE_TIPO" in d1.columns:
-        out = d1[["APARTAMENTO", "CAFE_TIPO"]].copy()
+    # Caso 1: formato largo APARTAMENTO/ZONA
+    if c_ap and c_z:
+        out = df[[c_ap, c_z]].copy()
+        out.columns = ["APARTAMENTO", "ZONA"]
         out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
-        out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
+        out["ZONA"] = out["ZONA"].astype(str).str.strip()
         out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
         return out.drop_duplicates()
 
-    if df.shape[1] == 2:
-        out = df.copy()
+    # Caso 2: formato ancho (cada columna es una zona y dentro hay apartamentos)
+    rows = []
+    for col in df.columns:
+        zona = str(col).strip()
+        ser = df[col]
+        for v in ser.dropna().tolist():
+            apt = str(v).strip()
+            if apt and apt.lower() != "nan":
+                rows.append((apt, zona))
+    out = pd.DataFrame(rows, columns=["APARTAMENTO", "ZONA"]).drop_duplicates()
+
+    # Limpieza opcional: quitar prefijo "Zona " si viene así
+    out["ZONA"] = out["ZONA"].str.replace(r"^\s*Zona\s+", "", regex=True).str.strip()
+    return out
+
+
+def _load_cafe(path: Path) -> pd.DataFrame:
+    df = _norm_cols(_read_excel_first_sheet(path))
+
+    c_ap = _find_col(df, ["APARTAMENTO", "Apartamento"])
+    c_cafe = _find_col(df, ["CAFE_TIPO", "Café", "Cafe", "CAFE", "TIPO CAFE", "Tipo cafe", "Tipo Café"])
+
+    # Caso 1: formato correcto
+    if c_ap and c_cafe:
+        out = df[[c_ap, c_cafe]].copy()
         out.columns = ["APARTAMENTO", "CAFE_TIPO"]
         out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
         out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
         out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
         return out.drop_duplicates()
 
-    cols = [str(c).strip() for c in df.columns]
-    if all(_norm(c) not in ("apartamento", "cafe", "cafetipo", "cafe_tipo", "tipocafe") for c in cols):
-        first_row = df.iloc[0].tolist() if len(df) > 0 else []
-        pairs = []
-        for apt, caf in zip(cols, first_row):
-            apt_s = str(apt).strip()
-            caf_s = str(caf).strip()
-            if apt_s and apt_s.lower() != "nan":
-                pairs.append({"APARTAMENTO": apt_s, "CAFE_TIPO": caf_s})
-        out = pd.DataFrame(pairs)
+    # Caso 2: el excel viene “sin headers” (pandas interpretó la primera fila como columnas)
+    df2 = pd.read_excel(path, sheet_name=0, header=None, engine="openpyxl")
+    if df2.shape[1] >= 2:
+        out = df2.iloc[:, :2].copy()
+        out.columns = ["APARTAMENTO", "CAFE_TIPO"]
         out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
         out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
+        out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
         return out.drop_duplicates()
 
     return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
 
 
-def _maybe_promote_first_row_as_header(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Si el excel viene con una fila de títulos dentro del cuerpo (típico),
-    y pandas ha puesto columnas tipo Unnamed, intentamos usar df.iloc[0] como header.
-    """
-    if df is None or df.empty:
-        return df
+def _load_apt_almacen(path: Path) -> pd.DataFrame:
+    df = _norm_cols(_read_excel_first_sheet(path))
 
-    unnamed_ratio = sum(str(c).lower().startswith("unnamed") for c in df.columns) / max(1, len(df.columns))
-    if unnamed_ratio < 0.5:
-        return df
+    c_alm = _find_col(df, ["ALMACEN", "Almacen", "ALMACÉN", "Almacén"])
+    c_ap = _find_col(df, ["APARTAMENTO", "Apartamento"])
+    # OJO: tu cabecera real es "Localiación" (errata). Lo soportamos.
+    c_loc = _find_col(df, ["Localizacion", "Localización", "Localiación", "LOCALIZACION", "LOCALIZACIÓN", "LOCALIAción", "LOCALIAcion"])
 
-    row0 = [str(x).strip() for x in df.iloc[0].tolist()]
-    row0_norm = {_norm(x) for x in row0}
-    # Si en esa fila aparecen palabras “tipo header”, promovemos
-    if {"amenity", "producto", "articulo", "item"}.intersection(row0_norm):
-        df2 = df.copy()
-        df2.columns = [str(x).strip() for x in df2.iloc[0]]
-        df2 = df2.iloc[1:].reset_index(drop=True)
-        return df2
+    if not c_alm or not c_ap:
+        raise ValueError(
+            f"APT↔ALMACÉN: el maestro debe tener ALMACEN y APARTAMENTO. Columnas detectadas: {list(df.columns)}"
+        )
 
-    return df
+    cols = [c_alm, c_ap] + ([c_loc] if c_loc else [])
+    out = df[cols].copy()
 
-
-def _ensure_thresholds_amenity(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Garantiza columna 'Amenity' (mínimo para que summarize_replenishment funcione).
-    No renombra Min/Max para no romper lógica existente.
-    """
-    if df is None:
-        return pd.DataFrame(columns=["Amenity"])
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.loc[:, [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]]
-
-    # intento: cabecera en primera fila
-    df = _maybe_promote_first_row_as_header(df)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # renombres típicos
-    df = _rename(
-        df,
-        {
-            "amenity": "Amenity",
-            "amenities": "Amenity",
-            "producto": "Amenity",
-            "product": "Amenity",
-            "articulo": "Amenity",
-            "item": "Amenity",
-            "nombre": "Amenity",
-        },
+    out = out.rename(
+        columns={
+            c_alm: "ALMACEN",
+            c_ap: "APARTAMENTO",
+            **({c_loc: "Localizacion"} if c_loc else {}),
+        }
     )
 
-    # fallback: si sigue sin Amenity, usar primera columna como Amenity
-    if "Amenity" not in df.columns and len(df.columns) >= 1:
-        df = df.rename(columns={df.columns[0]: "Amenity"})
+    out["ALMACEN"] = out["ALMACEN"].astype(str).str.strip()
+    out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
 
-    # limpiar
-    if "Amenity" in df.columns:
-        df["Amenity"] = df["Amenity"].astype(str).str.strip()
-        df = df[df["Amenity"].ne("") & df["Amenity"].ne("nan")]
+    if "Localizacion" not in out.columns:
+        out["Localizacion"] = ""
 
-    return df
+    out["Localizacion"] = out["Localizacion"].astype(str).str.strip()
+    out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
+    return out.drop_duplicates()
 
 
-@lru_cache(maxsize=1)
+def _load_thresholds(path: Path) -> pd.DataFrame:
+    df = _norm_cols(_read_excel_first_sheet(path))
+
+    c_am = _find_col(df, ["Amenity", "AMENITY", "Producto", "PRODUCTO", "Item", "ITEM"])
+    c_min = _find_col(df, ["Min", "MIN", "Minimo", "Mínimo", "STOCK_MIN", "MINIMO"])
+    c_max = _find_col(df, ["Max", "MAX", "Maximo", "Máximo", "STOCK_MAX", "MAXIMO"])
+
+    if not c_am:
+        raise ValueError(f"THRESHOLDS: no encuentro columna Amenity/Producto. Columnas: {list(df.columns)}")
+
+    use_cols = [c_am] + ([c_min] if c_min else []) + ([c_max] if c_max else [])
+    out = df[use_cols].copy()
+    out = out.rename(columns={c_am: "Amenity", **({c_min: "Min"} if c_min else {}), **({c_max: "Max"} if c_max else {})})
+
+    out["Amenity"] = out["Amenity"].astype(str).str.strip()
+    out = out[out["Amenity"].ne("") & out["Amenity"].ne("nan")]
+    return out.drop_duplicates()
+
+
 def load_masters_repo() -> dict:
-    base_dir = Path(__file__).resolve().parents[1]
-    data_dir = base_dir / "data"
-    if not data_dir.exists():
-        raise FileNotFoundError(f"No existe carpeta data/: {data_dir}")
+    d = _data_dir()
 
-    apt_file = _pick_file(data_dir, ["*Apartamentos*Inventarios*.xlsx", "*Apartamentos*Inventarios*.xls"])
-    cafe_file = _pick_file(data_dir, ["*Cafe*por*apartamento*.xlsx", "*Cafe*por*apartamento*.xls"])
-    thr_file = _pick_file(data_dir, ["*Stock*minimo*por*almacen*.xlsx", "*Stock*minimo*por*almacen*.xls"])
-    zonas_file = _pick_file(
-        data_dir,
-        ["*Agrupacion*apartamento*por*z*.xlsx", "*Agrupacion*apartamento*por*z*.xls", "*Zonas*.xlsx", "*Zonas*.xls"],
-    )
+    # Ajusta aquí si cambias nombres de archivos
+    zonas_path = next(d.glob("Agrupacion*zonas*.xlsx"), None)
+    cafe_path = next(d.glob("Cafe*apartamento*.xlsx"), None)
+    apt_path = next(d.glob("Apartamentos*Inventarios*.xlsx"), None)
+    thr_path = next(d.glob("Stock*minimo*almacen*.xlsx"), None)
 
-    apt = _read_excel_best_sheet(apt_file, {"apartamento", "almacen"})
-    cafe_raw = _read_excel_best_sheet(cafe_file, {"apartamento"})
-    thresholds_raw = _read_excel_best_sheet(thr_file, {"amenity"})
-    zonas_raw = _read_excel_best_sheet(zonas_file, {"apartamento", "zona"})
+    if zonas_path is None:
+        raise FileNotFoundError("No encuentro en data/ el Excel de ZONAS (Agrupacion*zonas*.xlsx).")
+    if cafe_path is None:
+        raise FileNotFoundError("No encuentro en data/ el Excel de CAFE (Cafe*apartamento*.xlsx).")
+    if apt_path is None:
+        raise FileNotFoundError("No encuentro en data/ el Excel APT↔ALMACEN (Apartamentos*Inventarios*.xlsx).")
+    if thr_path is None:
+        raise FileNotFoundError("No encuentro en data/ el Excel THRESHOLDS (Stock*minimo*almacen*.xlsx).")
 
-    # -------- ZONAS --------
-    zonas_try = _rename(zonas_raw, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
-    if "APARTAMENTO" in zonas_try.columns and "ZONA" in zonas_try.columns:
-        zonas = zonas_try[["APARTAMENTO", "ZONA"]].copy()
-        zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
-        zonas["ZONA"] = zonas["ZONA"].astype(str).str.strip()
-    else:
-        zonas = _zonas_wide_to_long(zonas_raw)
-        if zonas.empty:
-            raise ValueError(
-                f"ZONAS debe tener APARTAMENTO y ZONA, o venir en formato columnas por zona. "
-                f"Columnas: {list(zonas_raw.columns)}"
-            )
-
-    # -------- CAFE --------
-    cafe = _cafe_to_long(cafe_raw)
-    if cafe.empty:
-        raise ValueError(f"CAFE no reconocido. Columnas: {list(cafe_raw.columns)}")
-
-    # -------- APT_ALMACEN (+ Localizacion) --------
-    apt = _rename(
-        apt,
-        {
-            "apartamento": "APARTAMENTO",
-            "almacen": "ALMACEN",
-            "localizacion": "Localizacion",
-            "localizaciongps": "Localizacion",
-            "coordenadas": "Localizacion",
-            "coords": "Localizacion",
-            "gps": "Localizacion",
-        },
-    )
-    if "Localización" in apt.columns and "Localizacion" not in apt.columns:
-        apt = apt.rename(columns={"Localización": "Localizacion"})
-
-    if "APARTAMENTO" not in apt.columns or "ALMACEN" not in apt.columns:
-        raise ValueError(f"APT_ALMACEN debe tener APARTAMENTO y ALMACEN. Columnas: {list(apt.columns)}")
-
-    if "Localizacion" not in apt.columns:
-        apt["Localizacion"] = pd.NA
-
-    apt = apt[["APARTAMENTO", "ALMACEN", "Localizacion"]].copy()
-    apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
-    apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
-
-    # -------- THRESHOLDS (FIX) --------
-    thresholds = _ensure_thresholds_amenity(thresholds_raw)
-    if "Amenity" not in thresholds.columns:
-        raise ValueError(f"THRESHOLDS: no se pudo detectar columna Amenity. Columnas: {list(thresholds_raw.columns)}")
+    zonas = _load_zonas(zonas_path)
+    cafe = _load_cafe(cafe_path)
+    apt_almacen = _load_apt_almacen(apt_path)
+    thresholds = _load_thresholds(thr_path)
 
     return {
         "zonas": zonas,
-        "apt_almacen": apt,
         "cafe": cafe,
+        "apt_almacen": apt_almacen,
         "thresholds": thresholds,
     }
