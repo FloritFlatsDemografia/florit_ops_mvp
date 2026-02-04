@@ -1,295 +1,354 @@
-# src/loaders.py
-from __future__ import annotations
-
-from pathlib import Path
-from dataclasses import dataclass
-from functools import lru_cache
+import streamlit as st
 import pandas as pd
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 
-# =========================================
-# Helpers de normalización / detección
-# =========================================
-def _norm_col(s: str) -> str:
-    s = str(s).strip().lower()
-    s = (
-        s.replace("ó", "o")
-        .replace("í", "i")
-        .replace("á", "a")
-        .replace("é", "e")
-        .replace("ú", "u")
-        .replace("ñ", "n")
-    )
-    s = s.replace(" ", "").replace("_", "").replace("-", "")
-    return s
+# =========================
+# Config ruta (Google Maps)
+# =========================
+ORIGIN_LAT = 39.45702028460933
+ORIGIN_LNG = -0.38498336081567713
 
 
-def _safe_columns(df: pd.DataFrame) -> list[str]:
-    return [str(c).strip() for c in df.columns]
-
-
-def _read_csv(path: Path) -> pd.DataFrame:
-    # Intentos típicos para CSVs
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            return pd.read_csv(path, encoding=enc)
-        except Exception:
-            continue
-    # último intento
-    return pd.read_csv(path, encoding="latin-1", errors="ignore")
-
-
-@dataclass
-class TableRef:
-    path: Path
-    kind: str  # "excel" o "csv"
-    sheet: str | None
-    cols_norm: set[str]
-
-
-def _list_data_files(data_dir: Path) -> list[Path]:
-    exts = (".xlsx", ".xls", ".csv")
-    files = []
-    for p in data_dir.glob("*"):
-        if p.is_file() and p.suffix.lower() in exts:
-            files.append(p)
-    return sorted(files)
-
-
-def _index_tables(data_dir: Path) -> list[TableRef]:
-    """
-    Indexa todas las tablas en /data:
-      - CSV: una tabla
-      - Excel: una tabla por hoja
-    Lee SOLO headers (nrows=0) para detectar columnas.
-    """
-    refs: list[TableRef] = []
-    for path in _list_data_files(data_dir):
-        suf = path.suffix.lower()
-        if suf == ".csv":
-            try:
-                df0 = _read_csv(path)
-                cols = {_norm_col(c) for c in _safe_columns(df0)}
-                refs.append(TableRef(path=path, kind="csv", sheet=None, cols_norm=cols))
-            except Exception:
-                continue
-        else:
-            try:
-                xl = pd.ExcelFile(path)
-                for sh in xl.sheet_names:
-                    try:
-                        hdr = xl.parse(sheet_name=sh, nrows=0)
-                        cols = {_norm_col(c) for c in _safe_columns(hdr)}
-                        refs.append(TableRef(path=path, kind="excel", sheet=sh, cols_norm=cols))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-    return refs
-
-
-def _score(ref: TableRef, want: str) -> int:
-    """
-    Scoring heurístico para elegir la mejor tabla para cada maestro.
-    """
-    fn = ref.path.name.lower()
-    sh = (ref.sheet or "").lower()
-
-    has_ap = "apartamento" in ref.cols_norm
-    has_al = "almacen" in ref.cols_norm
-    has_z = "zona" in ref.cols_norm
-    has_cafe = any(k in ref.cols_norm for k in ("cafetipo", "cafe", "tipo_cafe", "cafe_tipo"))
-    has_amenity = "amenity" in ref.cols_norm
-
-    # min/max típicos (thresholds)
-    has_min = any(k in ref.cols_norm for k in ("min", "minimo", "stockmin", "stockminimo"))
-    has_max = any(k in ref.cols_norm for k in ("max", "maximo", "stockmax", "stockmaximo"))
-
-    # localizacion/coords
-    has_loc = any(k in ref.cols_norm for k in ("localizacion", "localizaciongps", "gps", "coords", "coordenadas", "lat", "lng"))
-
-    score = 0
-
-    if want == "apt_almacen":
-        if has_ap and has_al:
-            score += 100
-        if has_loc:
-            score += 25
-        if "apart" in fn or "invent" in fn or "almacen" in fn:
-            score += 10
-        if "almacen" in sh or "apto" in sh or "apart" in sh:
-            score += 5
-
-    elif want == "zonas":
-        if has_ap and has_z:
-            score += 100
-        if "zona" in fn:
-            score += 10
-        if "zona" in sh:
-            score += 5
-
-    elif want == "cafe":
-        if has_ap and has_cafe:
-            score += 100
-        if "cafe" in fn:
-            score += 10
-        if "cafe" in sh:
-            score += 5
-
-    elif want == "thresholds":
-        # exigimos Amenity y algo tipo min/max
-        if has_amenity and (has_min or has_max):
-            score += 100
-        if "threshold" in fn or "stock" in fn or "min" in fn or "max" in fn:
-            score += 10
-        if "threshold" in sh or "stock" in sh or "min" in sh or "max" in sh:
-            score += 5
-
-    return score
-
-
-def _pick_table(refs: list[TableRef], want: str) -> TableRef | None:
-    best = None
-    best_score = -1
-    for r in refs:
-        s = _score(r, want)
-        if s > best_score:
-            best_score = s
-            best = r
-    if best_score < 80:  # umbral: evita elegir “cualquier cosa”
+def _coord_str(lat, lng):
+    try:
+        return f"{float(lat):.8f},{float(lng):.8f}"
+    except Exception:
         return None
-    return best
 
 
-def _load_table(ref: TableRef) -> pd.DataFrame:
-    if ref.kind == "csv":
-        df = _read_csv(ref.path)
+def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=False):
+    """
+    coords: lista de strings "lat,lng" (paradas).
+    - return_to_base=True: destination = origen, waypoints = paradas
+    - return_to_base=False: destination = última parada, waypoints = resto
+    """
+    clean = []
+    seen = set()
+    for c in coords:
+        if isinstance(c, str) and "," in c and c not in seen:
+            seen.add(c)
+            clean.append(c)
+
+    if not clean:
+        return None
+
+    origin = f"{ORIGIN_LAT:.8f},{ORIGIN_LNG:.8f}"
+
+    if return_to_base:
+        destination = origin
+        waypoints = clean
     else:
-        df = pd.read_excel(ref.path, sheet_name=ref.sheet)
-    df.columns = _safe_columns(df)
-    return df
+        destination = clean[-1]
+        waypoints = clean[:-1]
+
+    wp = "|".join(waypoints)
+
+    url = "https://www.google.com/maps/dir/?api=1"
+    url += f"&origin={quote(origin)}"
+    url += f"&destination={quote(destination)}"
+    if wp:
+        url += f"&waypoints={quote(wp)}"
+    url += f"&travelmode={quote(travelmode)}"
+    return url
 
 
-def _rename_to_standard(df: pd.DataFrame, desired: dict[str, str]) -> pd.DataFrame:
-    """
-    desired: norm_key -> standard_name
-    """
-    cols = list(df.columns)
-    norm_map = {_norm_col(c): c for c in cols}
-    rename = {}
-    for nk, std in desired.items():
-        if nk in norm_map:
-            rename[norm_map[nk]] = std
-    return df.rename(columns=rename)
+def chunk_list(xs, n):
+    for i in range(0, len(xs), n):
+        yield xs[i : i + n]
 
 
-# =========================================
-# API pública (mantiene tu interfaz actual)
-# =========================================
-@lru_cache(maxsize=1)
-def load_masters_repo() -> dict:
-    """
-    Carga maestros desde /data del repo.
-    Devuelve dict con keys:
-      - zonas
-      - apt_almacen
-      - cafe
-      - thresholds
-    """
-    base_dir = Path(__file__).resolve().parents[1]
-    data_dir = base_dir / "data"
-    if not data_dir.exists():
-        raise FileNotFoundError(f"No existe carpeta data/ en el repo: {data_dir}")
+# =========================
+# Estilos tabla operativa
+# =========================
+def _style_operativa(df: pd.DataFrame):
+    colors = {
+        "ENTRADA+SALIDA": "#FFF3BF",
+        "ENTRADA": "#D3F9D8",
+        "SALIDA": "#FFE8CC",
+        "OCUPADO": "#E7F5FF",
+        "VACIO": "#F1F3F5",
+    }
 
-    refs = _index_tables(data_dir)
+    def row_style(row):
+        bg = colors.get(str(row.get("Estado", "")), "")
+        if bg:
+            return [f"background-color: {bg}"] * len(row)
+        return [""] * len(row)
 
-    if not refs:
-        files = [p.name for p in _list_data_files(data_dir)]
-        raise FileNotFoundError(f"No se detectaron tablas legibles en data/. Archivos: {files}")
+    return df.style.apply(row_style, axis=1)
 
-    # Elegimos tablas
-    ref_apt = _pick_table(refs, "apt_almacen")
-    ref_zon = _pick_table(refs, "zonas")
-    ref_caf = _pick_table(refs, "cafe")
-    ref_thr = _pick_table(refs, "thresholds")
 
-    missing = []
-    if ref_apt is None: missing.append("apt_almacen")
-    if ref_zon is None: missing.append("zonas")
-    if ref_caf is None: missing.append("cafe")
-    if ref_thr is None: missing.append("thresholds")
+# =========================
+# BOOTSTRAP: pinta algo SIEMPRE
+# =========================
+st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
+st.title("Florit OPS – Parte diario (Operativa + Reposición)")
+st.caption("Si ves esto, el script está arrancando. Si se queda en blanco, no está ejecutando app.py.")
 
-    if missing:
-        # Mensaje “accionable”
-        detected = sorted({r.path.name for r in refs})
-        raise ValueError(
-            "No pude detectar estos maestros en data/: "
-            f"{missing}. Archivos detectados: {detected}. "
-            "Asegura que existan hojas/CSVs con columnas esperadas."
+
+def main():
+    # Importar módulos “pesados” DESPUÉS de pintar algo
+    try:
+        from src.loaders import load_masters_repo
+        from src.parsers import parse_avantio_entradas, parse_odoo_stock
+        from src.normalize import normalize_products, summarize_replenishment
+        from src.dashboard import build_dashboard_frames
+    except Exception as e:
+        st.error("Error importando módulos de /src (loaders/parsers/normalize/dashboard).")
+        st.exception(e)
+        st.stop()
+
+    with st.expander("📌 Cómo usar", expanded=False):
+        st.markdown(
+            """
+**2 clics:**
+1) Subes Avantio
+2) Subes Odoo
+
+📌 Maestros desde `data/` (GitHub):
+- Zonas
+- Apt↔Almacén (+ Localizacion)
+- Café por apartamento
+- Stock mínimo/máximo (thresholds)
+
+📍 Ruta Google Maps: reposición HOY y MAÑANA por ZONA (salida Florit Flats).
+"""
         )
 
-    # Cargar DF
-    apt = _load_table(ref_apt)
-    zonas = _load_table(ref_zon)
-    cafe = _load_table(ref_caf)
-    thresholds = _load_table(ref_thr)
-
-    # Normalizar columnas mínimas esperadas
-    # ZONAS: APARTAMENTO, ZONA
-    zonas = _rename_to_standard(zonas, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
-    if "APARTAMENTO" not in zonas.columns:
-        raise ValueError(f"Maestro zonas sin APARTAMENTO. Columnas: {list(zonas.columns)}")
-    if "ZONA" not in zonas.columns:
-        # si existe algo parecido, mejor no inventar: que falle claro
-        raise ValueError(f"Maestro zonas sin ZONA. Columnas: {list(zonas.columns)}")
-    zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
-
-    # CAFE: APARTAMENTO, CAFE_TIPO
-    cafe = _rename_to_standard(cafe, {"apartamento": "APARTAMENTO", "cafetipo": "CAFE_TIPO", "cafe_tipo": "CAFE_TIPO", "cafe": "CAFE_TIPO"})
-    if "APARTAMENTO" not in cafe.columns or "CAFE_TIPO" not in cafe.columns:
-        raise ValueError(f"Maestro cafe debe tener APARTAMENTO y CAFE_TIPO. Columnas: {list(cafe.columns)}")
-    cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
-
-    # APT_ALMACEN: APARTAMENTO, ALMACEN, Localizacion (opcional pero la forzamos)
-    apt = _rename_to_standard(
-        apt,
-        {
-            "apartamento": "APARTAMENTO",
-            "almacen": "ALMACEN",
-            "localizacion": "Localizacion",
-            "localizaciongps": "Localizacion",
-            "coordenadas": "Localizacion",
-            "coords": "Localizacion",
-            "gps": "Localizacion",
-            "localizacion ": "Localizacion",
-            "localizacion\t": "Localizacion",
-        },
+    # =========================
+    # Sidebar (mínimo)
+    # =========================
+    st.sidebar.header("Archivos diarios")
+    avantio_file = st.sidebar.file_uploader(
+        "Avantio (Entradas) .xls/.xlsx/.csv",
+        type=["xls", "xlsx", "csv", "html"],
+    )
+    odoo_file = st.sidebar.file_uploader(
+        "Odoo (stock.quant) .xlsx/.csv",
+        type=["xlsx", "csv"],
     )
 
-    # Si venía con acento:
-    if "Localización" in apt.columns and "Localizacion" not in apt.columns:
-        apt = apt.rename(columns={"Localización": "Localizacion"})
+    # Por defecto: HOY + MAÑANA (2 días)
+    tz = ZoneInfo("Europe/Madrid")
+    today = pd.Timestamp.now(tz=tz).normalize().date()
 
-    if "APARTAMENTO" not in apt.columns or "ALMACEN" not in apt.columns:
-        raise ValueError(f"Maestro apt_almacen debe tener APARTAMENTO y ALMACEN. Columnas: {list(apt.columns)}")
+    # Controles avanzados (colapsados) — por si quieres ajustar luego
+    with st.sidebar.expander("Avanzado (opcional)", expanded=False):
+        period_start = st.date_input("Inicio", value=today)
+        period_days = st.number_input("Nº días", min_value=1, max_value=14, value=2, step=1)
+        only_replenishment = st.checkbox("Mostrar SOLO apartamentos con reposición", value=True)
+        travelmode = st.selectbox("Modo ruta", ["walking", "driving"], index=0)
+        return_to_base = st.checkbox("Volver a Florit Flats al final", value=False)
 
-    if "Localizacion" not in apt.columns:
-        # clave: si no existe, la creamos para que la app no falle
-        apt["Localizacion"] = pd.NA
+    # Si no abres “Avanzado”, usa defaults de 2 clics
+    if "period_start" not in locals():
+        period_start = today
+    if "period_days" not in locals():
+        period_days = 2
+    if "only_replenishment" not in locals():
+        only_replenishment = True
+    if "travelmode" not in locals():
+        travelmode = "walking"
+    if "return_to_base" not in locals():
+        return_to_base = False
 
-    apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
-    apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
+    # =========================
+    # Cargar maestros
+    # =========================
+    try:
+        with st.spinner("Cargando maestros (data/ en GitHub)…"):
+            masters = load_masters_repo()
+        st.sidebar.success("Maestros cargados ✅")
+    except Exception as e:
+        st.error("Fallo cargando maestros (data/).")
+        st.exception(e)
+        st.stop()
 
-    # THRESHOLDS: no renombro agresivo para no romper tu lógica interna,
-    # solo limpio headers y aseguro "Amenity" si viniera en mayúsculas.
-    thresholds.columns = _safe_columns(thresholds)
-    # si existiera AMENITY -> Amenity
-    if "AMENITY" in thresholds.columns and "Amenity" not in thresholds.columns:
-        thresholds = thresholds.rename(columns={"AMENITY": "Amenity"})
+    if not (avantio_file and odoo_file):
+        st.info("Sube Avantio + Odoo para generar el parte operativo.")
+        st.stop()
 
-    return {
-        "zonas": zonas,
-        "apt_almacen": apt,
-        "cafe": cafe,
-        "thresholds": thresholds,
-    }
+    # =========================
+    # Parse inputs
+    # =========================
+    avantio_df = parse_avantio_entradas(avantio_file)
+    odoo_df = parse_odoo_stock(odoo_file)
+
+    if odoo_df is None or odoo_df.empty:
+        st.error("Odoo: no se pudieron leer datos del stock.quant (archivo vacío o columnas no detectadas).")
+        st.stop()
+
+    # Normaliza Odoo
+    odoo_norm = normalize_products(odoo_df)
+
+    # =========================
+    # Maestro apt_almacen con Localizacion
+    # =========================
+    apt_master = masters.get("apt_almacen", pd.DataFrame()).copy()
+    if apt_master.empty:
+        st.error("El maestro apt_almacen viene vacío. Revisa data/Apartamentos e Inventarios.xlsx.")
+        st.stop()
+
+    # soportar Localización con acento
+    if "Localizacion" not in apt_master.columns and "Localización" in apt_master.columns:
+        apt_master = apt_master.rename(columns={"Localización": "Localizacion"})
+
+    has_loc = "Localizacion" in apt_master.columns
+
+    # Mapa apt -> almacén
+    need_cols = {"APARTAMENTO", "ALMACEN"}
+    if not need_cols.issubset(set(apt_master.columns)):
+        st.error(f"apt_almacen debe tener columnas {need_cols}. Columnas detectadas: {list(apt_master.columns)}")
+        st.stop()
+
+    ap_map = apt_master[["APARTAMENTO", "ALMACEN"] + (["Localizacion"] if has_loc else [])].dropna(subset=["APARTAMENTO"]).drop_duplicates()
+    ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
+    ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
+
+    # Parse Localizacion -> LAT/LNG
+    if has_loc:
+        loc = ap_map["Localizacion"].astype(str).str.replace(" ", "", regex=False)
+        parts = loc.str.split(",", n=1, expand=True)
+        ap_map["LAT"] = pd.to_numeric(parts[0], errors="coerce")
+        ap_map["LNG"] = pd.to_numeric(parts[1], errors="coerce")
+    else:
+        ap_map["LAT"] = pd.NA
+        ap_map["LNG"] = pd.NA
+        st.warning(
+            "No se ha encontrado columna 'Localizacion' en apt_almacen. "
+            f"Columnas detectadas: {list(apt_master.columns)}. "
+            "La app seguirá, pero sin rutas."
+        )
+
+    # Avantio -> APARTAMENTO
+    avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
+
+    # Cruces maestros
+    avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
+    avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
+    avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
+
+    # Odoo -> ALMACEN (desde Ubicación)
+    odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
+    odoo_norm["ALMACEN"] = odoo_norm["ALMACEN"].astype(str).str.strip()
+
+    # Stock por almacén + amenity
+    stock_by_alm = (
+        odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"]
+        .sum()
+        .rename(columns={"Cantidad": "Cantidad"})
+    )
+
+    # Reposición min/max
+    rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
+
+    unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
+
+    # =========================
+    # Dashboard
+    # =========================
+    dash = build_dashboard_frames(
+        avantio_df=avantio_df,
+        replenishment_df=rep,
+        unclassified_products=unclassified,
+        period_start=period_start,
+        period_days=period_days,
+    )
+
+    # KPIs
+    kpis = dash.get("kpis", {})
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
+    c2.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
+    c3.metric("Turnovers", kpis.get("turnovers_dia", 0))
+    c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
+    c5.metric("Vacíos", kpis.get("vacios_dia", 0))
+
+    st.download_button(
+        "⬇️ Descargar Excel (Operativa)",
+        data=dash["excel_all"],
+        file_name=dash["excel_filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    operativa = dash["operativa"].copy()
+
+    # =========================
+    # Rutas HOY + MAÑANA
+    # =========================
+    st.divider()
+    st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
+
+    if not has_loc:
+        st.info("Sin rutas: falta columna 'Localizacion' en maestro apt_almacen.")
+    else:
+        tomorrow = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
+
+        short_df = operativa.copy()
+        if "Lista_reponer" in short_df.columns:
+            short_df = short_df[short_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
+
+        short_df = short_df[short_df["Día"].isin([today, tomorrow])].copy()
+        short_df = short_df.merge(ap_map[["APARTAMENTO", "LAT", "LNG"]], on="APARTAMENTO", how="left")
+        short_df["COORD"] = short_df.apply(
+            lambda r: _coord_str(r["LAT"], r["LNG"]) if pd.notna(r.get("LAT")) and pd.notna(r.get("LNG")) else None,
+            axis=1
+        )
+
+        if short_df.empty:
+            st.info("No hay reposiciones previstas para HOY y MAÑANA.")
+        else:
+            MAX_STOPS = 20
+            for dia, ddf in short_df.groupby("Día", dropna=False):
+                st.markdown(f"### {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
+                for zona, zdf in ddf.groupby("ZONA", dropna=False):
+                    zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
+                    coords = [c for c in zdf["COORD"].tolist() if c]
+                    if not coords:
+                        st.info(f"{zona_label}: sin coordenadas suficientes para generar ruta.")
+                        continue
+
+                    for idx, chunk in enumerate(chunk_list(coords, MAX_STOPS), start=1):
+                        url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
+                        if url:
+                            # botón clicable (mejor que mostrar la url cruda)
+                            st.link_button(f"{zona_label} · Ruta (tramo {idx})", url)
+
+    # =========================
+    # Tabla operativa
+    # =========================
+    st.divider()
+    st.subheader("PARTE OPERATIVO · Entradas/Salidas/Ocupación/Vacíos + Reposición")
+    st.caption(f"Periodo: {dash['period_start']} → {dash['period_end']} · Agrupado por ZONA")
+
+    if only_replenishment and "Lista_reponer" in operativa.columns:
+        operativa = operativa[operativa["Lista_reponer"].astype(str).str.strip().ne("")].copy()
+
+    operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
+
+    for dia, ddf in operativa.groupby("Día", dropna=False):
+        st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
+        if ddf.empty:
+            st.info("Sin datos.")
+            continue
+
+        for zona, zdf in ddf.groupby("ZONA", dropna=False):
+            zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
+            st.markdown(f"#### {zona_label}")
+
+            show_df = zdf.drop(columns=["ZONA", "__prio"], errors="ignore").copy()
+            st.dataframe(
+                _style_operativa(show_df),
+                use_container_width=True,
+                height=min(520, 40 + 35 * len(show_df)),
+            )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        st.error("⚠️ Error en la app (detalle visible)")
+        st.exception(e)
