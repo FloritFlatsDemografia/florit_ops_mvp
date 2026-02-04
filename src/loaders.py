@@ -62,13 +62,7 @@ def _rename(df: pd.DataFrame, mapping_norm_to_std: dict[str, str]) -> pd.DataFra
 
 
 def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convierte un excel de zonas en formato columnas (cada columna = zona, celdas = apartamentos)
-    a formato largo: APARTAMENTO, ZONA.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["APARTAMENTO", "ZONA"])
-
+    # columnas = zonas, celdas = apartamentos
     cols = [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]
     rows = []
     for zcol in cols:
@@ -80,12 +74,65 @@ def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
             rows.append({"APARTAMENTO": apt, "ZONA": str(zcol).strip()})
 
     out = pd.DataFrame(rows).drop_duplicates()
-
-    # Limpieza de nombres de zona: "Zona Puerto" -> "Puerto"
     if not out.empty:
         out["ZONA"] = out["ZONA"].str.replace(r"^Zona\s+", "", regex=True).str.strip()
-
     return out
+
+
+def _cafe_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Acepta varios formatos:
+    1) Tabla: APARTAMENTO / CAFE_TIPO
+    2) 2 columnas sin headers claros (ej: col0=apartamento, col1=cafe)
+    3) Transpuesto: una fila con cafés y cabeceras como apartamentos (ej: columnas = apartamentos)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
+
+    # limpiar columnas "Unnamed"
+    df = df.loc[:, [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]]
+
+    # Intento 1: tabla estándar
+    d1 = _rename(df, {"apartamento": "APARTAMENTO", "cafe_tipo": "CAFE_TIPO", "cafetipo": "CAFE_TIPO", "cafe": "CAFE_TIPO", "tipocafe": "CAFE_TIPO"})
+    if "APARTAMENTO" in d1.columns and "CAFE_TIPO" in d1.columns:
+        out = d1[["APARTAMENTO", "CAFE_TIPO"]].copy()
+        out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
+        out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
+        out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
+        return out.drop_duplicates()
+
+    # Intento 2: 2 columnas “sin headers”
+    if df.shape[1] == 2:
+        out = df.copy()
+        out.columns = ["APARTAMENTO", "CAFE_TIPO"]
+        out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
+        out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
+        out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
+        return out.drop_duplicates()
+
+    # Intento 3: transpuesto (cabeceras son apartamentos, primera fila es café)
+    # Caso típico: columnas = ['ALFARO','Tassimo'] porque la primera fila se tomó como cabecera -> ya está “mal leído”.
+    # Lo arreglamos leyendo de nuevo SIN cabecera si detectamos que las "columnas" parecen datos.
+    cols = [str(c).strip() for c in df.columns]
+    # Heurística: si no hay ninguna columna que parezca "apartamento/cafe" y hay pocas columnas,
+    # probablemente es transpuesto.
+    if all(_norm(c) not in ("apartamento", "cafe", "cafetipo", "cafe_tipo", "tipocafe") for c in cols):
+        # Convertir de "columns = apartamentos" a long usando la primera fila como valor
+        # df.iloc[0] contiene cafés (o algo equivalente)
+        first_row = df.iloc[0].tolist() if len(df) > 0 else []
+        pairs = []
+        for apt, caf in zip(cols, first_row):
+            apt_s = str(apt).strip()
+            caf_s = str(caf).strip()
+            if apt_s and apt_s.lower() != "nan":
+                pairs.append({"APARTAMENTO": apt_s, "CAFE_TIPO": caf_s})
+        out = pd.DataFrame(pairs)
+        out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
+        out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
+        return out.drop_duplicates()
+
+    # fallback: no reconocido
+    return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
 
 
 @lru_cache(maxsize=1)
@@ -95,51 +142,36 @@ def load_masters_repo() -> dict:
     if not data_dir.exists():
         raise FileNotFoundError(f"No existe carpeta data/: {data_dir}")
 
-    # Archivos por patrón (tu estructura actual)
     apt_file = _pick_file(data_dir, ["*Apartamentos*Inventarios*.xlsx", "*Apartamentos*Inventarios*.xls"])
     cafe_file = _pick_file(data_dir, ["*Cafe*por*apartamento*.xlsx", "*Cafe*por*apartamento*.xls"])
     thr_file = _pick_file(data_dir, ["*Stock*minimo*por*almacen*.xlsx", "*Stock*minimo*por*almacen*.xls"])
     zonas_file = _pick_file(data_dir, ["*Agrupacion*apartamento*por*z*.xlsx", "*Agrupacion*apartamento*por*z*.xls", "*Zonas*.xlsx", "*Zonas*.xls"])
 
-    # Leer (hoja “mejor” por columnas esperadas)
     apt = _read_excel_best_sheet(apt_file, {"apartamento", "almacen"})
-    cafe = _read_excel_best_sheet(cafe_file, {"apartamento"})
+    cafe_raw = _read_excel_best_sheet(cafe_file, {"apartamento"})
     thresholds = _read_excel_best_sheet(thr_file, {"amenity"})
     zonas_raw = _read_excel_best_sheet(zonas_file, {"apartamento", "zona"})
 
-    # ---------- ZONAS ----------
-    # Intento 1: formato tabla clásico
-    zonas = _rename(zonas_raw, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
-    if "APARTAMENTO" in zonas.columns and "ZONA" in zonas.columns:
-        zonas = zonas[["APARTAMENTO", "ZONA"]].copy()
+    # -------- ZONAS --------
+    zonas_try = _rename(zonas_raw, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
+    if "APARTAMENTO" in zonas_try.columns and "ZONA" in zonas_try.columns:
+        zonas = zonas_try[["APARTAMENTO", "ZONA"]].copy()
         zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
         zonas["ZONA"] = zonas["ZONA"].astype(str).str.strip()
     else:
-        # Intento 2: formato columnas (cada columna = zona)
         zonas = _zonas_wide_to_long(zonas_raw)
         if zonas.empty:
             raise ValueError(
                 f"ZONAS debe tener APARTAMENTO y ZONA, o venir en formato columnas por zona. "
-                f"Columnas detectadas: {list(zonas_raw.columns)}"
+                f"Columnas: {list(zonas_raw.columns)}"
             )
 
-    # ---------- CAFE ----------
-    cafe = _rename(
-        cafe,
-        {
-            "apartamento": "APARTAMENTO",
-            "cafe_tipo": "CAFE_TIPO",
-            "cafetipo": "CAFE_TIPO",
-            "cafe": "CAFE_TIPO",
-            "tipocafe": "CAFE_TIPO",
-        },
-    )
-    if "APARTAMENTO" not in cafe.columns or "CAFE_TIPO" not in cafe.columns:
-        raise ValueError(f"CAFE debe tener APARTAMENTO y CAFE_TIPO. Columnas: {list(cafe.columns)}")
-    cafe = cafe[["APARTAMENTO", "CAFE_TIPO"]].copy()
-    cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
+    # -------- CAFE --------
+    cafe = _cafe_to_long(cafe_raw)
+    if cafe.empty:
+        raise ValueError(f"CAFE no reconocido. Columnas: {list(cafe_raw.columns)}")
 
-    # ---------- APT_ALMACEN (+ Localizacion) ----------
+    # -------- APT_ALMACEN (+ Localizacion) --------
     apt = _rename(
         apt,
         {
@@ -165,7 +197,7 @@ def load_masters_repo() -> dict:
     apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
     apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
 
-    # ---------- THRESHOLDS ----------
+    # -------- THRESHOLDS --------
     thresholds.columns = [str(c).strip() for c in thresholds.columns]
     if "AMENITY" in thresholds.columns and "Amenity" not in thresholds.columns:
         thresholds = thresholds.rename(columns={"AMENITY": "Amenity"})
