@@ -62,7 +62,6 @@ def _rename(df: pd.DataFrame, mapping_norm_to_std: dict[str, str]) -> pd.DataFra
 
 
 def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    # columnas = zonas, celdas = apartamentos
     cols = [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]
     rows = []
     for zcol in cols:
@@ -72,7 +71,6 @@ def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
             if not apt or apt.lower() == "nan":
                 continue
             rows.append({"APARTAMENTO": apt, "ZONA": str(zcol).strip()})
-
     out = pd.DataFrame(rows).drop_duplicates()
     if not out.empty:
         out["ZONA"] = out["ZONA"].str.replace(r"^Zona\s+", "", regex=True).str.strip()
@@ -80,20 +78,21 @@ def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _cafe_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Acepta varios formatos:
-    1) Tabla: APARTAMENTO / CAFE_TIPO
-    2) 2 columnas sin headers claros (ej: col0=apartamento, col1=cafe)
-    3) Transpuesto: una fila con cafés y cabeceras como apartamentos (ej: columnas = apartamentos)
-    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
 
-    # limpiar columnas "Unnamed"
     df = df.loc[:, [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]]
 
-    # Intento 1: tabla estándar
-    d1 = _rename(df, {"apartamento": "APARTAMENTO", "cafe_tipo": "CAFE_TIPO", "cafetipo": "CAFE_TIPO", "cafe": "CAFE_TIPO", "tipocafe": "CAFE_TIPO"})
+    d1 = _rename(
+        df,
+        {
+            "apartamento": "APARTAMENTO",
+            "cafe_tipo": "CAFE_TIPO",
+            "cafetipo": "CAFE_TIPO",
+            "cafe": "CAFE_TIPO",
+            "tipocafe": "CAFE_TIPO",
+        },
+    )
     if "APARTAMENTO" in d1.columns and "CAFE_TIPO" in d1.columns:
         out = d1[["APARTAMENTO", "CAFE_TIPO"]].copy()
         out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
@@ -101,7 +100,6 @@ def _cafe_to_long(df: pd.DataFrame) -> pd.DataFrame:
         out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
         return out.drop_duplicates()
 
-    # Intento 2: 2 columnas “sin headers”
     if df.shape[1] == 2:
         out = df.copy()
         out.columns = ["APARTAMENTO", "CAFE_TIPO"]
@@ -110,15 +108,8 @@ def _cafe_to_long(df: pd.DataFrame) -> pd.DataFrame:
         out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
         return out.drop_duplicates()
 
-    # Intento 3: transpuesto (cabeceras son apartamentos, primera fila es café)
-    # Caso típico: columnas = ['ALFARO','Tassimo'] porque la primera fila se tomó como cabecera -> ya está “mal leído”.
-    # Lo arreglamos leyendo de nuevo SIN cabecera si detectamos que las "columnas" parecen datos.
     cols = [str(c).strip() for c in df.columns]
-    # Heurística: si no hay ninguna columna que parezca "apartamento/cafe" y hay pocas columnas,
-    # probablemente es transpuesto.
     if all(_norm(c) not in ("apartamento", "cafe", "cafetipo", "cafe_tipo", "tipocafe") for c in cols):
-        # Convertir de "columns = apartamentos" a long usando la primera fila como valor
-        # df.iloc[0] contiene cafés (o algo equivalente)
         first_row = df.iloc[0].tolist() if len(df) > 0 else []
         pairs = []
         for apt, caf in zip(cols, first_row):
@@ -131,8 +122,73 @@ def _cafe_to_long(df: pd.DataFrame) -> pd.DataFrame:
         out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
         return out.drop_duplicates()
 
-    # fallback: no reconocido
     return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
+
+
+def _maybe_promote_first_row_as_header(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Si el excel viene con una fila de títulos dentro del cuerpo (típico),
+    y pandas ha puesto columnas tipo Unnamed, intentamos usar df.iloc[0] como header.
+    """
+    if df is None or df.empty:
+        return df
+
+    unnamed_ratio = sum(str(c).lower().startswith("unnamed") for c in df.columns) / max(1, len(df.columns))
+    if unnamed_ratio < 0.5:
+        return df
+
+    row0 = [str(x).strip() for x in df.iloc[0].tolist()]
+    row0_norm = {_norm(x) for x in row0}
+    # Si en esa fila aparecen palabras “tipo header”, promovemos
+    if {"amenity", "producto", "articulo", "item"}.intersection(row0_norm):
+        df2 = df.copy()
+        df2.columns = [str(x).strip() for x in df2.iloc[0]]
+        df2 = df2.iloc[1:].reset_index(drop=True)
+        return df2
+
+    return df
+
+
+def _ensure_thresholds_amenity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Garantiza columna 'Amenity' (mínimo para que summarize_replenishment funcione).
+    No renombra Min/Max para no romper lógica existente.
+    """
+    if df is None:
+        return pd.DataFrame(columns=["Amenity"])
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]]
+
+    # intento: cabecera en primera fila
+    df = _maybe_promote_first_row_as_header(df)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # renombres típicos
+    df = _rename(
+        df,
+        {
+            "amenity": "Amenity",
+            "amenities": "Amenity",
+            "producto": "Amenity",
+            "product": "Amenity",
+            "articulo": "Amenity",
+            "item": "Amenity",
+            "nombre": "Amenity",
+        },
+    )
+
+    # fallback: si sigue sin Amenity, usar primera columna como Amenity
+    if "Amenity" not in df.columns and len(df.columns) >= 1:
+        df = df.rename(columns={df.columns[0]: "Amenity"})
+
+    # limpiar
+    if "Amenity" in df.columns:
+        df["Amenity"] = df["Amenity"].astype(str).str.strip()
+        df = df[df["Amenity"].ne("") & df["Amenity"].ne("nan")]
+
+    return df
 
 
 @lru_cache(maxsize=1)
@@ -145,11 +201,14 @@ def load_masters_repo() -> dict:
     apt_file = _pick_file(data_dir, ["*Apartamentos*Inventarios*.xlsx", "*Apartamentos*Inventarios*.xls"])
     cafe_file = _pick_file(data_dir, ["*Cafe*por*apartamento*.xlsx", "*Cafe*por*apartamento*.xls"])
     thr_file = _pick_file(data_dir, ["*Stock*minimo*por*almacen*.xlsx", "*Stock*minimo*por*almacen*.xls"])
-    zonas_file = _pick_file(data_dir, ["*Agrupacion*apartamento*por*z*.xlsx", "*Agrupacion*apartamento*por*z*.xls", "*Zonas*.xlsx", "*Zonas*.xls"])
+    zonas_file = _pick_file(
+        data_dir,
+        ["*Agrupacion*apartamento*por*z*.xlsx", "*Agrupacion*apartamento*por*z*.xls", "*Zonas*.xlsx", "*Zonas*.xls"],
+    )
 
     apt = _read_excel_best_sheet(apt_file, {"apartamento", "almacen"})
     cafe_raw = _read_excel_best_sheet(cafe_file, {"apartamento"})
-    thresholds = _read_excel_best_sheet(thr_file, {"amenity"})
+    thresholds_raw = _read_excel_best_sheet(thr_file, {"amenity"})
     zonas_raw = _read_excel_best_sheet(zonas_file, {"apartamento", "zona"})
 
     # -------- ZONAS --------
@@ -197,10 +256,10 @@ def load_masters_repo() -> dict:
     apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
     apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
 
-    # -------- THRESHOLDS --------
-    thresholds.columns = [str(c).strip() for c in thresholds.columns]
-    if "AMENITY" in thresholds.columns and "Amenity" not in thresholds.columns:
-        thresholds = thresholds.rename(columns={"AMENITY": "Amenity"})
+    # -------- THRESHOLDS (FIX) --------
+    thresholds = _ensure_thresholds_amenity(thresholds_raw)
+    if "Amenity" not in thresholds.columns:
+        raise ValueError(f"THRESHOLDS: no se pudo detectar columna Amenity. Columnas: {list(thresholds_raw.columns)}")
 
     return {
         "zonas": zonas,
