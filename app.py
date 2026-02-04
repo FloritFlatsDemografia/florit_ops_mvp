@@ -60,6 +60,28 @@ def chunk_list(xs, n):
 
 
 # =========================
+# Parseo robusto de coords
+# =========================
+def parse_lat_lng(series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """
+    Acepta:
+      - "39.49,-0.39"
+      - "39.49; -0.39"
+      - "39.49 -0.39"
+      - "(39.49, -0.39)"
+    Devuelve LAT y LNG numéricos (NaN si no se puede parsear).
+    """
+    s = series.astype(str).str.strip()
+    s = s.str.replace("(", "", regex=False).str.replace(")", "", regex=False)
+
+    # extrae dos floats separados por coma / ; / espacio(s)
+    ext = s.str.extract(r"([+-]?\d+(?:\.\d+)?)\s*[,; ]\s*([+-]?\d+(?:\.\d+)?)")
+    lat = pd.to_numeric(ext[0], errors="coerce")
+    lng = pd.to_numeric(ext[1], errors="coerce")
+    return lat, lng
+
+
+# =========================
 # Estilos tabla operativa
 # =========================
 def _style_operativa(df: pd.DataFrame):
@@ -81,7 +103,7 @@ def _style_operativa(df: pd.DataFrame):
 
 
 # =========================
-# BOOTSTRAP: pinta algo SIEMPRE
+# BOOTSTRAP
 # =========================
 st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
 st.title("Florit OPS – Parte diario (Operativa + Reposición)")
@@ -89,7 +111,7 @@ st.caption("Si ves esto, el script está arrancando. Si se queda en blanco, no e
 
 
 def main():
-    # Importar módulos “pesados” DESPUÉS de pintar algo
+    # Imports “pesados” después de pintar
     try:
         from src.loaders import load_masters_repo
         from src.parsers import parse_avantio_entradas, parse_odoo_stock
@@ -117,9 +139,7 @@ def main():
 """
         )
 
-    # =========================
-    # Sidebar (mínimo)
-    # =========================
+    # Sidebar
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader(
         "Avantio (Entradas) .xls/.xlsx/.csv",
@@ -130,11 +150,9 @@ def main():
         type=["xlsx", "csv"],
     )
 
-    # Por defecto: HOY + MAÑANA (2 días)
     tz = ZoneInfo("Europe/Madrid")
     today = pd.Timestamp.now(tz=tz).normalize().date()
 
-    # Controles avanzados (colapsados) — por si quieres ajustar luego
     with st.sidebar.expander("Avanzado (opcional)", expanded=False):
         period_start = st.date_input("Inicio", value=today)
         period_days = st.number_input("Nº días", min_value=1, max_value=14, value=2, step=1)
@@ -142,21 +160,7 @@ def main():
         travelmode = st.selectbox("Modo ruta", ["walking", "driving"], index=0)
         return_to_base = st.checkbox("Volver a Florit Flats al final", value=False)
 
-    # Si no abres “Avanzado”, usa defaults de 2 clics
-    if "period_start" not in locals():
-        period_start = today
-    if "period_days" not in locals():
-        period_days = 2
-    if "only_replenishment" not in locals():
-        only_replenishment = True
-    if "travelmode" not in locals():
-        travelmode = "walking"
-    if "return_to_base" not in locals():
-        return_to_base = False
-
-    # =========================
-    # Cargar maestros
-    # =========================
+    # Maestros
     try:
         with st.spinner("Cargando maestros (data/ en GitHub)…"):
             masters = load_masters_repo()
@@ -170,9 +174,7 @@ def main():
         st.info("Sube Avantio + Odoo para generar el parte operativo.")
         st.stop()
 
-    # =========================
     # Parse inputs
-    # =========================
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
 
@@ -183,21 +185,17 @@ def main():
     # Normaliza Odoo
     odoo_norm = normalize_products(odoo_df)
 
-    # =========================
-    # Maestro apt_almacen con Localizacion
-    # =========================
+    # Maestro apt_almacen + localización
     apt_master = masters.get("apt_almacen", pd.DataFrame()).copy()
     if apt_master.empty:
         st.error("El maestro apt_almacen viene vacío. Revisa data/Apartamentos e Inventarios.xlsx.")
         st.stop()
 
-    # soportar Localización con acento
     if "Localizacion" not in apt_master.columns and "Localización" in apt_master.columns:
         apt_master = apt_master.rename(columns={"Localización": "Localizacion"})
 
     has_loc = "Localizacion" in apt_master.columns
 
-    # Mapa apt -> almacén
     need_cols = {"APARTAMENTO", "ALMACEN"}
     if not need_cols.issubset(set(apt_master.columns)):
         st.error(f"apt_almacen debe tener columnas {need_cols}. Columnas detectadas: {list(apt_master.columns)}")
@@ -207,12 +205,9 @@ def main():
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # Parse Localizacion -> LAT/LNG
+    # ✅ FIX: coords robustas (NO split)
     if has_loc:
-        loc = ap_map["Localizacion"].astype(str).str.replace(" ", "", regex=False)
-        parts = loc.str.split(",", n=1, expand=True)
-        ap_map["LAT"] = pd.to_numeric(parts[0], errors="coerce")
-        ap_map["LNG"] = pd.to_numeric(parts[1], errors="coerce")
+        ap_map["LAT"], ap_map["LNG"] = parse_lat_lng(ap_map["Localizacion"])
     else:
         ap_map["LAT"] = pd.NA
         ap_map["LNG"] = pd.NA
@@ -222,6 +217,13 @@ def main():
             "La app seguirá, pero sin rutas."
         )
 
+    # Aviso formatos malos (sin romper app)
+    if has_loc:
+        bad = ap_map[ap_map["LAT"].isna() | ap_map["LNG"].isna()][["APARTAMENTO", "Localizacion"]].dropna().head(12)
+        if not bad.empty:
+            st.warning("Hay localizaciones que no se pudieron parsear (revisa formato). Ejemplos:")
+            st.dataframe(bad, use_container_width=True, height=260)
+
     # Avantio -> APARTAMENTO
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
 
@@ -230,25 +232,19 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
 
-    # Odoo -> ALMACEN (desde Ubicación)
+    # Odoo -> ALMACEN
     odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
     odoo_norm["ALMACEN"] = odoo_norm["ALMACEN"].astype(str).str.strip()
 
-    # Stock por almacén + amenity
     stock_by_alm = (
         odoo_norm.groupby(["ALMACEN", "Amenity"], as_index=False)["Cantidad"]
         .sum()
         .rename(columns={"Cantidad": "Cantidad"})
     )
 
-    # Reposición min/max
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
-
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
-    # =========================
-    # Dashboard
-    # =========================
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
         replenishment_df=rep,
@@ -275,9 +271,7 @@ def main():
 
     operativa = dash["operativa"].copy()
 
-    # =========================
     # Rutas HOY + MAÑANA
-    # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
 
@@ -313,12 +307,9 @@ def main():
                     for idx, chunk in enumerate(chunk_list(coords, MAX_STOPS), start=1):
                         url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
                         if url:
-                            # botón clicable (mejor que mostrar la url cruda)
                             st.link_button(f"{zona_label} · Ruta (tramo {idx})", url)
 
-    # =========================
     # Tabla operativa
-    # =========================
     st.divider()
     st.subheader("PARTE OPERATIVO · Entradas/Salidas/Ocupación/Vacíos + Reposición")
     st.caption(f"Periodo: {dash['period_start']} → {dash['period_end']} · Agrupado por ZONA")
