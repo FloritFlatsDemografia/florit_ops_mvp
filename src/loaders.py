@@ -1,174 +1,266 @@
-import pandas as pd
+# src/loaders.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-import re
-import unicodedata
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "data"
-
-ZONAS_PATH = DATA_DIR / "Agrupacion apartamentos por zona.xlsx"
-APT_ALM_PATH = DATA_DIR / "Apartamentos e Inventarios.xlsx"
-CAFE_PATH = DATA_DIR / "Cafe por apartamento.xlsx"
-THRESHOLDS_PATH = DATA_DIR / "Stock minimo por almacen.xlsx"
+import pandas as pd
 
 
-def _norm(s: str) -> str:
-    s = str(s or "").strip().lower()
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    s = re.sub(r"\s+", " ", s)
+# ---------------------------
+# Normalización de columnas
+# ---------------------------
+def _norm_col(s: str) -> str:
+    s = str(s).strip().lower()
+    s = (
+        s.replace("ó", "o")
+        .replace("í", "i")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("ú", "u")
+        .replace("ñ", "n")
+    )
+    s = s.replace(" ", "").replace("_", "").replace("-", "")
     return s
 
 
-def _zones_wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
-    out = []
-    for col in df_wide.columns:
-        zona = str(col).strip()
-        s = df_wide[col].dropna().astype(str).str.strip()
-        s = s[s != ""]
-        for ap in s.tolist():
-            out.append({"APARTAMENTO": ap, "ZONA": zona})
-    return pd.DataFrame(out).drop_duplicates()
+def _safe_columns(df: pd.DataFrame) -> list[str]:
+    return [str(c).strip() for c in df.columns]
 
 
-def _classify_threshold_product(prod_name: str) -> str | None:
+# ---------------------------
+# Lectores (cabecera vs full)
+# ---------------------------
+def _read_csv_header(path: Path) -> pd.DataFrame:
+    # Solo cabecera, rápido
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, nrows=0)
+        except Exception:
+            continue
+    return pd.read_csv(path, encoding="latin-1", nrows=0, errors="ignore")
+
+
+def _read_csv_full(path: Path) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception:
+            continue
+    return pd.read_csv(path, encoding="latin-1", errors="ignore")
+
+
+@dataclass
+class TableRef:
+    path: Path
+    kind: str  # "excel" | "csv"
+    sheet: str | None
+    cols_norm: set[str]
+
+
+def _list_data_files(data_dir: Path) -> list[Path]:
+    exts = (".xlsx", ".xls", ".csv")
+    return sorted([p for p in data_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
+
+
+def _index_tables(data_dir: Path) -> list[TableRef]:
     """
-    Mapeo ESPECÍFICO para tu Excel de thresholds (Producto/Minimo/Maximo),
-    no para nombres largos de Odoo.
+    Indexa tablas leyendo SOLO cabeceras:
+      - CSV: pd.read_csv(nrows=0)
+      - Excel: parse(nrows=0) por hoja
     """
-    t = _norm(prod_name)
-
-    # Café
-    if re.search(r"cafe.*molido|cafe natural molido|molido", t):
-        return "Café molido"
-    if re.search(r"tassimo", t):
-        return "Cápsulas Tassimo"
-    if re.search(r"dolce\s*gusto|dolcegusto", t):
-        return "Cápsulas Dolce Gusto"
-    if re.search(r"senseo", t):
-        return "Cápsulas Senseo"
-    # tu “café en cápsula Colombia” suele ser cápsula tipo Nespresso
-    if re.search(r"cafe.*capsul|capsula", t):
-        # si no cayó en tassimo/dolce/senseo, lo tratamos como nespresso-compatible
-        return "Cápsulas Nespresso"
-
-    # Amenities
-    if re.search(r"azucar", t):
-        return "Azúcar"
-    if re.search(r"infus|te\b|t[eé]\b", t):
-        return "Té/Infusión"
-    if re.search(r"champu|shampoo", t):
-        return "Champú"
-    if re.search(r"gel.*duch|gel ducha|\bducha\b", t) and not re.search(r"manos", t):
-        return "Gel de ducha"
-    if re.search(r"gel.*manos|jabon.*manos|gel de manos|jabon de manos", t):
-        return "Jabón de manos"
-    if re.search(r"insectic|raid|mosquit|cucarach|hormig", t):
-        return "Insecticida"
-    if re.search(r"detergente|lavadora|capsula.*deterg|capsu.*deterg", t):
-        return "Detergente"
-    if re.search(r"vinagre", t):
-        return "Vinagre"
-    if re.search(r"abrillantador", t):
-        return "Abrillantador"
-    if re.search(r"sal.*lavavaj", t):
-        return "Sal lavavajillas"
-    if re.search(r"\bescoba\b", t):
-        return "Escoba"
-    if re.search(r"fregona|mocho|mopa", t):
-        return "Mocho/Fregona"
-
-    # “Sal fina de mesa” -> si la quieres controlar como amenity, la añadimos:
-    if re.search(r"sal fina|sal de mesa|\bsal\b", t) and not re.search(r"lavavaj", t):
-        return "Sal de mesa"
-
-    return None
+    refs: list[TableRef] = []
+    for path in _list_data_files(data_dir):
+        suf = path.suffix.lower()
+        if suf == ".csv":
+            try:
+                hdr = _read_csv_header(path)
+                cols = {_norm_col(c) for c in _safe_columns(hdr)}
+                refs.append(TableRef(path=path, kind="csv", sheet=None, cols_norm=cols))
+            except Exception:
+                continue
+        else:
+            try:
+                xl = pd.ExcelFile(path)
+                for sh in xl.sheet_names:
+                    try:
+                        hdr = xl.parse(sheet_name=sh, nrows=0)
+                        cols = {_norm_col(c) for c in _safe_columns(hdr)}
+                        refs.append(TableRef(path=path, kind="excel", sheet=sh, cols_norm=cols))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    return refs
 
 
-def _build_thresholds_from_stock_minimo(df_minmax: pd.DataFrame) -> pd.DataFrame:
-    df = df_minmax.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+def _score(ref: TableRef, want: str) -> int:
+    fn = ref.path.name.lower()
+    sh = (ref.sheet or "").lower()
 
-    # Detectar columnas
-    col_prod = col_min = col_max = None
-    for c in df.columns:
-        cl = _norm(c)
-        if "producto" in cl:
-            col_prod = c
-        if "min" in cl:
-            col_min = c
-        if "max" in cl:
-            col_max = c
+    cols = ref.cols_norm
+    has_ap = "apartamento" in cols
+    has_al = "almacen" in cols
+    has_z = "zona" in cols
+    has_amenity = "amenity" in cols
 
-    if not (col_prod and col_min and col_max):
-        raise ValueError(
-            f"Thresholds: no encuentro columnas Producto/Minimo/Maximo. Columnas={list(df.columns)}"
-        )
+    has_cafe = any(k in cols for k in ("cafetipo", "cafe_tipo", "cafe", "tipocafe"))
+    has_min = any(k in cols for k in ("min", "minimo", "stockmin", "stockminimo"))
+    has_max = any(k in cols for k in ("max", "maximo", "stockmax", "stockmaximo"))
+    has_loc = any(k in cols for k in ("localizacion", "localizaciongps", "gps", "coords", "coordenadas", "lat", "lng"))
 
-    df = df[[col_prod, col_min, col_max]].rename(columns={
-        col_prod: "Producto",
-        col_min: "Minimo",
-        col_max: "Maximo",
-    })
+    score = 0
 
-    df["Producto"] = df["Producto"].astype(str).str.strip()
-    df["Minimo"] = pd.to_numeric(df["Minimo"], errors="coerce")
-    df["Maximo"] = pd.to_numeric(df["Maximo"], errors="coerce")
+    if want == "apt_almacen":
+        if has_ap and has_al:
+            score += 100
+        if has_loc:
+            score += 30
+        if "invent" in fn or "apart" in fn or "almacen" in fn:
+            score += 10
+        if "almacen" in sh or "apart" in sh or "invent" in sh:
+            score += 5
 
-    # Ignorar filas sin números (por ejemplo “Fregona” vacío)
-    df = df.dropna(subset=["Minimo", "Maximo"], how="any")
+    elif want == "zonas":
+        if has_ap and has_z:
+            score += 100
+        if "zona" in fn:
+            score += 10
+        if "zona" in sh:
+            score += 5
 
-    df["Amenity"] = df["Producto"].apply(_classify_threshold_product)
-    df = df.dropna(subset=["Amenity"])
+    elif want == "cafe":
+        if has_ap and has_cafe:
+            score += 100
+        if "cafe" in fn:
+            score += 10
+        if "cafe" in sh:
+            score += 5
 
-    if df.empty:
-        raise ValueError("Thresholds: tras mapear productos no quedó ninguna fila válida.")
+    elif want == "thresholds":
+        if has_amenity and (has_min or has_max):
+            score += 100
+        if "threshold" in fn or "stock" in fn or "min" in fn or "max" in fn:
+            score += 10
+        if "threshold" in sh or "stock" in sh or "min" in sh or "max" in sh:
+            score += 5
 
-    # Si hay duplicados por Amenity, tomamos el máximo (regla conservadora)
-    thr = df.groupby("Amenity", as_index=False).agg(
-        Minimo=("Minimo", "max"),
-        Maximo=("Maximo", "max"),
-    )
-    return thr
+    return score
 
 
-def load_masters_repo() -> dict:
-    masters = {}
+def _pick_table(refs: list[TableRef], want: str) -> TableRef | None:
+    best = None
+    best_score = -1
+    for r in refs:
+        s = _score(r, want)
+        if s > best_score:
+            best_score = s
+            best = r
+    if best_score < 80:
+        return None
+    return best
 
-    missing = [p.name for p in [ZONAS_PATH, APT_ALM_PATH, CAFE_PATH, THRESHOLDS_PATH] if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Faltan maestros en data/: {missing}")
 
-    # Zonas
-    dfz = pd.read_excel(ZONAS_PATH)
-    masters["zonas"] = _zones_wide_to_long(dfz)
-
-    # Apt ↔ Almacén
-    dfa = pd.read_excel(APT_ALM_PATH)
-    dfa.columns = [str(c).strip() for c in dfa.columns]
-    # Tomamos las dos primeras columnas si no están claros los nombres
-    if len(dfa.columns) >= 2:
-        # intenta detectar por nombre
-        cols_norm = {_norm(c): c for c in dfa.columns}
-        c_ap = cols_norm.get("apartamento") or cols_norm.get("apto") or dfa.columns[0]
-        c_al = cols_norm.get("almacen") or cols_norm.get("almacén") or dfa.columns[1]
-        dfa = dfa.rename(columns={c_ap: "APARTAMENTO", c_al: "ALMACEN"})
+def _load_table(ref: TableRef) -> pd.DataFrame:
+    if ref.kind == "csv":
+        df = _read_csv_full(ref.path)
     else:
-        raise ValueError("Apartamentos e Inventarios: no tiene 2 columnas mínimas.")
+        df = pd.read_excel(ref.path, sheet_name=ref.sheet)
+    df.columns = _safe_columns(df)
+    return df
 
-    dfa["ALMACEN"] = dfa["ALMACEN"].astype(str).str.strip()
-    dfa["APARTAMENTO"] = dfa["APARTAMENTO"].astype(str).str.strip()
-    masters["apt_almacen"] = dfa[["ALMACEN", "APARTAMENTO"]].dropna().drop_duplicates()
 
-    # Café por apto
-    dfc = pd.read_excel(CAFE_PATH)
-    dfc = dfc.iloc[:, :2].copy()
-    dfc.columns = ["APARTAMENTO", "CAFE_TIPO"]
-    dfc["APARTAMENTO"] = dfc["APARTAMENTO"].astype(str).str.strip()
-    dfc["CAFE_TIPO"] = dfc["CAFE_TIPO"].astype(str).str.strip()
-    masters["cafe"] = dfc.dropna().drop_duplicates()
+def _rename_to_standard(df: pd.DataFrame, desired: dict[str, str]) -> pd.DataFrame:
+    cols = list(df.columns)
+    norm_map = {_norm_col(c): c for c in cols}
+    rename = {}
+    for nk, std in desired.items():
+        if nk in norm_map:
+            rename[norm_map[nk]] = std
+    return df.rename(columns=rename)
 
-    # Thresholds
-    dft = pd.read_excel(THRESHOLDS_PATH)
-    masters["thresholds"] = _build_thresholds_from_stock_minimo(dft)
 
-    return masters
+@lru_cache(maxsize=1)
+def load_masters_repo() -> dict:
+    """
+    Devuelve:
+      - zonas: APARTAMENTO, ZONA
+      - apt_almacen: APARTAMENTO, ALMACEN, Localizacion
+      - cafe: APARTAMENTO, CAFE_TIPO
+      - thresholds: tabla de mínimos/máximos por Amenity
+    """
+    base_dir = Path(__file__).resolve().parents[1]  # repo root
+    data_dir = base_dir / "data"
+    if not data_dir.exists():
+        raise FileNotFoundError(f"No existe carpeta data/ en el repo: {data_dir}")
+
+    refs = _index_tables(data_dir)
+    if not refs:
+        raise FileNotFoundError(f"No se detectaron tablas legibles en data/. Archivos: {[p.name for p in _list_data_files(data_dir)]}")
+
+    ref_apt = _pick_table(refs, "apt_almacen")
+    ref_zon = _pick_table(refs, "zonas")
+    ref_caf = _pick_table(refs, "cafe")
+    ref_thr = _pick_table(refs, "thresholds")
+
+    missing = [k for k, r in (("apt_almacen", ref_apt), ("zonas", ref_zon), ("cafe", ref_caf), ("thresholds", ref_thr)) if r is None]
+    if missing:
+        detected = sorted({r.path.name for r in refs})
+        raise ValueError(f"No pude detectar estos maestros en data/: {missing}. Archivos detectados: {detected}.")
+
+    apt = _load_table(ref_apt)
+    zonas = _load_table(ref_zon)
+    cafe = _load_table(ref_caf)
+    thresholds = _load_table(ref_thr)
+
+    # ZONAS
+    zonas = _rename_to_standard(zonas, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
+    if "APARTAMENTO" not in zonas.columns or "ZONA" not in zonas.columns:
+        raise ValueError(f"Maestro zonas debe tener APARTAMENTO y ZONA. Columnas: {list(zonas.columns)}")
+    zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
+
+    # CAFE
+    cafe = _rename_to_standard(cafe, {"apartamento": "APARTAMENTO", "cafe_tipo": "CAFE_TIPO", "cafetipo": "CAFE_TIPO", "cafe": "CAFE_TIPO", "tipocafe": "CAFE_TIPO"})
+    if "APARTAMENTO" not in cafe.columns or "CAFE_TIPO" not in cafe.columns:
+        raise ValueError(f"Maestro cafe debe tener APARTAMENTO y CAFE_TIPO. Columnas: {list(cafe.columns)}")
+    cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
+
+    # APT_ALMACEN (+ Localizacion)
+    apt = _rename_to_standard(
+        apt,
+        {
+            "apartamento": "APARTAMENTO",
+            "almacen": "ALMACEN",
+            "localizacion": "Localizacion",
+            "localizaciongps": "Localizacion",
+            "coordenadas": "Localizacion",
+            "coords": "Localizacion",
+            "gps": "Localizacion",
+            "lat": "LAT",
+            "lng": "LNG",
+        },
+    )
+    if "Localización" in apt.columns and "Localizacion" not in apt.columns:
+        apt = apt.rename(columns={"Localización": "Localizacion"})
+
+    if "APARTAMENTO" not in apt.columns or "ALMACEN" not in apt.columns:
+        raise ValueError(f"Maestro apt_almacen debe tener APARTAMENTO y ALMACEN. Columnas: {list(apt.columns)}")
+
+    # Si no viene Localizacion, la creamos para que la app no pete
+    if "Localizacion" not in apt.columns:
+        apt["Localizacion"] = pd.NA
+
+    apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
+    apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
+
+    # THRESHOLDS (solo limpiamos headers)
+    thresholds.columns = _safe_columns(thresholds)
+    if "AMENITY" in thresholds.columns and "Amenity" not in thresholds.columns:
+        thresholds = thresholds.rename(columns={"AMENITY": "Amenity"})
+
+    return {
+        "zonas": zonas,
+        "apt_almacen": apt,
+        "cafe": cafe,
+        "thresholds": thresholds,
+    }
