@@ -265,60 +265,74 @@ def main():
 
     operativa = dash["operativa"].copy()
 
-    # =========================
-    # RUTA: por APARTAMENTO, libres HOY y MAÑANA, con reposición
+       # =========================
+    # RUTA: por APARTAMENTO (HOY y MAÑANA), "visitable" + con reposición
     # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
-    st.caption("Selecciona apartamentos con reposición que estén LIBRES HOY y MAÑANA. Salida: Florit Flats.")
+    st.caption("Incluye apartamentos con reposición y Estado visitable ese día. Salida: Florit Flats.")
 
     tomorrow = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
 
-    route_df = operativa.copy()
+    # Asegura tipo date en la columna Día
+    operativa_route = operativa.copy()
+    operativa_route["Día"] = pd.to_datetime(operativa_route["Día"], errors="coerce").dt.date
 
-    # 1) solo hoy y mañana
-    route_df = route_df[route_df["Día"].isin([today, tomorrow])].copy()
+    # Estados visitables (ajusta aquí si quieres restringir)
+    VISITABLE_STATES = {"VACIO", "ENTRADA", "SALIDA", "ENTRADA+SALIDA"}
 
-    # 2) solo con reposición
-    if "Lista_reponer" in route_df.columns:
-        route_df = route_df[route_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
-    else:
-        st.info("No existe columna Lista_reponer en operativa (revisar dashboard).")
-        route_df = route_df.iloc[0:0]
+    def build_routes_for_day(day_date):
+        df = operativa_route.copy()
 
-    # 3) LIBRE HOY y MAÑANA = Estado VACIO ambos días (por apartamento)
-    free_today = route_df[(route_df["Día"] == today) & (route_df["Estado"] == "VACIO")][["APARTAMENTO"]].drop_duplicates()
-    free_tom = route_df[(route_df["Día"] == tomorrow) & (route_df["Estado"] == "VACIO")][["APARTAMENTO"]].drop_duplicates()
-    free_both = free_today.merge(free_tom, on="APARTAMENTO", how="inner")
+        # 1) Solo ese día
+        df = df[df["Día"] == day_date].copy()
 
-    route_df = route_df.merge(free_both, on="APARTAMENTO", how="inner")
+        # 2) Solo con reposición
+        if "Lista_reponer" in df.columns:
+            df = df[df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
+        else:
+            return pd.DataFrame()
 
-    # 4) coords por apartamento
-    route_df = route_df.merge(ap_map[["APARTAMENTO", "LAT", "LNG"]], on="APARTAMENTO", how="left")
-    route_df["COORD"] = route_df.apply(
-        lambda r: _coord_str(r["LAT"], r["LNG"]) if pd.notna(r.get("LAT")) and pd.notna(r.get("LNG")) else None,
-        axis=1,
-    )
-    route_df = route_df[route_df["COORD"].notna()].copy()
+        # 3) Solo estados visitables
+        df = df[df["Estado"].astype(str).isin(VISITABLE_STATES)].copy()
 
-    if route_df.empty:
-        st.info("No hay apartamentos con reposición que estén libres HOY y MAÑANA (o faltan coordenadas).")
-    else:
+        # 4) Añadir coords por apartamento (por si operativa no las lleva)
+        df = df.merge(ap_map[["APARTAMENTO", "LAT", "LNG"]], on="APARTAMENTO", how="left")
+        df["COORD"] = df.apply(
+            lambda r: _coord_str(r["LAT"], r["LNG"]) if pd.notna(r.get("LAT")) and pd.notna(r.get("LNG")) else None,
+            axis=1,
+        )
+        df = df[df["COORD"].notna()].copy()
+
+        # 5) Una parada por apartamento
+        df = df.drop_duplicates("APARTAMENTO").copy()
+
+        return df
+
+    for day_date, day_label in [(today, "HOY"), (tomorrow, "MAÑANA")]:
+        st.markdown(f"### {day_label} · {pd.to_datetime(day_date).strftime('%d/%m/%Y')}")
+
+        day_df = build_routes_for_day(day_date)
+
+        if day_df.empty:
+            st.info(f"No hay apartamentos visitables con reposición para {day_label} (o faltan coordenadas).")
+            continue
+
+        # Listado control
         st.caption("Paradas incluidas (control):")
         st.dataframe(
-            route_df.sort_values(["ZONA", "APARTAMENTO", "Día"])[["Día", "ZONA", "APARTAMENTO", "Estado", "Lista_reponer"]],
+            day_df.sort_values(["ZONA", "APARTAMENTO"])[
+                ["ZONA", "APARTAMENTO", "Estado", "Próxima Entrada", "Lista_reponer"]
+            ],
             use_container_width=True,
             height=260,
         )
 
         MAX_STOPS = 20
-        for zona, zdf in route_df.groupby("ZONA", dropna=False):
+        for zona, zdf in day_df.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
 
-            # una parada por apartamento (evita duplicar hoy/mañana)
-            z_unique = zdf.drop_duplicates("APARTAMENTO").copy()
-            coords = z_unique["COORD"].tolist()
-
+            coords = zdf["COORD"].tolist()
             if not coords:
                 st.info(f"{zona_label}: sin coordenadas suficientes para generar ruta.")
                 continue
@@ -327,6 +341,7 @@ def main():
                 url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
                 if url:
                     st.link_button(f"{zona_label} · Ruta (tramo {idx})", url)
+
 
     # =========================
     # Tabla operativa
