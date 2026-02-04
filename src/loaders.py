@@ -7,9 +7,15 @@ from pathlib import Path
 import pandas as pd
 
 
-# ---------------------------
-# Normalización de columnas
-# ---------------------------
+# =========================
+# Ajustes anti-cuelgue
+# =========================
+MAX_FILE_BYTES = 10_000_000  # 10 MB: maestros sí, archivos grandes no
+
+
+# =========================
+# Helpers
+# =========================
 def _norm_col(s: str) -> str:
     s = str(s).strip().lower()
     s = (
@@ -24,15 +30,11 @@ def _norm_col(s: str) -> str:
     return s
 
 
-def _safe_columns(df: pd.DataFrame) -> list[str]:
-    return [str(c).strip() for c in df.columns]
+def _safe_cols(cols) -> list[str]:
+    return [str(c).strip() for c in cols]
 
 
-# ---------------------------
-# Lectores (cabecera vs full)
-# ---------------------------
 def _read_csv_header(path: Path) -> pd.DataFrame:
-    # Solo cabecera, rápido
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             return pd.read_csv(path, encoding=enc, nrows=0)
@@ -53,29 +55,42 @@ def _read_csv_full(path: Path) -> pd.DataFrame:
 @dataclass
 class TableRef:
     path: Path
-    kind: str  # "excel" | "csv"
-    sheet: str | None
+    kind: str          # "excel" | "csv"
+    sheet: str | None  # None para csv
     cols_norm: set[str]
 
 
-def _list_data_files(data_dir: Path) -> list[Path]:
+def _list_candidate_files(data_dir: Path) -> list[Path]:
     exts = (".xlsx", ".xls", ".csv")
-    return sorted([p for p in data_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
+    out = []
+    for p in data_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in exts:
+            continue
+        # anti-cuelgue: ignorar grandes
+        try:
+            if p.stat().st_size > MAX_FILE_BYTES:
+                continue
+        except Exception:
+            continue
+        out.append(p)
+    return sorted(out)
 
 
 def _index_tables(data_dir: Path) -> list[TableRef]:
     """
-    Indexa tablas leyendo SOLO cabeceras:
-      - CSV: pd.read_csv(nrows=0)
-      - Excel: parse(nrows=0) por hoja
+    Indexa SOLO ficheros pequeños y SOLO cabeceras (nrows=0).
     """
     refs: list[TableRef] = []
-    for path in _list_data_files(data_dir):
+    files = _list_candidate_files(data_dir)
+
+    for path in files:
         suf = path.suffix.lower()
         if suf == ".csv":
             try:
                 hdr = _read_csv_header(path)
-                cols = {_norm_col(c) for c in _safe_columns(hdr)}
+                cols = {_norm_col(c) for c in _safe_cols(hdr.columns)}
                 refs.append(TableRef(path=path, kind="csv", sheet=None, cols_norm=cols))
             except Exception:
                 continue
@@ -85,20 +100,21 @@ def _index_tables(data_dir: Path) -> list[TableRef]:
                 for sh in xl.sheet_names:
                     try:
                         hdr = xl.parse(sheet_name=sh, nrows=0)
-                        cols = {_norm_col(c) for c in _safe_columns(hdr)}
+                        cols = {_norm_col(c) for c in _safe_cols(hdr.columns)}
                         refs.append(TableRef(path=path, kind="excel", sheet=sh, cols_norm=cols))
                     except Exception:
                         continue
             except Exception:
                 continue
+
     return refs
 
 
 def _score(ref: TableRef, want: str) -> int:
     fn = ref.path.name.lower()
     sh = (ref.sheet or "").lower()
-
     cols = ref.cols_norm
+
     has_ap = "apartamento" in cols
     has_al = "almacen" in cols
     has_z = "zona" in cols
@@ -107,7 +123,7 @@ def _score(ref: TableRef, want: str) -> int:
     has_cafe = any(k in cols for k in ("cafetipo", "cafe_tipo", "cafe", "tipocafe"))
     has_min = any(k in cols for k in ("min", "minimo", "stockmin", "stockminimo"))
     has_max = any(k in cols for k in ("max", "maximo", "stockmax", "stockmaximo"))
-    has_loc = any(k in cols for k in ("localizacion", "localizaciongps", "gps", "coords", "coordenadas", "lat", "lng"))
+    has_loc = any(k in cols for k in ("localizacion", "localizaciongps", "coords", "coordenadas", "gps", "lat", "lng"))
 
     score = 0
 
@@ -116,9 +132,9 @@ def _score(ref: TableRef, want: str) -> int:
             score += 100
         if has_loc:
             score += 30
-        if "invent" in fn or "apart" in fn or "almacen" in fn:
+        if "apart" in fn or "invent" in fn or "almacen" in fn:
             score += 10
-        if "almacen" in sh or "apart" in sh or "invent" in sh:
+        if "apart" in sh or "invent" in sh or "almacen" in sh:
             score += 5
 
     elif want == "zonas":
@@ -148,7 +164,7 @@ def _score(ref: TableRef, want: str) -> int:
     return score
 
 
-def _pick_table(refs: list[TableRef], want: str) -> TableRef | None:
+def _pick(refs: list[TableRef], want: str) -> TableRef | None:
     best = None
     best_score = -1
     for r in refs:
@@ -161,72 +177,68 @@ def _pick_table(refs: list[TableRef], want: str) -> TableRef | None:
     return best
 
 
-def _load_table(ref: TableRef) -> pd.DataFrame:
+def _load(ref: TableRef) -> pd.DataFrame:
     if ref.kind == "csv":
         df = _read_csv_full(ref.path)
     else:
         df = pd.read_excel(ref.path, sheet_name=ref.sheet)
-    df.columns = _safe_columns(df)
+    df.columns = _safe_cols(df.columns)
     return df
 
 
-def _rename_to_standard(df: pd.DataFrame, desired: dict[str, str]) -> pd.DataFrame:
-    cols = list(df.columns)
-    norm_map = {_norm_col(c): c for c in cols}
-    rename = {}
-    for nk, std in desired.items():
+def _rename_std(df: pd.DataFrame, mapping_norm_to_std: dict[str, str]) -> pd.DataFrame:
+    norm_map = {_norm_col(c): c for c in df.columns}
+    ren = {}
+    for nk, std in mapping_norm_to_std.items():
         if nk in norm_map:
-            rename[norm_map[nk]] = std
-    return df.rename(columns=rename)
+            ren[norm_map[nk]] = std
+    return df.rename(columns=ren)
 
 
 @lru_cache(maxsize=1)
 def load_masters_repo() -> dict:
-    """
-    Devuelve:
-      - zonas: APARTAMENTO, ZONA
-      - apt_almacen: APARTAMENTO, ALMACEN, Localizacion
-      - cafe: APARTAMENTO, CAFE_TIPO
-      - thresholds: tabla de mínimos/máximos por Amenity
-    """
-    base_dir = Path(__file__).resolve().parents[1]  # repo root
+    base_dir = Path(__file__).resolve().parents[1]
     data_dir = base_dir / "data"
     if not data_dir.exists():
         raise FileNotFoundError(f"No existe carpeta data/ en el repo: {data_dir}")
 
     refs = _index_tables(data_dir)
     if not refs:
-        raise FileNotFoundError(f"No se detectaron tablas legibles en data/. Archivos: {[p.name for p in _list_data_files(data_dir)]}")
+        files = [p.name for p in data_dir.iterdir() if p.is_file()]
+        raise FileNotFoundError(
+            "No se detectaron maestros pequeños en data/ (o todos superan 10MB). "
+            f"Archivos: {files}"
+        )
 
-    ref_apt = _pick_table(refs, "apt_almacen")
-    ref_zon = _pick_table(refs, "zonas")
-    ref_caf = _pick_table(refs, "cafe")
-    ref_thr = _pick_table(refs, "thresholds")
+    ref_apt = _pick(refs, "apt_almacen")
+    ref_zon = _pick(refs, "zonas")
+    ref_caf = _pick(refs, "cafe")
+    ref_thr = _pick(refs, "thresholds")
 
     missing = [k for k, r in (("apt_almacen", ref_apt), ("zonas", ref_zon), ("cafe", ref_caf), ("thresholds", ref_thr)) if r is None]
     if missing:
         detected = sorted({r.path.name for r in refs})
-        raise ValueError(f"No pude detectar estos maestros en data/: {missing}. Archivos detectados: {detected}.")
+        raise ValueError(f"No pude detectar estos maestros en data/: {missing}. Detectados (<=10MB): {detected}")
 
-    apt = _load_table(ref_apt)
-    zonas = _load_table(ref_zon)
-    cafe = _load_table(ref_caf)
-    thresholds = _load_table(ref_thr)
+    apt = _load(ref_apt)
+    zonas = _load(ref_zon)
+    cafe = _load(ref_caf)
+    thresholds = _load(ref_thr)
 
     # ZONAS
-    zonas = _rename_to_standard(zonas, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
+    zonas = _rename_std(zonas, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
     if "APARTAMENTO" not in zonas.columns or "ZONA" not in zonas.columns:
         raise ValueError(f"Maestro zonas debe tener APARTAMENTO y ZONA. Columnas: {list(zonas.columns)}")
     zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
 
     # CAFE
-    cafe = _rename_to_standard(cafe, {"apartamento": "APARTAMENTO", "cafe_tipo": "CAFE_TIPO", "cafetipo": "CAFE_TIPO", "cafe": "CAFE_TIPO", "tipocafe": "CAFE_TIPO"})
+    cafe = _rename_std(cafe, {"apartamento": "APARTAMENTO", "cafetipo": "CAFE_TIPO", "cafe_tipo": "CAFE_TIPO", "cafe": "CAFE_TIPO", "tipocafe": "CAFE_TIPO"})
     if "APARTAMENTO" not in cafe.columns or "CAFE_TIPO" not in cafe.columns:
         raise ValueError(f"Maestro cafe debe tener APARTAMENTO y CAFE_TIPO. Columnas: {list(cafe.columns)}")
     cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
 
-    # APT_ALMACEN (+ Localizacion)
-    apt = _rename_to_standard(
+    # APT_ALMACEN + Localizacion
+    apt = _rename_std(
         apt,
         {
             "apartamento": "APARTAMENTO",
@@ -236,8 +248,6 @@ def load_masters_repo() -> dict:
             "coordenadas": "Localizacion",
             "coords": "Localizacion",
             "gps": "Localizacion",
-            "lat": "LAT",
-            "lng": "LNG",
         },
     )
     if "Localización" in apt.columns and "Localizacion" not in apt.columns:
@@ -246,15 +256,14 @@ def load_masters_repo() -> dict:
     if "APARTAMENTO" not in apt.columns or "ALMACEN" not in apt.columns:
         raise ValueError(f"Maestro apt_almacen debe tener APARTAMENTO y ALMACEN. Columnas: {list(apt.columns)}")
 
-    # Si no viene Localizacion, la creamos para que la app no pete
     if "Localizacion" not in apt.columns:
-        apt["Localizacion"] = pd.NA
+        apt["Localizacion"] = pd.NA  # no romperá la app
 
     apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
     apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
 
-    # THRESHOLDS (solo limpiamos headers)
-    thresholds.columns = _safe_columns(thresholds)
+    # THRESHOLDS (solo limpiar headers)
+    thresholds.columns = _safe_cols(thresholds.columns)
     if "AMENITY" in thresholds.columns and "Amenity" not in thresholds.columns:
         thresholds = thresholds.rename(columns={"AMENITY": "Amenity"})
 
