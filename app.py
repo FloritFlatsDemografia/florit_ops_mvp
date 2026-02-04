@@ -24,7 +24,6 @@ def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=Fals
     - return_to_base=True: destination = origen, waypoints = paradas
     - return_to_base=False: destination = última parada, waypoints = resto
     """
-    # limpiar y deduplicar manteniendo orden
     clean = []
     seen = set()
     for c in coords:
@@ -64,15 +63,12 @@ def chunk_list(xs, n):
 # Estilos tabla operativa
 # =========================
 def _style_operativa(df: pd.DataFrame):
-    """
-    Colorea filas según Estado.
-    """
     colors = {
-        "ENTRADA+SALIDA": "#FFF3BF",  # amarillo suave
-        "ENTRADA": "#D3F9D8",         # verde suave
-        "SALIDA": "#FFE8CC",          # naranja suave
-        "OCUPADO": "#E7F5FF",         # azul suave
-        "VACIO": "#F1F3F5",           # gris suave
+        "ENTRADA+SALIDA": "#FFF3BF",
+        "ENTRADA": "#D3F9D8",
+        "SALIDA": "#FFE8CC",
+        "OCUPADO": "#E7F5FF",
+        "VACIO": "#F1F3F5",
     }
 
     def row_style(row):
@@ -156,31 +152,58 @@ def main():
     # ---------- Normaliza Odoo ----------
     odoo_norm = normalize_products(odoo_df)
 
-    # ---------- Mapa apt -> almacén + localización ----------
-    # Se asume que el maestro apt_almacen ya tiene columna "Localizacion" con "lat,lng"
+    # ---------- Mapa apt -> almacén + localización (ROBUSTO) ----------
     apt_master = masters["apt_almacen"].copy()
+    apt_master.columns = [str(c).strip() for c in apt_master.columns]  # quita espacios en headers
 
-    # Intento robusto: si por cualquier motivo la columna viniera con acento
-    if "Localizacion" not in apt_master.columns and "Localización" in apt_master.columns:
-        apt_master = apt_master.rename(columns={"Localización": "Localizacion"})
+    def _norm_col(s: str) -> str:
+        s = str(s).strip().lower()
+        s = s.replace("ó", "o").replace("í", "i").replace("á", "a").replace("é", "e").replace("ú", "u").replace("ñ", "n")
+        s = s.replace(" ", "").replace("_", "")
+        return s
 
-    required_cols = {"APARTAMENTO", "ALMACEN", "Localizacion"}
-    missing_cols = required_cols - set(apt_master.columns)
-    if missing_cols:
-        st.error(f"Faltan columnas en maestro apt_almacen: {missing_cols}. Revisa el Excel de GitHub.")
+    norm_map = {_norm_col(c): c for c in apt_master.columns}
+
+    if "apartamento" not in norm_map or "almacen" not in norm_map:
+        st.error(
+            "El maestro apt_almacen no trae APARTAMENTO/ALMACEN como columnas.\n\n"
+            f"Columnas detectadas: {list(apt_master.columns)}"
+        )
         st.stop()
 
-    ap_map = apt_master[["APARTAMENTO", "ALMACEN", "Localizacion"]].copy()
-    ap_map = ap_map.dropna(subset=["APARTAMENTO"]).drop_duplicates()
+    col_ap = norm_map["apartamento"]
+    col_al = norm_map["almacen"]
 
+    # localizar columna de coords (puede venir con nombres distintos)
+    col_loc = None
+    for key in ["localizacion", "localizaciongps", "gps", "coords", "coordenadas"]:
+        if key in norm_map:
+            col_loc = norm_map[key]
+            break
+
+    base_cols = [col_ap, col_al] + ([col_loc] if col_loc else [])
+    ap_map = apt_master[base_cols].copy()
+    ap_map = ap_map.dropna(subset=[col_ap]).drop_duplicates()
+
+    ap_map = ap_map.rename(columns={col_ap: "APARTAMENTO", col_al: "ALMACEN"})
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # Parse Localizacion -> LAT/LNG
-    loc = ap_map["Localizacion"].astype(str).str.replace(" ", "", regex=False)
-    parts = loc.str.split(",", n=1, expand=True)
-    ap_map["LAT"] = pd.to_numeric(parts[0], errors="coerce")
-    ap_map["LNG"] = pd.to_numeric(parts[1], errors="coerce")
+    if col_loc:
+        ap_map = ap_map.rename(columns={col_loc: "Localizacion"})
+        loc = ap_map["Localizacion"].astype(str).str.replace(" ", "", regex=False)
+        parts = loc.str.split(",", n=1, expand=True)
+        ap_map["LAT"] = pd.to_numeric(parts[0], errors="coerce")
+        ap_map["LNG"] = pd.to_numeric(parts[1], errors="coerce")
+    else:
+        ap_map["Localizacion"] = None
+        ap_map["LAT"] = pd.NA
+        ap_map["LNG"] = pd.NA
+        st.warning(
+            "No se ha encontrado columna de localización en el maestro apt_almacen.\n\n"
+            f"Columnas detectadas: {list(apt_master.columns)}\n\n"
+            "La app seguirá funcionando, pero sin rutas hasta que el loader incluya esa columna."
+        )
 
     # Avantio -> APARTAMENTO
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
@@ -206,7 +229,7 @@ def main():
     # Reposición min/max
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"])
 
-    # Productos sin clasificar (por si luego quieres mostrarlo)
+    # Productos sin clasificar
     unclassified = odoo_norm[odoo_norm["Amenity"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # ---------- Dashboard ----------
@@ -234,7 +257,7 @@ def main():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # Aviso si faltan coordenadas en el maestro (de cara a rutas)
+    # Aviso si faltan coordenadas
     missing_coords = ap_map[ap_map["LAT"].isna() | ap_map["LNG"].isna()]["APARTAMENTO"].dropna().unique().tolist()
     if missing_coords:
         st.warning(
@@ -260,37 +283,31 @@ def main():
     today = pd.Timestamp.now(tz=tz).normalize().date()
     tomorrow = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
 
-    # Solo hoy y mañana + con reposición
     short_df = operativa.copy()
     if "Lista_reponer" in short_df.columns:
         short_df = short_df[short_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
     short_df = short_df[short_df["Día"].isin([today, tomorrow])].copy()
 
-    # Añadir coords a operativa (merge por APARTAMENTO desde ap_map)
     short_df = short_df.merge(ap_map[["APARTAMENTO", "LAT", "LNG"]], on="APARTAMENTO", how="left")
     short_df["COORD"] = short_df.apply(
         lambda r: _coord_str(r["LAT"], r["LNG"]) if pd.notna(r.get("LAT")) and pd.notna(r.get("LNG")) else None,
         axis=1
     )
 
-    # Si quieres solo rutas para mañana (por ejemplo), lo cambias aquí.
     if short_df.empty:
-        st.info("No hay reposiciones previstas para HOY y MAÑANA en el periodo seleccionado (o no hay Lista_reponer).")
+        st.info("No hay reposiciones previstas para HOY y MAÑANA (o no hay Lista_reponer).")
     else:
-        MAX_STOPS = 20  # por seguridad (waypoints en Google Maps)
-        # Por cada día, por cada zona
+        MAX_STOPS = 20
         for dia, ddf in short_df.groupby("Día", dropna=False):
             st.markdown(f"### {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
             for zona, zdf in ddf.groupby("ZONA", dropna=False):
                 zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
                 coords = [c for c in zdf["COORD"].tolist() if c]
 
-                # Si no hay coords suficientes, aviso
                 if not coords:
                     st.info(f"{zona_label}: sin coordenadas suficientes para generar ruta.")
                     continue
 
-                # Dividir en tramos si hay muchos puntos
                 for idx, chunk in enumerate(chunk_list(coords, MAX_STOPS), start=1):
                     url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
                     if url:
@@ -299,16 +316,13 @@ def main():
     st.divider()
 
     # ============
-    # Tablas operativas (lo que ya tenías)
+    # Tablas operativas
     # ============
-    # Filtro solo con reposición (opcional)
     if only_replenishment and "Lista_reponer" in operativa.columns:
         operativa = operativa[operativa["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
-    # Orden global: Día, ZONA, prioridad, apartamento
     operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
 
-    # Mostrar por día y por zona
     for dia, ddf in operativa.groupby("Día", dropna=False):
         st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
         if ddf.empty:
