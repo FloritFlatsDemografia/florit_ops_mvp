@@ -41,10 +41,7 @@ def _pick_sheet_by_cols(xls: pd.ExcelFile, required_norm_cols: set[str]) -> str:
         if score > best_score:
             best_score = score
             best = sh
-    if best is None or best_score == 0:
-        # fallback primera hoja
-        return xls.sheet_names[0]
-    return best
+    return best or xls.sheet_names[0]
 
 
 def _read_excel_best_sheet(path: Path, required_norm_cols: set[str]) -> pd.DataFrame:
@@ -64,34 +61,69 @@ def _rename(df: pd.DataFrame, mapping_norm_to_std: dict[str, str]) -> pd.DataFra
     return df.rename(columns=ren)
 
 
+def _zonas_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convierte un excel de zonas en formato columnas (cada columna = zona, celdas = apartamentos)
+    a formato largo: APARTAMENTO, ZONA.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["APARTAMENTO", "ZONA"])
+
+    cols = [c for c in df.columns if not str(c).strip().lower().startswith("unnamed")]
+    rows = []
+    for zcol in cols:
+        s = df[zcol].dropna()
+        for v in s.tolist():
+            apt = str(v).strip()
+            if not apt or apt.lower() == "nan":
+                continue
+            rows.append({"APARTAMENTO": apt, "ZONA": str(zcol).strip()})
+
+    out = pd.DataFrame(rows).drop_duplicates()
+
+    # Limpieza de nombres de zona: "Zona Puerto" -> "Puerto"
+    if not out.empty:
+        out["ZONA"] = out["ZONA"].str.replace(r"^Zona\s+", "", regex=True).str.strip()
+
+    return out
+
+
 @lru_cache(maxsize=1)
 def load_masters_repo() -> dict:
-    # repo root = parent de /src
     base_dir = Path(__file__).resolve().parents[1]
     data_dir = base_dir / "data"
     if not data_dir.exists():
         raise FileNotFoundError(f"No existe carpeta data/: {data_dir}")
 
-    # 1) Archivos (por patrón)
+    # Archivos por patrón (tu estructura actual)
     apt_file = _pick_file(data_dir, ["*Apartamentos*Inventarios*.xlsx", "*Apartamentos*Inventarios*.xls"])
     cafe_file = _pick_file(data_dir, ["*Cafe*por*apartamento*.xlsx", "*Cafe*por*apartamento*.xls"])
     thr_file = _pick_file(data_dir, ["*Stock*minimo*por*almacen*.xlsx", "*Stock*minimo*por*almacen*.xls"])
-    zonas_file = _pick_file(data_dir, ["*Agrupacion*zon*.xlsx", "*Agrupacion*zon*.xls", "*Zonas*.xlsx", "*Zonas*.xls"])
+    zonas_file = _pick_file(data_dir, ["*Agrupacion*apartamento*por*z*.xlsx", "*Agrupacion*apartamento*por*z*.xls", "*Zonas*.xlsx", "*Zonas*.xls"])
 
-    # 2) Cargar cada maestro (buscando hoja por columnas)
+    # Leer (hoja “mejor” por columnas esperadas)
     apt = _read_excel_best_sheet(apt_file, {"apartamento", "almacen"})
     cafe = _read_excel_best_sheet(cafe_file, {"apartamento"})
-    zonas = _read_excel_best_sheet(zonas_file, {"apartamento", "zona"})
     thresholds = _read_excel_best_sheet(thr_file, {"amenity"})
+    zonas_raw = _read_excel_best_sheet(zonas_file, {"apartamento", "zona"})
 
-    # 3) Normalizar/renombrar columnas esperadas
-    # ZONAS
-    zonas = _rename(zonas, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
-    if "APARTAMENTO" not in zonas.columns or "ZONA" not in zonas.columns:
-        raise ValueError(f"ZONAS debe tener APARTAMENTO y ZONA. Columnas: {list(zonas.columns)}")
-    zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
+    # ---------- ZONAS ----------
+    # Intento 1: formato tabla clásico
+    zonas = _rename(zonas_raw, {"apartamento": "APARTAMENTO", "zona": "ZONA"})
+    if "APARTAMENTO" in zonas.columns and "ZONA" in zonas.columns:
+        zonas = zonas[["APARTAMENTO", "ZONA"]].copy()
+        zonas["APARTAMENTO"] = zonas["APARTAMENTO"].astype(str).str.strip()
+        zonas["ZONA"] = zonas["ZONA"].astype(str).str.strip()
+    else:
+        # Intento 2: formato columnas (cada columna = zona)
+        zonas = _zonas_wide_to_long(zonas_raw)
+        if zonas.empty:
+            raise ValueError(
+                f"ZONAS debe tener APARTAMENTO y ZONA, o venir en formato columnas por zona. "
+                f"Columnas detectadas: {list(zonas_raw.columns)}"
+            )
 
-    # CAFE
+    # ---------- CAFE ----------
     cafe = _rename(
         cafe,
         {
@@ -104,9 +136,10 @@ def load_masters_repo() -> dict:
     )
     if "APARTAMENTO" not in cafe.columns or "CAFE_TIPO" not in cafe.columns:
         raise ValueError(f"CAFE debe tener APARTAMENTO y CAFE_TIPO. Columnas: {list(cafe.columns)}")
+    cafe = cafe[["APARTAMENTO", "CAFE_TIPO"]].copy()
     cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
 
-    # APT_ALMACEN (+ Localizacion)
+    # ---------- APT_ALMACEN (+ Localizacion) ----------
     apt = _rename(
         apt,
         {
@@ -119,7 +152,6 @@ def load_masters_repo() -> dict:
             "gps": "Localizacion",
         },
     )
-    # soporte acento
     if "Localización" in apt.columns and "Localizacion" not in apt.columns:
         apt = apt.rename(columns={"Localización": "Localizacion"})
 
@@ -129,10 +161,11 @@ def load_masters_repo() -> dict:
     if "Localizacion" not in apt.columns:
         apt["Localizacion"] = pd.NA
 
+    apt = apt[["APARTAMENTO", "ALMACEN", "Localizacion"]].copy()
     apt["APARTAMENTO"] = apt["APARTAMENTO"].astype(str).str.strip()
     apt["ALMACEN"] = apt["ALMACEN"].astype(str).str.strip()
 
-    # THRESHOLDS: no fuerzo estructura; tu summarize_replenishment ya lo gestiona
+    # ---------- THRESHOLDS ----------
     thresholds.columns = [str(c).strip() for c in thresholds.columns]
     if "AMENITY" in thresholds.columns and "Amenity" not in thresholds.columns:
         thresholds = thresholds.rename(columns={"AMENITY": "Amenity"})
