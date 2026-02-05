@@ -14,6 +14,8 @@ ORIGIN_LNG = -0.38498336081567713
 # =========================
 def _coord_str(lat, lng):
     try:
+        if pd.isna(lat) or pd.isna(lng):
+            return None
         return f"{float(lat):.8f},{float(lng):.8f}"
     except Exception:
         return None
@@ -103,7 +105,6 @@ def parse_lista_reponer(s: str):
             if name:
                 out.append((name, qty))
         else:
-            # si no viene xN, asumimos 1
             out.append((p, 1))
     return out
 
@@ -157,6 +158,50 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str]):
     return items_df, totals_df
 
 
+# =========================
+# Master coords helper
+# =========================
+def _ensure_coords_from_master(ap_map: pd.DataFrame) -> pd.DataFrame:
+    """
+    Asegura que ap_map tenga LAT/LNG numéricos.
+    Soporta:
+      - columnas LAT/LNG
+      - columna Localizacion o Localización con "lat,lng"
+    """
+    df = ap_map.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    # Renombres típicos
+    if "Localización" in df.columns and "Localizacion" not in df.columns:
+        df = df.rename(columns={"Localización": "Localizacion"})
+
+    # Garantiza LAT/LNG
+    if "LAT" not in df.columns:
+        df["LAT"] = pd.NA
+    if "LNG" not in df.columns:
+        df["LNG"] = pd.NA
+
+    # Si LAT/LNG vienen vacíos pero hay Localizacion -> parsea
+    if "Localizacion" in df.columns:
+        loc = df["Localizacion"].astype(str).str.replace(" ", "", regex=False)
+        parts = loc.str.split(",", n=1, expand=True)
+        if parts.shape[1] >= 2:
+            lat = pd.to_numeric(parts[0], errors="coerce")
+            lng = pd.to_numeric(parts[1], errors="coerce")
+
+            # Solo rellena donde no hay ya LAT/LNG
+            df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
+            df["LNG"] = pd.to_numeric(df["LNG"], errors="coerce")
+            df.loc[df["LAT"].isna(), "LAT"] = lat[df["LAT"].isna()]
+            df.loc[df["LNG"].isna(), "LNG"] = lng[df["LNG"].isna()]
+
+    # Normaliza numérico final
+    df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
+    df["LNG"] = pd.to_numeric(df["LNG"], errors="coerce")
+
+    return df
+
+
 def main():
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
@@ -187,7 +232,7 @@ def main():
         )
 
     # =========================
-    # Sidebar (2 clics + avanzado)
+    # Sidebar
     # =========================
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
@@ -233,11 +278,9 @@ def main():
         st.stop()
 
     # Zonas selector (multi)
-    zonas_all = (
-        masters["zonas"]["ZONA"].dropna().astype(str).str.strip().unique().tolist()
-        if "zonas" in masters and "ZONA" in masters["zonas"].columns
-        else []
-    )
+    zonas_all = []
+    if "zonas" in masters and isinstance(masters["zonas"], pd.DataFrame) and "ZONA" in masters["zonas"].columns:
+        zonas_all = masters["zonas"]["ZONA"].dropna().astype(str).str.strip().unique().tolist()
     zonas_all = sorted([z for z in zonas_all if z and z.lower() not in ["nan", "none"]])
 
     zonas_sel = st.sidebar.multiselect(
@@ -268,16 +311,14 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     ap_map = masters["apt_almacen"].copy()
-    # aseguramos columnas
+    ap_map.columns = [c.strip() for c in ap_map.columns]
+
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
         st.stop()
 
-    # coords si están
-    for c in ["LAT", "LNG"]:
-        if c not in ap_map.columns:
-            ap_map[c] = pd.NA
+    ap_map = _ensure_coords_from_master(ap_map)
 
     ap_map = ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]].dropna(subset=["APARTAMENTO", "ALMACEN"]).drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
@@ -294,8 +335,9 @@ def main():
         odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
     odoo_norm["ALMACEN"] = odoo_norm["ALMACEN"].astype(str).str.strip()
 
+    # 🔴 CLAVE: conservar AmenityKey + Amenity para el cruce correcto
     stock_by_alm = (
-        odoo_norm.groupby(["ALMACEN", "AmenityKey"], as_index=False)["Cantidad"]
+        odoo_norm.groupby(["ALMACEN", "AmenityKey", "Amenity"], as_index=False)["Cantidad"]
         .sum()
         .rename(columns={"Cantidad": "Cantidad"})
     )
@@ -304,8 +346,8 @@ def main():
     rep = summarize_replenishment(
         stock_by_alm,
         masters["thresholds"],
-        objective="max",     # siempre “hasta máximo”
-        urgent_only=urgent_only,  # filtra por bajo mínimo si el modo es urgente
+        objective="max",          # siempre hasta máximo
+        urgent_only=urgent_only,  # en modo urgente, solo filas bajo mínimo
     )
 
     unclassified = odoo_norm[odoo_norm["AmenityKey"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
@@ -340,7 +382,7 @@ def main():
     )
 
     # =========================
-    # 1) PARTE OPERATIVO (primero)
+    # 1) PARTE OPERATIVO
     # =========================
     st.divider()
     st.subheader("PARTE OPERATIVO · Entradas / Salidas / Ocupación / Vacíos + Reposición")
@@ -372,6 +414,7 @@ def main():
         for zona, zdf in ddf.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
+
             show_df = zdf.drop(columns=["ZONA", "__prio"], errors="ignore").copy()
             st.dataframe(
                 _style_operativa(show_df),
@@ -380,7 +423,7 @@ def main():
             )
 
     # =========================
-    # 2) SUGERENCIA DE REPOSICIÓN (resumen)
+    # 2) SUGERENCIA DE REPOSICIÓN
     # =========================
     st.divider()
     st.subheader("Sugerencia de Reposición")
@@ -402,22 +445,20 @@ def main():
             st.dataframe(
                 items_df,
                 use_container_width=True,
-                height=min(520, 40 + 28 * min(len(items_df), 20)),
+                height=min(520, 40 + 28 * min(len(items_df), 25)),
             )
 
-        # Extra útil: checklist por zona
         with st.expander("✅ Checklist por ZONA (lista rápida)", expanded=False):
             for zona, zdf in items_df.groupby("ZONA", dropna=False):
                 zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
                 st.markdown(f"### {zona_label}")
-                # por apartamento
                 for apt, adf in zdf.groupby("APARTAMENTO"):
                     lines = [f"- {row['Producto']} x{int(row['Cantidad'])}" for _, row in adf.iterrows()]
                     st.markdown(f"**{apt}**")
                     st.markdown("\n".join(lines))
 
     # =========================
-    # 3) RUTAS GOOGLE MAPS (ABAJO DEL TODO)
+    # 3) RUTAS GOOGLE MAPS (ABAJO)
     # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
@@ -437,6 +478,7 @@ def main():
     if zonas_sel:
         route_df = route_df[route_df["ZONA"].isin(zonas_sel)].copy()
 
+    # coords por apartamento (NO por zona)
     route_df = route_df.merge(ap_map[["APARTAMENTO", "LAT", "LNG"]], on="APARTAMENTO", how="left")
     route_df["COORD"] = route_df.apply(lambda r: _coord_str(r.get("LAT"), r.get("LNG")), axis=1)
     route_df = route_df[route_df["COORD"].notna()].copy()
@@ -449,14 +491,19 @@ def main():
             st.markdown(f"### {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
             for zona, zdf in ddf.groupby("ZONA", dropna=False):
                 zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
-                coords = zdf["COORD"].tolist()
+                coords = [c for c in zdf["COORD"].tolist() if c]
 
                 if not coords:
                     st.info(f"{zona_label}: sin coordenadas suficientes.")
                     continue
 
                 for idx, chunk in enumerate(chunk_list(coords, MAX_STOPS), start=1):
-                    url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base, optimize=True)
+                    url = build_gmaps_directions_url(
+                        chunk,
+                        travelmode=travelmode,
+                        return_to_base=return_to_base,
+                        optimize=True,
+                    )
                     if url:
                         st.link_button(f"Abrir ruta · {zona_label} (tramo {idx})", url)
 
@@ -465,7 +512,9 @@ def main():
     # =========================
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
-        st.dataframe(rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True), use_container_width=True)
+        # rep puede no tener Amenity (si no mapea), orden robusto:
+        sort_cols = [c for c in ["ALMACEN", "Amenity"] if c in rep.columns]
+        st.dataframe(rep.sort_values(sort_cols, na_position="last").reset_index(drop=True), use_container_width=True)
         if not unclassified.empty:
             st.warning("Hay productos sin clasificar (no entran en reposición).")
             st.dataframe(unclassified.reset_index(drop=True), use_container_width=True)
