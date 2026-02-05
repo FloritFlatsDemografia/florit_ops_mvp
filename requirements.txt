@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+lxml
+xlsxwriter
+python-dateutil
