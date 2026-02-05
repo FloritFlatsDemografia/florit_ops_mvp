@@ -169,19 +169,19 @@ def main():
         # Mapeo UI -> Estado interno
         ui_to_state = {
             "Entradas": "ENTRADA",
-            "Salidas":"SALIDA"
-            "Vacio": "VACIO",
+            "Salidas": "SALIDA",
             "Entrada/Salidas": "ENTRADA+SALIDA",
+            "Vacio": "VACIO",
             "Ocupado": "OCUPADO",
-            # Si quieres también SALIDA suelta, dímelo y lo añado
-            # "Salidas": "SALIDA",
         }
+
         selected_ui = st.multiselect(
             "Mostrar",
             options=list(ui_to_state.keys()),
             default=list(ui_to_state.keys()),
         )
         selected_states = [ui_to_state[x] for x in selected_ui]
+
 
         st.divider()
         st.subheader("Ruta (extra)")
