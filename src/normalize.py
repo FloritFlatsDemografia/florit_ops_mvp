@@ -86,7 +86,6 @@ def normalize_products(odoo_df: pd.DataFrame) -> pd.DataFrame:
     Añade columna 'Amenity' clasificando por nombre de producto.
     """
     df = odoo_df.copy()
-
     if "Producto" not in df.columns:
         raise ValueError(f"Odoo df debe tener columna 'Producto'. Columnas: {list(df.columns)}")
 
@@ -102,7 +101,6 @@ def _normalize_threshold_columns(thr: pd.DataFrame) -> pd.DataFrame:
     """
     thr = thr.copy()
 
-    # Renombres por si vienen con tilde
     rename_map = {}
     if "Mínimo" in thr.columns and "Minimo" not in thr.columns:
         rename_map["Mínimo"] = "Minimo"
@@ -116,7 +114,6 @@ def _normalize_threshold_columns(thr: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Thresholds debe tener {required}. Faltan: {missing}. Columnas: {list(thr.columns)}")
 
-    # Normaliza tipos numéricos
     thr["Minimo"] = pd.to_numeric(thr["Minimo"], errors="coerce")
     thr["Maximo"] = pd.to_numeric(thr["Maximo"], errors="coerce")
 
@@ -125,14 +122,15 @@ def _normalize_threshold_columns(thr: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_replenishment(stock_by_alm: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula reposición por ALMACEN+Amenity usando min/max:
+    Calcula reposición por ALMACEN+Amenity usando min/max.
 
-    - Si Cantidad < Minimo => A_reponer = Maximo - Cantidad
-    - Si Cantidad >= Minimo => A_reponer = 0
+    ✅ Política Florit (la que necesitas):
+      - A_reponer = max(0, Maximo - Cantidad)
+      - (se repone SIEMPRE hasta máximo, aunque esté por encima del mínimo)
 
-    Mejoras:
-    - Merge robusto por clave sin tildes: amenity_key
-    - Cantidades negativas de Odoo se recortan a 0 para el cálculo (operativa).
+    Además:
+      - Merge robusto por clave sin tildes: amenity_key
+      - Cantidades negativas en Odoo: para reposición se tratan como 0 (no tiene sentido reponer "menos")
     """
     if stock_by_alm is None or stock_by_alm.empty:
         return pd.DataFrame(columns=["ALMACEN", "Amenity", "Cantidad", "Minimo", "Maximo", "Faltante_min", "A_reponer"])
@@ -150,30 +148,29 @@ def summarize_replenishment(stock_by_alm: pd.DataFrame, thresholds: pd.DataFrame
     out["amenity_key"] = out["Amenity"].apply(_norm_txt)
     thr["amenity_key"] = thr["Amenity"].apply(_norm_txt)
 
-    # Merge por clave
     out = out.merge(
         thr[["amenity_key", "Minimo", "Maximo"]],
         on="amenity_key",
         how="left",
     )
 
-    # Limpieza numérica
+    # Flag para diagnosticar: si no matchea en thresholds, aquí lo verás
+    out["thr_missing"] = out["Minimo"].isna() | out["Maximo"].isna()
+
+    # Numéricos
     out["Cantidad"] = pd.to_numeric(out["Cantidad"], errors="coerce").fillna(0)
 
-    # Operativa: si Odoo trae negativos, para reposición los tratamos como 0
+    # Operativa: negativos a 0 para calcular reposición
     out["Cantidad_calc"] = out["Cantidad"].clip(lower=0)
 
     out["Minimo"] = pd.to_numeric(out["Minimo"], errors="coerce").fillna(0)
     out["Maximo"] = pd.to_numeric(out["Maximo"], errors="coerce").fillna(0)
 
-    # Regla: solo reponer si está por debajo del mínimo
+    # Solo informativo (por si lo quieres usar)
     out["Faltante_min"] = out["Cantidad_calc"] < out["Minimo"]
 
-    out["A_reponer"] = 0.0
-    mask = out["Faltante_min"]
-    out.loc[mask, "A_reponer"] = (out.loc[mask, "Maximo"] - out.loc[mask, "Cantidad_calc"]).clip(lower=0)
+    # ✅ Reposición siempre hasta máximo
+    out["A_reponer"] = (out["Maximo"] - out["Cantidad_calc"]).clip(lower=0)
 
-    # Orden final (amenity_key no hace falta mostrarlo)
     out = out.drop(columns=["amenity_key"], errors="ignore")
-
     return out
