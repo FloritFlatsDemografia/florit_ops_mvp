@@ -1,6 +1,5 @@
 import pandas as pd
 from io import BytesIO
-import xlsxwriter
 
 
 STATE_PRIORITY = {
@@ -11,7 +10,6 @@ STATE_PRIORITY = {
     "VACIO": 4,
 }
 
-# AmenityKey que tratamos como “café” (se filtra por CAFE_TIPO)
 COFFEE_KEYS = {"cafe_tassimo", "cafe_nespresso", "cafe_molido", "cafe_dolcegusto"}
 
 
@@ -29,34 +27,19 @@ def _coffee_allowed_keys(cafe_tipo: str) -> set[str]:
         return {"cafe_molido"}
     if "dolce" in t:
         return {"cafe_dolcegusto"}
-    return set()  # si no está definido, mejor no meter café
+    return set()
 
 
-def _as_int(x) -> int:
-    try:
-        return int(round(float(x)))
-    except Exception:
-        return 0
-
-
-def _join_items(series: pd.Series, limit: int = 80) -> str:
-    xs = []
-    for v in series.tolist():
-        if isinstance(v, str) and v.strip():
-            xs.append(v.strip())
-        if len(xs) >= limit:
-            break
-    return ", ".join(xs)
-
-
-def _build_replenishment_lists_per_apt(apt_df: pd.DataFrame, rep_df: pd.DataFrame) -> pd.DataFrame:
+def _build_replenishment_lists_per_apt(
+    apt_df: pd.DataFrame,
+    rep_df: pd.DataFrame,
+) -> pd.DataFrame:
     """
-    Construye 2 columnas por APARTAMENTO:
-      - Lista_reponer  -> para llegar a MAXIMO (A_reponer)
-      - Bajo_minimo    -> lo urgente para llegar a MINIMO (Faltan_para_min)
-
-    apt_df: APARTAMENTO, ALMACEN, CAFE_TIPO (y lo que quieras conservar)
-    rep_df:  ALMACEN, AmenityKey, Amenity, A_reponer, Faltan_para_min, ...
+    Construye 2 listas:
+      - Lista_reponer: para llegar a máximo (A_reponer_max)
+      - Bajo_minimo: faltante para mínimo (Faltan_para_min)
+    rep_df esperado:
+      ALMACEN, AmenityKey, Amenity, A_reponer_max, Faltan_para_min, Bajo_minimo
     """
     out = apt_df.copy()
     out["Lista_reponer"] = ""
@@ -67,76 +50,52 @@ def _build_replenishment_lists_per_apt(apt_df: pd.DataFrame, rep_df: pd.DataFram
 
     rep = rep_df.copy()
 
-    # Columnas esperadas (robusto)
-    if "ALMACEN" not in rep.columns:
-        rep["ALMACEN"] = ""
+    need_cols = {"ALMACEN", "AmenityKey", "Amenity"}
+    if not need_cols.issubset(set(rep.columns)):
+        # no rompemos: simplemente sin listas
+        return out
 
-    if "AmenityKey" not in rep.columns:
-        rep["AmenityKey"] = ""
-
-    if "Amenity" not in rep.columns:
-        rep["Amenity"] = ""
-
-    if "A_reponer" not in rep.columns:
-        rep["A_reponer"] = 0
-
-    if "Faltan_para_min" not in rep.columns:
-        # compat por si viniera con otros nombres
-        for alt in ["Faltante_min", "Faltan_min", "Faltante_minimo"]:
-            if alt in rep.columns:
-                rep["Faltan_para_min"] = rep[alt]
-                break
-        else:
-            rep["Faltan_para_min"] = 0
-
-    rep["A_reponer"] = pd.to_numeric(rep["A_reponer"], errors="coerce").fillna(0)
-    rep["Faltan_para_min"] = pd.to_numeric(rep["Faltan_para_min"], errors="coerce").fillna(0)
-
-    # join por ALMACEN (cada apt tiene su almacén)
+    # Join por almacén
     tmp = out[["APARTAMENTO", "ALMACEN", "CAFE_TIPO"]].merge(rep, on="ALMACEN", how="left")
 
-    # filtra café por tipo del apartamento
+    # Filtra café por tipo de apartamento
     def keep_row(r):
         k = r.get("AmenityKey")
-        if pd.isna(k) or str(k).strip() == "":
+        if pd.isna(k):
             return False
-
-        k = str(k).strip()
-
         if k in COFFEE_KEYS:
             allowed = _coffee_allowed_keys(r.get("CAFE_TIPO"))
             return k in allowed
-
         return True
 
     tmp = tmp[tmp.apply(keep_row, axis=1)].copy()
 
-    # -------- Lista_reponer (hasta máximo) --------
-    tmp_max = tmp[tmp["A_reponer"] > 0].copy()
-    if not tmp_max.empty:
+    # --- Lista para máximo ---
+    if "A_reponer_max" in tmp.columns:
+        tmp_max = tmp[tmp["A_reponer_max"].fillna(0) > 0].copy()
         tmp_max["item"] = tmp_max.apply(
-            lambda r: f"{r.get('Amenity','')} x{_as_int(r.get('A_reponer', 0))}",
+            lambda r: f"{r.get('Amenity','')} x{int(round(float(r.get('A_reponer_max',0))))}",
             axis=1,
         )
         agg_max = (
-            tmp_max.groupby("APARTAMENTO")["item"]
-            .apply(_join_items)
-            .reset_index(name="Lista_reponer")
+            tmp_max.groupby("APARTAMENTO", as_index=False)["item"]
+            .apply(lambda s: ", ".join([x for x in s.tolist() if x and str(x).strip()]))
+            .rename(columns={"item": "Lista_reponer"})
         )
         out = out.merge(agg_max, on="APARTAMENTO", how="left")
         out["Lista_reponer"] = out["Lista_reponer"].fillna("")
 
-    # -------- Bajo_minimo (urgente: hasta mínimo) --------
-    tmp_min = tmp[tmp["Faltan_para_min"] > 0].copy()
-    if not tmp_min.empty:
-        tmp_min["item"] = tmp_min.apply(
-            lambda r: f"{r.get('Amenity','')} x{_as_int(r.get('Faltan_para_min', 0))}",
+    # --- Bajo mínimo (urgente) ---
+    if "Faltan_para_min" in tmp.columns:
+        tmp_min = tmp[tmp["Faltan_para_min"].fillna(0) > 0].copy()
+        tmp_min["item2"] = tmp_min.apply(
+            lambda r: f"{r.get('Amenity','')} x{int(round(float(r.get('Faltan_para_min',0))))}",
             axis=1,
         )
         agg_min = (
-            tmp_min.groupby("APARTAMENTO")["item"]
-            .apply(_join_items)
-            .reset_index(name="Bajo_minimo")
+            tmp_min.groupby("APARTAMENTO", as_index=False)["item2"]
+            .apply(lambda s: ", ".join([x for x in s.tolist() if x and str(x).strip()]))
+            .rename(columns={"item2": "Bajo_minimo"})
         )
         out = out.merge(agg_min, on="APARTAMENTO", how="left")
         out["Bajo_minimo"] = out["Bajo_minimo"].fillna("")
@@ -153,9 +112,8 @@ def build_dashboard_frames(
 ):
     df = avantio_df.copy()
 
-    # Necesitamos: APARTAMENTO, ALMACEN, ZONA, CAFE_TIPO, Fecha entrada hora, Fecha salida hora
+    # Normaliza columnas de fecha
     if "Fecha entrada hora" not in df.columns or "Fecha salida hora" not in df.columns:
-        # fallback por si vienen con otros nombres
         for alt in ["Fecha entrada", "Entrada", "Check-in"]:
             if alt in df.columns and "Fecha entrada hora" not in df.columns:
                 df = df.rename(columns={alt: "Fecha entrada hora"})
@@ -163,55 +121,42 @@ def build_dashboard_frames(
             if alt in df.columns and "Fecha salida hora" not in df.columns:
                 df = df.rename(columns={alt: "Fecha salida hora"})
 
-    # Parse datetimes
-    df["in_dt"] = _safe_dt(df.get("Fecha entrada hora"))
-    df["out_dt"] = _safe_dt(df.get("Fecha salida hora"))
+    df["in_dt"] = _safe_dt(df["Fecha entrada hora"])
+    df["out_dt"] = _safe_dt(df["Fecha salida hora"])
 
-    # Periodo (robusto)
-    if period_start is None:
-        start = pd.Timestamp.today().normalize()
-    else:
-        start = pd.Timestamp(period_start).normalize()
-
-    days = int(period_days) if period_days else 2
-    days = max(1, days)
-
+    # Periodo
+    start = pd.Timestamp(period_start).normalize()
+    days = int(period_days)
     date_list = [start + pd.Timedelta(days=i) for i in range(days)]
     end = (start + pd.Timedelta(days=days - 1)).normalize()
 
     # Base apartamentos únicos
     base_cols = ["APARTAMENTO", "ZONA", "CAFE_TIPO", "ALMACEN"]
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = None
-
     base = df[base_cols].dropna(subset=["APARTAMENTO"]).drop_duplicates().copy()
     base["APARTAMENTO"] = base["APARTAMENTO"].astype(str).str.strip()
     base["ZONA"] = base["ZONA"].astype(str).str.strip()
+    base["ALMACEN"] = base["ALMACEN"].astype(str).str.strip()
 
-    # Lista reponer (máximo) + Bajo_minimo (mínimo) por apt (según ALMACEN + café)
+    # Listas de reposición por apt
     base = _build_replenishment_lists_per_apt(base, replenishment_df)
 
     oper_rows = []
-
     for d in date_list:
         day_start = d
         day_end = d + pd.Timedelta(days=1)
 
-        # reservas que solapan el día: in < end && out > start
+        # Reservas que solapan el día
         day_res = df[(df["in_dt"] < day_end) & (df["out_dt"] > day_start)].copy()
 
-        # entradas / salidas exactas del día
+        # entradas/salidas exactas
         in_today = df[df["in_dt"].dt.normalize() == day_start][["APARTAMENTO", "in_dt"]].copy()
         out_today = df[df["out_dt"].dt.normalize() == day_start][["APARTAMENTO", "out_dt"]].copy()
-
         in_today = in_today.sort_values("in_dt").drop_duplicates("APARTAMENTO")
         out_today = out_today.sort_values("out_dt").drop_duplicates("APARTAMENTO")
 
         occ = day_res[["APARTAMENTO"]].drop_duplicates()
         occ["OCUPA"] = True
 
-        # empieza con base y asigna estado
         day_table = base.copy()
         day_table["Día"] = day_start.date()
 
@@ -237,40 +182,21 @@ def build_dashboard_frames(
         day_table["Estado"] = day_table.apply(compute_state, axis=1)
         day_table["__prio"] = day_table["Estado"].map(lambda x: STATE_PRIORITY.get(x, 99))
 
-        # próxima entrada futura (posterior al día)
+        # Próxima entrada futura (posterior al día)
         future_in = df[df["in_dt"] > day_end][["APARTAMENTO", "in_dt"]].copy()
         future_in = future_in.sort_values("in_dt").drop_duplicates("APARTAMENTO")
         future_in["Próxima Entrada"] = future_in["in_dt"].dt.date
         future_in = future_in[["APARTAMENTO", "Próxima Entrada"]]
         day_table = day_table.merge(future_in, on="APARTAMENTO", how="left")
 
-        # Orden columnas (Bajo_minimo justo después de Lista_reponer)
-        wanted = [
-            "Día",
-            "ZONA",
-            "APARTAMENTO",
-            "Estado",
-            "Próxima Entrada",
-            "Lista_reponer",
-            "Bajo_minimo",
-            "CAFE_TIPO",
-            "__prio",
-        ]
-        keep = [c for c in wanted if c in day_table.columns] + [c for c in day_table.columns if c not in wanted]
-
-        day_table = day_table[keep].copy()
-
-        # Quitar columnas que NO quieres ver
-        day_table = day_table.drop(
-            columns=["OCUPA", "in_dt", "out_dt", "Entrada hora", "Salida hora"],
-            errors="ignore",
-        )
+        # --- LIMPIEZA de columnas (lo que pediste quitar)
+        day_table = day_table.drop(columns=["OCUPA", "in_dt", "out_dt"], errors="ignore")
 
         oper_rows.append(day_table)
 
     operativa = pd.concat(oper_rows, ignore_index=True)
 
-    # KPIs del “día foco” (primer día del periodo)
+    # KPIs del día foco
     foco = start.date()
     foco_df = operativa[operativa["Día"] == foco]
     kpis = {
@@ -293,13 +219,11 @@ def build_dashboard_frames(
         for sh in writer.sheets.values():
             sh.freeze_panes(1, 0)
 
-    excel_bytes = output.getvalue()
-
     return {
         "kpis": kpis,
         "operativa": operativa,
         "period_start": start.date(),
         "period_end": end.date(),
-        "excel_all": excel_bytes,
+        "excel_all": output.getvalue(),
         "excel_filename": f"Florit_OPS_Operativa_{start.date()}_{end.date()}.xlsx",
     }
