@@ -164,24 +164,33 @@ def _load_thresholds(path: Path) -> pd.DataFrame:
     df = _norm_cols(_read_excel_first_sheet(path))
 
     c_am = _find_col(df, ["Amenity", "AMENITY", "Producto", "PRODUCTO", "Item", "ITEM"])
-    c_min = _find_col(df, ["Min", "MIN", "Minimo", "Mínimo", "STOCK_MIN", "MINIMO"])
-    c_max = _find_col(df, ["Max", "MAX", "Maximo", "Máximo", "STOCK_MAX", "MAXIMO"])
+    c_min = _find_col(df, ["Minimo", "Mínimo", "Min", "MIN", "STOCK_MIN", "MINIMO"])
+    c_max = _find_col(df, ["Maximo", "Máximo", "Max", "MAX", "STOCK_MAX", "MAXIMO"])
 
     if not c_am:
         raise ValueError(f"THRESHOLDS: no encuentro columna Amenity/Producto. Columnas: {list(df.columns)}")
 
-    use_cols = [c_am] + ([c_min] if c_min else []) + ([c_max] if c_max else [])
-    out = df[use_cols].copy()
-    out = out.rename(
-        columns={
-            c_am: "Amenity",
-            **({c_min: "Min"} if c_min else {}),
-            **({c_max: "Max"} if c_max else {}),
-        }
-    )
-    out["Amenity"] = out["Amenity"].astype(str).str.strip()
-    out = out[out["Amenity"].ne("") & out["Amenity"].ne("nan")]
+    # Construir salida estándar
+    out = pd.DataFrame()
+    out["Amenity"] = df[c_am].astype(str).str.strip()
+
+    if c_min:
+        out["Minimo"] = pd.to_numeric(df[c_min], errors="coerce")
+    else:
+        out["Minimo"] = 0
+
+    if c_max:
+        out["Maximo"] = pd.to_numeric(df[c_max], errors="coerce")
+    else:
+        # si no hay max, por defecto igual al mínimo
+        out["Maximo"] = out["Minimo"]
+
+    out = out[out["Amenity"].ne("") & out["Amenity"].ne("nan")].copy()
+    out["Minimo"] = out["Minimo"].fillna(0)
+    out["Maximo"] = out["Maximo"].fillna(out["Minimo"])
+
     return out.drop_duplicates()
+
 
 
 # --------------------------
