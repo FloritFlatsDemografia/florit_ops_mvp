@@ -169,6 +169,7 @@ def main():
         # Mapeo UI -> Estado interno
         ui_to_state = {
             "Entradas": "ENTRADA",
+            "Salidas":"SALIDA"
             "Vacio": "VACIO",
             "Entrada/Salidas": "ENTRADA+SALIDA",
             "Ocupado": "OCUPADO",
