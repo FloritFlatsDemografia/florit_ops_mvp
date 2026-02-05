@@ -1,210 +1,179 @@
+import pandas as pd
 import re
 import unicodedata
-import pandas as pd
 
 
-def _norm_txt(x) -> str:
-    if x is None:
-        return ""
-    try:
-        s = str(x)
-    except Exception:
-        return ""
-    s = s.strip().lower()
+def _norm_txt(s: str) -> str:
+    """
+    Normaliza texto para comparar/mergear:
+    - lowercase
+    - sin tildes
+    - espacios normalizados
+    """
+    s = s or ""
+    s = str(s).strip().lower()
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
     s = re.sub(r"\s+", " ", s)
     return s
 
 
-def amenity_key(product_name: str) -> str | None:
+# =========================
+# Reglas de clasificación
+# =========================
+AMENITY_RULES = [
+    ("Gel de ducha", [r"gel.*duch", r"gel ducha", r"\bducha\b"]),
+    ("Champú", [r"champu", r"shampoo"]),
+    ("Jabón de manos", [r"(jabon|gel)\s+de\s+manos", r"gel de manos", r"hand\s+soap"]),
+    ("Azúcar", [r"azucar"]),
+
+    ("Té/Infusión", [r"infus", r"\bte\b", r"rooibos", r"manzanilla", r"\btilo\b", r"menta", r"earl", r"english"]),
+    ("Insecticida", [r"insectic", r"raid", r"mosquit", r"cucarach", r"hormig"]),
+    ("Detergente", [r"detergente", r"lavadora", r"capsula.*deterg", r"capsu.*deterg"]),
+
+    ("Papel higiénico", [r"papel\s*higien", r"higienico", r"papel wc", r"\bwc\b"]),
+    ("Botella de agua", [r"botella\s*agua", r"\bagua\b.*\b1l\b", r"agua\s*1l"]),
+    ("Kit limpieza", [r"kit\s*limpieza", r"kit limpieza"]),
+
+    ("Vinagre", [r"vinagre"]),
+    ("Abrillantador", [r"abrillantador"]),
+    ("Sal lavavajillas", [r"sal.*lavavaj"]),
+    ("Sal de mesa", [r"sal fina", r"sal de mesa"]),
+    ("Escoba", [r"escoba"]),
+    ("Mocho/Fregona", [r"fregona", r"mocho", r"mopa"]),
+]
+
+COFFEE_RULES = [
+    ("Café molido", [r"cafe.*molido", r"\bmolido\b", r"cafe natural molido"]),
+]
+
+COFFEE_CAPSULE_RULES = [
+    ("Cápsulas Nespresso", [r"nespresso", r"\bcapsul.*nesp", r"capsula colombia", r"capsula.*colombia"]),
+    ("Cápsulas Tassimo", [r"tassimo"]),
+    ("Cápsulas Dolce Gusto", [r"dolce\s*gusto", r"dolcegusto"]),
+    ("Cápsulas Senseo", [r"senseo"]),
+]
+
+
+def classify_product(product_name: str) -> str | None:
     t = _norm_txt(product_name)
 
-    # --- Café ---
-    if "tassimo" in t:
-        return "cafe_tassimo"
-    if ("dolce" in t and "gusto" in t) or "dolcegusto" in t:
-        return "cafe_dolcegusto"
-    if "nespresso" in t or "capsula colombia" in t or ("capsula" in t and "colombia" in t):
-        return "cafe_nespresso"
-    if "molido" in t and "cafe" in t:
-        return "cafe_molido"
+    # Coffee (molido)
+    for label, patterns in COFFEE_RULES:
+        for p in patterns:
+            if re.search(p, t):
+                return label
 
-    # --- Amenities ---
-    if "gel" in t and "duch" in t and "manos" not in t:
-        return "gel_ducha"
-    if "champu" in t or "shampoo" in t:
-        return "champu"
-    if (("jabon" in t) or ("gel" in t)) and "manos" in t:
-        return "gel_manos"
-    if "azucar" in t:
-        return "azucar"
-    if "infus" in t or re.search(r"\bte\b", t):
-        return "infusion"
-    if "insectic" in t or "mosquit" in t or "cucarach" in t or "hormig" in t:
-        return "insecticida"
-    if "deterg" in t or "lavadora" in t:
-        return "detergente"
-    if "vinagre" in t:
-        return "vinagre"
-    if "abrillantador" in t:
-        return "abrillantador"
-    if "sal" in t and "lavavaj" in t:
-        return "sal_lavavajillas"
-    if "sal" in t:
-        return "sal_mesa"
-    if "escoba" in t:
-        return "escoba"
-    if "fregona" in t or "mocho" in t or "mopa" in t:
-        return "fregona"
+    # Coffee capsules
+    for label, patterns in COFFEE_CAPSULE_RULES:
+        for p in patterns:
+            if re.search(p, t):
+                return label
+
+    # Amenities
+    for label, patterns in AMENITY_RULES:
+        for p in patterns:
+            if re.search(p, t):
+                # Evitar que "gel de manos" caiga en "gel de ducha"
+                if label == "Gel de ducha" and re.search(r"manos", t):
+                    continue
+                return label
 
     return None
 
 
-DISPLAY_BY_KEY = {
-    "cafe_tassimo": "Capsula Tassimo",
-    "cafe_dolcegusto": "Capsulas Dolce Gusto",
-    "cafe_nespresso": "Café en cápsula Colombia",
-    "cafe_molido": "Café Natural Molido",
-    "gel_ducha": "Gel ducha",
-    "champu": "Champu",
-    "gel_manos": "Gel de manos",
-    "azucar": "Azúcar",
-    "infusion": "Té/Infusión",
-    "insecticida": "Insecticida",
-    "detergente": "Detergente",
-    "vinagre": "Vinagre",
-    "abrillantador": "Abrillantador",
-    "sal_lavavajillas": "Sal lavavajillas",
-    "sal_mesa": "Sal de mesa",
-    "escoba": "Escoba",
-    "fregona": "Fregona",
-}
-
-
 def normalize_products(odoo_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Espera columnas: Ubicación/Ubicacion, Producto, Cantidad
+    Añade columna 'Amenity' clasificando por nombre de producto.
     """
     df = odoo_df.copy()
-    df.columns = [c.strip() for c in df.columns]
 
-    # Normaliza nombres típicos
-    for c in list(df.columns):
-        if _norm_txt(c) in ["ubicacion", "ubicación"]:
-            df = df.rename(columns={c: "Ubicación"})
-        if _norm_txt(c) in ["producto", "product"]:
-            df = df.rename(columns={c: "Producto"})
-        if _norm_txt(c) in ["cantidad", "quantity"]:
-            df = df.rename(columns={c: "Cantidad"})
+    if "Producto" not in df.columns:
+        raise ValueError(f"Odoo df debe tener columna 'Producto'. Columnas: {list(df.columns)}")
 
-    if "Producto" not in df.columns or "Cantidad" not in df.columns:
-        raise ValueError(f"Odoo: columnas requeridas Producto/Cantidad no detectadas. Columnas: {list(df.columns)}")
-
-    # Quita filas sin producto (totales tipo "AP29/Stock (15)")
-    df = df[df["Producto"].notna()].copy()
-
-    df["AmenityKey"] = df["Producto"].apply(amenity_key)
-    df["Amenity"] = df["AmenityKey"].map(DISPLAY_BY_KEY)
+    df["Amenity"] = df["Producto"].apply(classify_product)
     return df
 
 
-def _clean_thresholds(thresholds: pd.DataFrame) -> pd.DataFrame:
-    thr = thresholds.copy()
-    thr.columns = [c.strip() for c in thr.columns]
-
-    # Producto
-    prod_col = None
-    for c in thr.columns:
-        if _norm_txt(c) in ["producto", "product"]:
-            prod_col = c
-            break
-    if prod_col is None:
-        raise ValueError(f"Thresholds: no encuentro columna Producto. Columnas: {list(thr.columns)}")
-
-    # Min/Max
-    min_col = None
-    max_col = None
-    for c in thr.columns:
-        cn = _norm_txt(c)
-        if cn in ["minimo", "min", "minimum"]:
-            min_col = c
-        if cn in ["maximo", "max", "maximum"]:
-            max_col = c
-
-    if min_col is None or max_col is None:
-        raise ValueError(f"Thresholds: deben existir Minimo y Maximo. Columnas: {list(thr.columns)}")
-
-    thr = thr.rename(columns={prod_col: "Producto", min_col: "Minimo", max_col: "Maximo"})
-    thr["AmenityKey"] = thr["Producto"].apply(amenity_key)
-
-    thr["Minimo"] = pd.to_numeric(thr["Minimo"], errors="coerce").fillna(0)
-    thr["Maximo"] = pd.to_numeric(thr["Maximo"], errors="coerce").fillna(0)
-    thr["Amenity"] = thr["AmenityKey"].map(DISPLAY_BY_KEY)
-
-    return thr[["AmenityKey", "Amenity", "Minimo", "Maximo", "Producto"]].dropna(subset=["AmenityKey"])
-
-
-def summarize_replenishment(
-    stock_by_alm: pd.DataFrame,
-    thresholds: pd.DataFrame,
-    objective: str = "max",
-    urgent_only: bool = False,
-) -> pd.DataFrame:
+def _normalize_threshold_columns(thr: pd.DataFrame) -> pd.DataFrame:
     """
-    stock_by_alm: ALMACEN, AmenityKey, Cantidad
-    thresholds:   Producto, Minimo, Maximo (sin ALMACEN normalmente)
-    objective:
-      - "max": A_reponer = Maximo - Cantidad
-      - "min": A_reponer = Minimo - Cantidad
-    urgent_only:
-      - True: devuelve solo filas Bajo_minimo == True (pero A_reponer siempre se calcula según objective)
+    Acepta variantes típicas de columnas del maestro:
+    - Minimo / Mínimo
+    - Maximo / Máximo
     """
-    thr = _clean_thresholds(thresholds)
+    thr = thr.copy()
+
+    # Renombres por si vienen con tilde
+    rename_map = {}
+    if "Mínimo" in thr.columns and "Minimo" not in thr.columns:
+        rename_map["Mínimo"] = "Minimo"
+    if "Máximo" in thr.columns and "Maximo" not in thr.columns:
+        rename_map["Máximo"] = "Maximo"
+    if rename_map:
+        thr = thr.rename(columns=rename_map)
+
+    required = {"Amenity", "Minimo", "Maximo"}
+    missing = required - set(thr.columns)
+    if missing:
+        raise ValueError(f"Thresholds debe tener {required}. Faltan: {missing}. Columnas: {list(thr.columns)}")
+
+    # Normaliza tipos numéricos
+    thr["Minimo"] = pd.to_numeric(thr["Minimo"], errors="coerce")
+    thr["Maximo"] = pd.to_numeric(thr["Maximo"], errors="coerce")
+
+    return thr
+
+
+def summarize_replenishment(stock_by_alm: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula reposición por ALMACEN+Amenity usando min/max:
+
+    - Si Cantidad < Minimo => A_reponer = Maximo - Cantidad
+    - Si Cantidad >= Minimo => A_reponer = 0
+
+    Mejoras:
+    - Merge robusto por clave sin tildes: amenity_key
+    - Cantidades negativas de Odoo se recortan a 0 para el cálculo (operativa).
+    """
+    if stock_by_alm is None or stock_by_alm.empty:
+        return pd.DataFrame(columns=["ALMACEN", "Amenity", "Cantidad", "Minimo", "Maximo", "Faltante_min", "A_reponer"])
 
     out = stock_by_alm.copy()
-    out.columns = [c.strip() for c in out.columns]
 
-    # Normaliza nombres típicos
-    if "Ubicación" in out.columns and "ALMACEN" not in out.columns:
-        out = out.rename(columns={"Ubicación": "ALMACEN"})
-    if "Almacen" in out.columns and "ALMACEN" not in out.columns:
-        out = out.rename(columns={"Almacen": "ALMACEN"})
+    required_left = {"ALMACEN", "Amenity", "Cantidad"}
+    missing_left = required_left - set(out.columns)
+    if missing_left:
+        raise ValueError(f"stock_by_alm debe tener {required_left}. Faltan: {missing_left}. Columnas: {list(out.columns)}")
 
-    if "AmenityKey" not in out.columns:
-        raise ValueError(f"stock_by_alm debe traer AmenityKey. Columnas: {list(out.columns)}")
-    if "Cantidad" not in out.columns:
-        raise ValueError(f"stock_by_alm debe traer Cantidad. Columnas: {list(out.columns)}")
-    if "ALMACEN" not in out.columns:
-        raise ValueError(f"stock_by_alm debe traer ALMACEN. Columnas: {list(out.columns)}")
+    thr = _normalize_threshold_columns(thresholds)
 
+    # Claves normalizadas para merge (evita fallos por tildes/case)
+    out["amenity_key"] = out["Amenity"].apply(_norm_txt)
+    thr["amenity_key"] = thr["Amenity"].apply(_norm_txt)
+
+    # Merge por clave
+    out = out.merge(
+        thr[["amenity_key", "Minimo", "Maximo"]],
+        on="amenity_key",
+        how="left",
+    )
+
+    # Limpieza numérica
     out["Cantidad"] = pd.to_numeric(out["Cantidad"], errors="coerce").fillna(0)
 
-    # --- IMPORTANTE: completar grid ALMACEN x AmenityKey para detectar faltantes = 0 ---
-    almacenes = out["ALMACEN"].dropna().astype(str).str.strip().unique().tolist()
-    keys_thr = thr["AmenityKey"].dropna().unique().tolist()
+    # Operativa: si Odoo trae negativos, para reposición los tratamos como 0
+    out["Cantidad_calc"] = out["Cantidad"].clip(lower=0)
 
-    grid = pd.MultiIndex.from_product([almacenes, keys_thr], names=["ALMACEN", "AmenityKey"]).to_frame(index=False)
+    out["Minimo"] = pd.to_numeric(out["Minimo"], errors="coerce").fillna(0)
+    out["Maximo"] = pd.to_numeric(out["Maximo"], errors="coerce").fillna(0)
 
-    out = grid.merge(out[["ALMACEN", "AmenityKey", "Cantidad"]], on=["ALMACEN", "AmenityKey"], how="left")
-    out["Cantidad"] = out["Cantidad"].fillna(0)
+    # Regla: solo reponer si está por debajo del mínimo
+    out["Faltante_min"] = out["Cantidad_calc"] < out["Minimo"]
 
-    # Merge thresholds (no hay ALMACEN en tu master actual)
-    out = out.merge(thr[["AmenityKey", "Amenity", "Minimo", "Maximo"]].drop_duplicates(), on="AmenityKey", how="left")
+    out["A_reponer"] = 0.0
+    mask = out["Faltante_min"]
+    out.loc[mask, "A_reponer"] = (out.loc[mask, "Maximo"] - out.loc[mask, "Cantidad_calc"]).clip(lower=0)
 
-    out["Minimo"] = out["Minimo"].fillna(0)
-    out["Maximo"] = out["Maximo"].fillna(0)
-
-    out["Faltan_para_min"] = (out["Minimo"] - out["Cantidad"]).clip(lower=0)
-    out["Bajo_minimo"] = out["Faltan_para_min"] > 0
-
-    obj = (objective or "max").strip().lower()
-    if obj == "min":
-        out["A_reponer"] = (out["Minimo"] - out["Cantidad"]).clip(lower=0)
-    else:
-        out["A_reponer"] = (out["Maximo"] - out["Cantidad"]).clip(lower=0)
-
-    # Si pides "solo urgente", filtramos por bajo mínimo
-    if urgent_only:
-        out = out[out["Bajo_minimo"]].copy()
+    # Orden final (amenity_key no hace falta mostrarlo)
+    out = out.drop(columns=["amenity_key"], errors="ignore")
 
     return out
