@@ -103,42 +103,48 @@ def parse_lista_reponer(s: str):
             if name:
                 out.append((name, qty))
         else:
-            # si no viene xN, asumimos 1
             out.append((p, 1))
     return out
 
 
-def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str]):
+def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_completar: bool = False):
     """
     Devuelve:
-      items_df: Día, ZONA, APARTAMENTO, Producto, Cantidad
+      items_df: Día, ZONA, APARTAMENTO, Producto, Cantidad, Fuente
       totals_df: Producto, Total
+    Si include_completar=True, suma Lista_reponer + Completar con.
     """
     df = operativa.copy()
 
     # Solo estados “preparables”
     df = df[df["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA", "VACIO"])].copy()
 
-    # Solo con lista
-    df = df[df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
-
     # Zonas filtradas
     if zonas_sel:
         df = df[df["ZONA"].isin(zonas_sel)].copy()
 
+    cols = ["Lista_reponer"]
+    if include_completar and "Completar con" in df.columns:
+        cols.append("Completar con")
+
     rows = []
     for _, r in df.iterrows():
-        items = parse_lista_reponer(r.get("Lista_reponer", ""))
-        for prod, qty in items:
-            rows.append(
-                {
-                    "Día": r.get("Día"),
-                    "ZONA": r.get("ZONA"),
-                    "APARTAMENTO": r.get("APARTAMENTO"),
-                    "Producto": prod,
-                    "Cantidad": int(qty),
-                }
-            )
+        for col in cols:
+            txt = r.get(col, "")
+            if str(txt).strip() == "":
+                continue
+            items = parse_lista_reponer(txt)
+            for prod, qty in items:
+                rows.append(
+                    {
+                        "Día": r.get("Día"),
+                        "ZONA": r.get("ZONA"),
+                        "APARTAMENTO": r.get("APARTAMENTO"),
+                        "Producto": prod,
+                        "Cantidad": int(qty),
+                        "Fuente": col,
+                    }
+                )
 
     items_df = pd.DataFrame(rows)
     if items_df.empty:
@@ -153,7 +159,7 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str]):
         .reset_index(drop=True)
     )
 
-    items_df = items_df.sort_values(["ZONA", "APARTAMENTO", "Producto"]).reset_index(drop=True)
+    items_df = items_df.sort_values(["ZONA", "APARTAMENTO", "Producto", "Fuente"]).reset_index(drop=True)
     return items_df, totals_df
 
 
@@ -187,7 +193,7 @@ def main():
         )
 
     # =========================
-    # Sidebar (2 clics + avanzado)
+    # Sidebar
     # =========================
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
@@ -268,13 +274,11 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     ap_map = masters["apt_almacen"].copy()
-    # aseguramos columnas
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
         st.stop()
 
-    # coords si están
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
@@ -301,21 +305,33 @@ def main():
     )
 
     urgent_only = mode.startswith("URGENTE")
+
+    # 1) reposición completa (hasta máximo) -> para "Completar con"
+    rep_all = summarize_replenishment(
+        stock_by_alm,
+        masters["thresholds"],
+        objective="max",
+        urgent_only=False,
+    )
+
+    # 2) reposición usada en pantalla (si urgente_only, solo bajo mínimo)
     rep = summarize_replenishment(
         stock_by_alm,
         masters["thresholds"],
-        objective="max",     # siempre “hasta máximo”
-        urgent_only=urgent_only,  # filtra por bajo mínimo si el modo es urgente
+        objective="max",
+        urgent_only=urgent_only,
     )
 
     unclassified = odoo_norm[odoo_norm["AmenityKey"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # =========================
-    # Dashboard
+    # Dashboard  (IMPORTANTE: rep_all_df + urgent_only)
     # =========================
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
         replenishment_df=rep,
+        rep_all_df=rep_all,
+        urgent_only=urgent_only,
         unclassified_products=unclassified,
         period_start=period_start,
         period_days=period_days,
@@ -340,7 +356,7 @@ def main():
     )
 
     # =========================
-    # 1) PARTE OPERATIVO (primero)
+    # 1) PARTE OPERATIVO
     # =========================
     st.divider()
     st.subheader("PARTE OPERATIVO · Entradas / Salidas / Ocupación / Vacíos + Reposición")
@@ -348,19 +364,15 @@ def main():
 
     operativa = dash["operativa"].copy()
 
-    # filtros por ZONA
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
 
-    # filtros por estado
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
 
-    # filtro solo con reposición
     if only_replenishment and "Lista_reponer" in operativa.columns:
         operativa = operativa[operativa["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
-    # orden
     operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
 
     for dia, ddf in operativa.groupby("Día", dropna=False):
@@ -380,13 +392,17 @@ def main():
             )
 
     # =========================
-    # 2) SUGERENCIA DE REPOSICIÓN (resumen)
+    # 2) SUGERENCIA DE REPOSICIÓN
     # =========================
     st.divider()
     st.subheader("Sugerencia de Reposición")
-    st.caption("Resumen del periodo seleccionado: solo ENTRADA / ENTRADA+SALIDA / VACIO, con reposición. Totales + dónde dejar.")
 
-    items_df, totals_df = build_sugerencia_df(dash["operativa"], zonas_sel)
+    if urgent_only:
+        st.caption("Modo URGENTE: Totales + dónde dejar, incluyendo Lista_reponer (urgente) y Completar con (aprovechar viaje).")
+        items_df, totals_df = build_sugerencia_df(dash["operativa"], zonas_sel, include_completar=True)
+    else:
+        st.caption("Resumen del periodo: ENTRADA / ENTRADA+SALIDA / VACIO con reposición. Totales + dónde dejar.")
+        items_df, totals_df = build_sugerencia_df(dash["operativa"], zonas_sel, include_completar=False)
 
     if items_df.empty:
         st.info("No hay reposición sugerida para el periodo (con esos criterios) o faltan listas.")
@@ -402,22 +418,11 @@ def main():
             st.dataframe(
                 items_df,
                 use_container_width=True,
-                height=min(520, 40 + 28 * min(len(items_df), 20)),
+                height=min(520, 40 + 28 * min(len(items_df), 25)),
             )
 
-        # Extra útil: checklist por zona
-        with st.expander("✅ Checklist por ZONA (lista rápida)", expanded=False):
-            for zona, zdf in items_df.groupby("ZONA", dropna=False):
-                zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
-                st.markdown(f"### {zona_label}")
-                # por apartamento
-                for apt, adf in zdf.groupby("APARTAMENTO"):
-                    lines = [f"- {row['Producto']} x{int(row['Cantidad'])}" for _, row in adf.iterrows()]
-                    st.markdown(f"**{apt}**")
-                    st.markdown("\n".join(lines))
-
     # =========================
-    # 3) RUTAS GOOGLE MAPS (ABAJO DEL TODO)
+    # 3) RUTAS GOOGLE MAPS (ABAJO)
     # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
@@ -432,6 +437,8 @@ def main():
     route_df = dash["operativa"].copy()
     route_df = route_df[route_df["Día"].isin([today, tomorrow])].copy()
     route_df = route_df[route_df["Estado"].isin(visitable_states)].copy()
+
+    # en urgente, si quieres rutear solo urgentes -> Lista_reponer; si quieres incluir completar, cambia aquí
     route_df = route_df[route_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
     if zonas_sel:
