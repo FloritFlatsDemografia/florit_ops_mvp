@@ -13,7 +13,6 @@ COFFEE_KEYS = {"cafe_tassimo", "cafe_nespresso", "cafe_molido", "cafe_dolcegusto
 
 
 def _safe_dt(s):
-    # Robust: primero intento normal (ISO), si salen muchos NaT pruebo dayfirst (dd/mm).
     dt = pd.to_datetime(s, errors="coerce")
     try:
         if hasattr(dt, "isna") and dt.isna().mean() > 0.5:
@@ -48,32 +47,35 @@ def _find_client_col(df: pd.DataFrame) -> str | None:
     cols = list(df.columns)
     norm = {c: str(c).strip().lower() for c in cols}
 
-    # exactos
     for target in ["cliente", "huesped", "huésped", "ocupante", "guest", "nombre"]:
         for c, n in norm.items():
             if n == target:
                 return c
 
-    # contiene
     for c, n in norm.items():
         if "cliente" in n:
             return c
     for c, n in norm.items():
         if "ocup" in n or "huesp" in n or "guest" in n:
             return c
-
     return None
 
 
-def _build_replenishment_list_per_apt(apt_df: pd.DataFrame, rep_df: pd.DataFrame) -> pd.DataFrame:
+def _build_list_per_apt(apt_df: pd.DataFrame, rep_df: pd.DataFrame, col_name: str) -> pd.DataFrame:
+    """
+    apt_df: APARTAMENTO, ALMACEN, CAFE_TIPO
+    rep_df:  ALMACEN, AmenityKey, Amenity, A_reponer
+    Devuelve apt_df + col_name (texto "Amenity xN, ...")
+    """
     out = apt_df.copy()
-    out["Lista_reponer"] = ""
+    out[col_name] = ""
 
     if rep_df is None or rep_df.empty:
         return out
 
     rep = rep_df.copy()
-    if "ALMACEN" not in rep.columns or "AmenityKey" not in rep.columns or "A_reponer" not in rep.columns:
+    need_cols = {"ALMACEN", "AmenityKey", "A_reponer"}
+    if not need_cols.issubset(set(rep.columns)):
         return out
 
     rep["A_reponer"] = pd.to_numeric(rep["A_reponer"], errors="coerce").fillna(0)
@@ -109,20 +111,63 @@ def _build_replenishment_list_per_apt(apt_df: pd.DataFrame, rep_df: pd.DataFrame
         tmp.groupby("APARTAMENTO")["item"]
         .agg(lambda s: ", ".join([x for x in s.tolist() if isinstance(x, str) and x.strip()])[:60])
         .reset_index()
-        .rename(columns={"item": "Lista_reponer"})
+        .rename(columns={"item": col_name})
     )
 
-    out = out.drop(columns=["Lista_reponer"], errors="ignore").merge(agg, on="APARTAMENTO", how="left")
-    out["Lista_reponer"] = out["Lista_reponer"].fillna("").astype(str)
+    out = out.drop(columns=[col_name], errors="ignore").merge(agg, on="APARTAMENTO", how="left")
+    out[col_name] = out[col_name].fillna("").astype(str)
     return out
+
+
+def _diff_rep(rep_all: pd.DataFrame, rep_urgent: pd.DataFrame) -> pd.DataFrame:
+    """
+    rep_all:   ALMACEN, AmenityKey, A_reponer, Amenity
+    rep_urgent: idem (solo urgentes)
+    Devuelve el "resto" para completar: A_reponer_all - A_reponer_urgent (>=0)
+    """
+    if rep_all is None or rep_all.empty:
+        return pd.DataFrame(columns=["ALMACEN", "AmenityKey", "Amenity", "A_reponer"])
+    a = rep_all.copy()
+    u = rep_urgent.copy() if rep_urgent is not None else pd.DataFrame(columns=a.columns)
+
+    for df in (a, u):
+        if "A_reponer" in df.columns:
+            df["A_reponer"] = pd.to_numeric(df["A_reponer"], errors="coerce").fillna(0)
+        if "ALMACEN" in df.columns:
+            df["ALMACEN"] = df["ALMACEN"].astype(str).str.strip()
+        if "AmenityKey" in df.columns:
+            df["AmenityKey"] = df["AmenityKey"].astype(str).str.strip()
+
+    a = a.dropna(subset=["ALMACEN", "AmenityKey"]).copy()
+    u = u.dropna(subset=["ALMACEN", "AmenityKey"]).copy()
+
+    u = u[["ALMACEN", "AmenityKey", "A_reponer"]].groupby(["ALMACEN", "AmenityKey"], as_index=False)["A_reponer"].sum()
+    a = a[["ALMACEN", "AmenityKey", "A_reponer"]].groupby(["ALMACEN", "AmenityKey"], as_index=False)["A_reponer"].sum()
+
+    m = a.merge(u, on=["ALMACEN", "AmenityKey"], how="left", suffixes=("_all", "_urg"))
+    m["A_reponer_urg"] = m["A_reponer_urg"].fillna(0)
+    m["A_reponer"] = (m["A_reponer_all"] - m["A_reponer_urg"]).clip(lower=0)
+
+    m = m[m["A_reponer"] > 0].copy()
+
+    # recuperar display Amenity desde rep_all original si existe
+    if rep_all is not None and "Amenity" in rep_all.columns:
+        disp = rep_all[["ALMACEN", "AmenityKey", "Amenity"]].drop_duplicates()
+        m = m.merge(disp, on=["ALMACEN", "AmenityKey"], how="left")
+    else:
+        m["Amenity"] = m["AmenityKey"]
+
+    return m[["ALMACEN", "AmenityKey", "Amenity", "A_reponer"]]
 
 
 def build_dashboard_frames(
     avantio_df: pd.DataFrame,
-    replenishment_df: pd.DataFrame,
+    replenishment_df: pd.DataFrame,          # lo que estás usando como "rep" (puede ser urgente)
     unclassified_products: pd.DataFrame | None = None,
     period_start=None,
     period_days: int = 2,
+    rep_all_df: pd.DataFrame | None = None,  # NUEVO: reposición completa (hasta máximo)
+    urgent_only: bool = False,               # NUEVO: si está activo, generamos "Completar con"
 ) -> dict:
     df = avantio_df.copy()
 
@@ -164,7 +209,14 @@ def build_dashboard_frames(
     base["CAFE_TIPO"] = base["CAFE_TIPO"].astype(str).str.strip()
     base["ALMACEN"] = base["ALMACEN"].astype(str).str.strip()
 
-    base = _build_replenishment_list_per_apt(base, replenishment_df)
+    # --- Lista_reponer (según rep actual) ---
+    base = _build_list_per_apt(base, replenishment_df, "Lista_reponer")
+
+    # --- Completar con (solo si urgente_only) ---
+    base["Completar con"] = ""
+    if urgent_only and rep_all_df is not None and not rep_all_df.empty:
+        rep_rest = _diff_rep(rep_all_df, replenishment_df)
+        base = _build_list_per_apt(base, rep_rest, "Completar con")
 
     oper_rows = []
 
@@ -223,7 +275,7 @@ def build_dashboard_frames(
         future_in = future_in[["APARTAMENTO", "Próxima Entrada"]]
         day_table = day_table.merge(future_in, on="APARTAMENTO", how="left")
 
-        # Output limpio (sin in_dt/out_dt/ocupa/horas)
+        # Output limpio
         keep_cols = [
             "Día",
             "ZONA",
@@ -232,6 +284,7 @@ def build_dashboard_frames(
             "Estado",
             "CAFE_TIPO",
             "Lista_reponer",
+            "Completar con",
             "Próxima Entrada",
             "__prio",
         ]
@@ -258,7 +311,9 @@ def build_dashboard_frames(
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         operativa.to_excel(writer, sheet_name="Operativa", index=False)
         if replenishment_df is not None and not replenishment_df.empty:
-            replenishment_df.to_excel(writer, sheet_name="Reposicion_por_almacen", index=False)
+            replenishment_df.to_excel(writer, sheet_name="Reposicion_usada", index=False)
+        if rep_all_df is not None and not rep_all_df.empty:
+            rep_all_df.to_excel(writer, sheet_name="Reposicion_completa", index=False)
         if unclassified_products is not None and not unclassified_products.empty:
             unclassified_products.to_excel(writer, sheet_name="Sin_clasificar", index=False)
         for sh in writer.sheets.values():
