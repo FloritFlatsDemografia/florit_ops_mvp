@@ -4,3 +4,5 @@ openpyxl
 lxml
 xlsxwriter
 python-dateutil
+gspread
+google-auth
