@@ -1,7 +1,5 @@
-# src/dashboard.py
 import pandas as pd
 from io import BytesIO
-
 
 STATE_PRIORITY = {
     "ENTRADA+SALIDA": 0,
@@ -164,13 +162,13 @@ def _diff_rep(rep_all: pd.DataFrame, rep_urgent: pd.DataFrame) -> pd.DataFrame:
 
 def build_dashboard_frames(
     avantio_df: pd.DataFrame,
-    base_apts: pd.DataFrame,                # NUEVO: base desde masters
-    replenishment_df: pd.DataFrame,         # rep usada (puede ser urgente)
+    replenishment_df: pd.DataFrame,           # lo que usas como "rep" (puede ser urgente)
     unclassified_products: pd.DataFrame | None = None,
     period_start=None,
     period_days: int = 2,
-    rep_all_df: pd.DataFrame | None = None, # reposición completa (hasta máximo)
-    urgent_only: bool = False,              # si activo, generamos "Completar con"
+    rep_all_df: pd.DataFrame | None = None,   # reposición completa (hasta máximo)
+    urgent_only: bool = False,                # si está activo, generamos "Completar con"
+    base_apts: pd.DataFrame | None = None,    # NUEVO: base de apartamentos (masters)
 ) -> dict:
     df = avantio_df.copy()
 
@@ -200,27 +198,31 @@ def build_dashboard_frames(
     date_list = [start + pd.Timedelta(days=i) for i in range(days)]
     end = (start + pd.Timedelta(days=days - 1)).normalize()
 
-    # =========================
-    # BASE APARTMENTS (desde masters)
-    # =========================
-    base = base_apts.copy()
+    # Base apartments
     base_cols = ["APARTAMENTO", "ZONA", "CAFE_TIPO", "ALMACEN"]
-
     for c in base_cols:
-        if c not in base.columns:
-            base[c] = ""
+        if c not in df.columns:
+            df[c] = ""
+
+    # Base desde masters si viene; si no, desde reservas
+    if base_apts is not None and isinstance(base_apts, pd.DataFrame) and not base_apts.empty:
+        base = base_apts.copy()
+        for c in base_cols:
+            if c not in base.columns:
+                base[c] = ""
+        base = base[base_cols].dropna(subset=["APARTAMENTO"]).drop_duplicates().copy()
+    else:
+        base = df[base_cols].dropna(subset=["APARTAMENTO"]).drop_duplicates().copy()
 
     base["APARTAMENTO"] = base["APARTAMENTO"].astype(str).str.strip()
     base["ZONA"] = base["ZONA"].astype(str).str.strip()
     base["CAFE_TIPO"] = base["CAFE_TIPO"].astype(str).str.strip()
     base["ALMACEN"] = base["ALMACEN"].astype(str).str.strip()
 
-    base = base.dropna(subset=["APARTAMENTO"]).drop_duplicates("APARTAMENTO").copy()
-
     # --- Lista_reponer (según rep actual) ---
     base = _build_list_per_apt(base, replenishment_df, "Lista_reponer")
 
-    # --- Completar con (solo si urgent_only) ---
+    # --- Completar con (solo si urgente_only) ---
     base["Completar con"] = ""
     if urgent_only and rep_all_df is not None and not rep_all_df.empty:
         rep_rest = _diff_rep(rep_all_df, replenishment_df)
@@ -232,15 +234,17 @@ def build_dashboard_frames(
         day_start = d
         day_end = d + pd.Timedelta(days=1)
 
-        # reservas que ocupan el día (cruce por rango)
+        # Reservas activas en ese día
         day_res = df[(df["in_dt"] < day_end) & (df["out_dt"] > day_start)].copy()
 
+        # Entradas y salidas “en el día”
         in_today = df[df["in_dt"].dt.normalize() == day_start][["APARTAMENTO", "in_dt", "CLIENTE"]].copy()
         out_today = df[df["out_dt"].dt.normalize() == day_start][["APARTAMENTO", "out_dt", "CLIENTE"]].copy()
 
         in_today = in_today.sort_values("in_dt").drop_duplicates("APARTAMENTO")
         out_today = out_today.sort_values("out_dt").drop_duplicates("APARTAMENTO")
 
+        # Ocupación
         occ = day_res[["APARTAMENTO"]].drop_duplicates()
         occ["OCUPA"] = True
 
@@ -252,6 +256,19 @@ def build_dashboard_frames(
 
         day_table = day_table.merge(in_today.rename(columns={"CLIENTE": "CLIENTE_IN"}), on="APARTAMENTO", how="left")
         day_table = day_table.merge(out_today.rename(columns={"CLIENTE": "CLIENTE_OUT"}), on="APARTAMENTO", how="left")
+
+        # NUEVO: cliente durante ocupación (reserva activa ese día)
+        # Si hay varias, nos quedamos con la que tenga in_dt más reciente (la “activa” más actual)
+        occ_client = pd.DataFrame(columns=["APARTAMENTO", "CLIENTE_OCUPA"])
+        if not day_res.empty:
+            tmp = day_res[["APARTAMENTO", "in_dt", "CLIENTE"]].copy()
+            tmp["CLIENTE"] = tmp["CLIENTE"].astype(str).str.strip()
+            tmp = tmp[tmp["CLIENTE"].str.strip().ne("")].copy()
+            if not tmp.empty:
+                tmp = tmp.sort_values(["APARTAMENTO", "in_dt"], ascending=[True, False]).drop_duplicates("APARTAMENTO")
+                occ_client = tmp[["APARTAMENTO", "CLIENTE"]].rename(columns={"CLIENTE": "CLIENTE_OCUPA"})
+
+        day_table = day_table.merge(occ_client, on="APARTAMENTO", how="left")
 
         def compute_state(r):
             has_in = pd.notna(r.get("in_dt"))
@@ -269,15 +286,22 @@ def build_dashboard_frames(
         day_table["Estado"] = day_table.apply(compute_state, axis=1)
         day_table["__prio"] = day_table["Estado"].map(lambda x: STATE_PRIORITY.get(x, 99))
 
+        # NUEVO orden de preferencia:
+        # 1) si entra hoy -> cliente entrada
+        # 2) si sale hoy -> cliente salida
+        # 3) si está ocupado -> cliente de reserva activa
         def pick_cliente(r):
             if pd.notna(r.get("CLIENTE_IN")) and str(r.get("CLIENTE_IN")).strip():
                 return str(r.get("CLIENTE_IN")).strip()
             if pd.notna(r.get("CLIENTE_OUT")) and str(r.get("CLIENTE_OUT")).strip():
                 return str(r.get("CLIENTE_OUT")).strip()
+            if pd.notna(r.get("CLIENTE_OCUPA")) and str(r.get("CLIENTE_OCUPA")).strip():
+                return str(r.get("CLIENTE_OCUPA")).strip()
             return ""
 
         day_table["Cliente"] = day_table.apply(pick_cliente, axis=1)
 
+        # Próxima entrada
         future_in = df[df["in_dt"] > day_end][["APARTAMENTO", "in_dt"]].copy()
         future_in = future_in.sort_values("in_dt").drop_duplicates("APARTAMENTO")
         future_in["Próxima Entrada"] = future_in["in_dt"].dt.date
