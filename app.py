@@ -5,7 +5,7 @@ from urllib.parse import quote
 import re
 
 # ✅ NUEVO: último informe por apartamento (LLAVES / OTRAS / INCIDENCIAS)
-from src.parsers.cleaning_last_report import build_last_report_view
+from src.cleaning_last_report import build_last_report_view
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
