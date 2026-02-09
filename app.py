@@ -2,7 +2,7 @@
 # - Base_apts desde masters (para que salgan todos)
 # - Sin opción "Mostrar SOLO apartamentos con reposición"
 # - KPI Check-ins presenciales (Apolo 29/180/197 + Serranos)
-# - Opción 7: Buscador + Ficha de apartamento (con Maps)
+# - Opción 7: Buscador + Ficha de apartamento (en blanco por defecto; solo muestra si eliges)
 import streamlit as st
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -365,21 +365,8 @@ def main():
 
     urgent_only = mode.startswith("URGENTE")
 
-    # 1) reposición completa (hasta máximo) -> para "Completar con"
-    rep_all = summarize_replenishment(
-        stock_by_alm,
-        masters["thresholds"],
-        objective="max",
-        urgent_only=False,
-    )
-
-    # 2) reposición usada en pantalla (si urgent_only, solo bajo mínimo)
-    rep = summarize_replenishment(
-        stock_by_alm,
-        masters["thresholds"],
-        objective="max",
-        urgent_only=urgent_only,
-    )
+    rep_all = summarize_replenishment(stock_by_alm, masters["thresholds"], objective="max", urgent_only=False)
+    rep = summarize_replenishment(stock_by_alm, masters["thresholds"], objective="max", urgent_only=urgent_only)
 
     unclassified = odoo_norm[odoo_norm["AmenityKey"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
@@ -452,14 +439,12 @@ def main():
                 )
 
     # =========================
-    # 7) Buscador + Ficha de apartamento
+    # 7) Buscador + Ficha de apartamento (EN BLANCO POR DEFECTO)
     # =========================
     st.divider()
     st.subheader("🔎 Buscador · Ficha de apartamento")
 
     operativa_all = dash["operativa"].copy()
-
-    # Lista de apartamentos disponibles
     apt_list = sorted([a for a in operativa_all["APARTAMENTO"].dropna().astype(str).str.strip().unique().tolist() if a])
 
     q = st.text_input("Buscar apartamento", value="", placeholder="Ej: Apolo 197, Serreria 04, Serranos...").strip()
@@ -470,24 +455,22 @@ def main():
     else:
         apt_filtered = apt_list
 
+    # Placeholder: en blanco por defecto
+    options = ["— Selecciona un apartamento —"] + (apt_filtered if apt_filtered else apt_list)
+
     colS1, colS2 = st.columns([2, 1])
     with colS1:
-        apt_sel = st.selectbox(
-            "Selecciona apartamento",
-            options=apt_filtered if apt_filtered else apt_list,
-            index=0 if (apt_filtered or apt_list) else 0,
-        )
+        apt_sel = st.selectbox("Selecciona apartamento", options=options, index=0)
 
     with colS2:
         days_to_show = st.number_input("Días a mostrar (dentro del periodo)", min_value=1, max_value=14, value=2, step=1)
 
-    if not apt_sel:
-        st.info("No hay apartamentos disponibles para mostrar.")
+    if apt_sel == "— Selecciona un apartamento —":
+        st.info("Selecciona un apartamento para ver su ficha.")
     else:
         apt_df = operativa_all[operativa_all["APARTAMENTO"].astype(str).str.strip() == str(apt_sel).strip()].copy()
         apt_df = apt_df.sort_values("Día").reset_index(drop=True)
 
-        foco = dash["period_start"]
         today_row = apt_df[apt_df["Día"] == foco].head(1)
 
         foco_ts = pd.Timestamp(foco)
@@ -510,18 +493,18 @@ def main():
             estado_hoy = str(r.get("Estado", "") or "")
             cliente_hoy = str(r.get("Cliente", "") or "")
             prox_ent = r.get("Próxima Entrada", "")
-            cafe = str(r.get("CAFE_TIPO", "") or "")
+            cafe_tipo = str(r.get("CAFE_TIPO", "") or "")
             lista = str(r.get("Lista_reponer", "") or "")
             completar = str(r.get("Completar con", "") or "")
             zona = str(r.get("ZONA", "") or "")
         else:
-            estado_hoy, cliente_hoy, prox_ent, cafe, lista, completar, zona = "", "", "", "", "", "", ""
+            estado_hoy, cliente_hoy, prox_ent, cafe_tipo, lista, completar, zona = "", "", "", "", "", "", ""
 
         cA1, cB1, cC1, cD1 = st.columns([1, 2, 1, 1])
         cA1.metric("Estado HOY", estado_hoy if estado_hoy else "-")
         cB1.metric("Cliente HOY", cliente_hoy if cliente_hoy else "-")
         cC1.metric("Zona", zona if zona else "-")
-        cD1.metric("Café", cafe if cafe else "-")
+        cD1.metric("Café", cafe_tipo if cafe_tipo else "-")
 
         colL, colR = st.columns([3, 2])
         with colL:
@@ -646,8 +629,6 @@ def main():
     route_df = dash["operativa"].copy()
     route_df = route_df[route_df["Día"].isin([today, tomorrow])].copy()
     route_df = route_df[route_df["Estado"].isin(visitable_states)].copy()
-
-    # Para rutas: SOLO con Lista_reponer
     route_df = route_df[route_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
     if zonas_sel:
