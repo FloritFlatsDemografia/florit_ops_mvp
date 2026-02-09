@@ -1,28 +1,35 @@
 from __future__ import annotations
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
+
+@st.cache_data(ttl=60, show_spinner=False)
 def read_sheet_df() -> pd.DataFrame:
     """
-    Lee un Google Sheet con gspread usando credenciales en st.secrets.
+    Lee un Google Sheet (worksheet) usando credenciales de Service Account en st.secrets.
 
-    Secrets requeridos:
+    Requiere en Secrets:
       gsheet_url = "https://docs.google.com/spreadsheets/d/....../edit"
       gsheet_tab = "Respuestas de formulario 1"
-      [gcp_service_account] ... (service account JSON en TOML)
+
+      [gcp_service_account]
+      type="service_account"
+      ...
     """
     try:
         import gspread
         from google.oauth2.service_account import Credentials
     except Exception as e:
-        raise RuntimeError("Faltan dependencias: instala gspread y google-auth en requirements.txt") from e
+        raise RuntimeError(
+            "Faltan dependencias. Añade a requirements.txt: gspread y google-auth"
+        ) from e
 
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("No existe [gcp_service_account] en Secrets de Streamlit.")
 
-    gsheet_url = st.secrets.get("gsheet_url", "")
-    gsheet_tab = st.secrets.get("gsheet_tab", "")
+    gsheet_url = str(st.secrets.get("gsheet_url", "")).strip()
+    gsheet_tab = str(st.secrets.get("gsheet_tab", "")).strip()
 
     if not gsheet_url:
         raise RuntimeError("Falta gsheet_url en Secrets.")
