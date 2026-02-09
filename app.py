@@ -459,7 +459,7 @@ dash_ficha = build_dashboard_frames(
     st.divider()
     st.subheader("🔎 Buscador · Ficha de apartamento")
 
-    operativa_all = dash["operativa"].copy()
+    operativa_all = dash_ficha["operativa"].copy()
     apt_list = sorted([a for a in operativa_all["APARTAMENTO"].dropna().astype(str).str.strip().unique().tolist() if a])
 
     q = st.text_input("Buscar apartamento", value="", placeholder="Ej: Apolo 197, Serreria 04, Serranos...").strip()
