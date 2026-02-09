@@ -411,6 +411,7 @@ def main():
             with st.expander("Ver detalle (hoy)", expanded=False):
                 st.dataframe(ops_today, use_container_width=True)
 
+        
             # =========================================================
             # ✅ NUEVO BLOQUE: ÚLTIMO INFORME POR APARTAMENTO
             #    (LLAVES + OTRAS REPOSICIONES + INCIDENCIAS/TAREAS)
