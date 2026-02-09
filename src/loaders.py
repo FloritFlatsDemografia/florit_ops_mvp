@@ -9,10 +9,33 @@ DATA_DIR = "data"
 
 FILES = {
     "zonas": "Agrupacion apartamentos por zona.xlsx",
-    "apt_almacen": "Apartamentos e inventarios.xlsx",
+    "apt_almacen": "Apartamentos e Inventarios.xlsx",  # <- nombre “oficial” (pero lo buscamos case-insensitive)
     "cafe": "Cafe por apartamento.xlsx",
     "thresholds": "Stock minimo por almacen.xlsx",
 }
+
+
+def _resolve_path(filename: str) -> str:
+    """
+    Devuelve la ruta real dentro de data/:
+    - primero intenta match exacto
+    - si no existe, busca ignorando mayúsculas/minúsculas
+    """
+    p = os.path.join(DATA_DIR, filename)
+    if os.path.exists(p):
+        return p
+
+    # fallback: búsqueda case-insensitive
+    try:
+        wanted = filename.lower()
+        for f in os.listdir(DATA_DIR):
+            if f.lower() == wanted:
+                return os.path.join(DATA_DIR, f)
+    except Exception:
+        pass
+
+    # si no hay match, devuelve el path original para que el error sea explícito
+    return p
 
 
 def _read_excel(path: str) -> pd.DataFrame:
@@ -34,9 +57,6 @@ def _safe_str(x) -> str:
     return s
 
 
-# =========================
-# Detectores flexibles
-# =========================
 def _find_col_by_keywords(df: pd.DataFrame, keywords: list[str]) -> str | None:
     if df is None or df.empty:
         return None
@@ -78,22 +98,18 @@ def _ensure_apt_almacen(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = _clean_cols(df)
 
-    # Detecta APARTAMENTO
     apt_col = _find_col_by_keywords(df, ["apart", "aloj", "prop", "vivi", "nombre"])
     if apt_col is None:
         apt_col = df.columns[0]
 
-    # Detecta ALMACEN/UBICACION
     alm_col = _find_col_by_keywords(df, ["almac", "ubic", "location"])
     if alm_col is None and len(df.columns) >= 2:
         alm_col = df.columns[1]
 
-    # Detecta LAT/LNG si existen
     lat_col = _find_col_by_keywords(df, ["lat"])
     lng_col = _find_col_by_keywords(df, ["lng", "lon", "long"])
 
-    # Detecta columna coordenadas por nombre, o usa columna C
-    coord_col = _find_col_by_keywords(df, ["coord", "coorden"])
+    coord_col = _find_col_by_keywords(df, ["coord", "coorden", "localiz"])
     if coord_col is None and len(df.columns) >= 3:
         coord_col = df.columns[2]  # columna C
 
@@ -125,12 +141,6 @@ def _ensure_apt_almacen(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _ensure_zonas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Devuelve df con columnas: APARTAMENTO, ZONA
-    Ultra-flexible:
-    - intenta detectar por nombre
-    - fallback: col0=APARTAMENTO, col1=ZONA
-    """
     df = _clean_cols(df)
 
     apt_col = _find_col_by_keywords(df, ["apart", "aloj", "prop", "vivi", "nombre"])
@@ -147,7 +157,6 @@ def _ensure_zonas(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.dropna(subset=["APARTAMENTO"]).copy()
     out = out[out["APARTAMENTO"].astype(str).str.strip().ne("")].copy()
-
     return out[["APARTAMENTO", "ZONA"]].drop_duplicates()
 
 
@@ -168,39 +177,30 @@ def _ensure_cafe(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.dropna(subset=["APARTAMENTO"]).copy()
     out = out[out["APARTAMENTO"].astype(str).str.strip().ne("")].copy()
-
     return out[["APARTAMENTO", "CAFE_TIPO"]].drop_duplicates()
 
 
 @st.cache_data(show_spinner=False)
 def load_masters_repo() -> dict:
-    """
-    Carga maestros desde data/ dentro del repo.
-    Devuelve dict con keys:
-      - zonas (APARTAMENTO, ZONA)
-      - apt_almacen (APARTAMENTO, ALMACEN, LAT, LNG)
-      - cafe (APARTAMENTO, CAFE_TIPO)
-      - thresholds (tal cual)
-    """
     masters = {}
 
     # ZONAS
-    p = os.path.join(DATA_DIR, FILES["zonas"])
+    p = _resolve_path(FILES["zonas"])
     zonas_raw = _read_excel(p)
     masters["zonas"] = _ensure_zonas(zonas_raw)
 
     # APARTAMENTOS + INVENTARIOS (ALMACEN + COORDS)
-    p = os.path.join(DATA_DIR, FILES["apt_almacen"])
+    p = _resolve_path(FILES["apt_almacen"])
     apt_raw = _read_excel(p)
     masters["apt_almacen"] = _ensure_apt_almacen(apt_raw)
 
     # CAFE
-    p = os.path.join(DATA_DIR, FILES["cafe"])
+    p = _resolve_path(FILES["cafe"])
     cafe_raw = _read_excel(p)
     masters["cafe"] = _ensure_cafe(cafe_raw)
 
     # THRESHOLDS
-    p = os.path.join(DATA_DIR, FILES["thresholds"])
+    p = _resolve_path(FILES["thresholds"])
     thr = _read_excel(p)
     masters["thresholds"] = _clean_cols(thr)
 
