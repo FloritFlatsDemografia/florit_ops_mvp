@@ -1,4 +1,4 @@
-# app.py (COMPLETO) — sin opción “Mostrar SOLO apartamentos con reposición”
+# app.py (COMPLETO) — incluye: base_apts desde masters + SIN filtro "solo reposición" + KPI check-ins presenciales
 import streamlit as st
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -164,6 +164,30 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
     return items_df, totals_df
 
 
+# =========================
+# Normalización aptos (para check-ins presenciales)
+# =========================
+def _norm_apt_name(x: str) -> str:
+    """
+    Normaliza nombres para casar:
+    - mayúsculas
+    - espacios
+    - APOLO 029 == APOLO 29
+    """
+    s = "" if x is None else str(x)
+    s = s.strip().upper()
+    s = re.sub(r"\s+", " ", s)
+
+    m = re.match(r"^(APOLO)\s+0*([0-9]+)$", s)
+    if m:
+        return f"{m.group(1)} {int(m.group(2))}"
+    return s
+
+
+PRESENTIAL_APTS_RAW = {"Apolo 029", "Apolo 197", "Apolo 180", "Serranos"}
+PRESENTIAL_APTS = {_norm_apt_name(a) for a in PRESENTIAL_APTS_RAW}
+
+
 def main():
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
@@ -273,7 +297,7 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     # apt_almacen (ALMACEN + coords)
-    ap_map = masters["apt_almacen"].copy()
+    ap_map = masters["apt_almacen"].s
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
@@ -335,7 +359,7 @@ def main():
         urgent_only=False,
     )
 
-    # 2) reposición usada en pantalla (si urgente_only, solo bajo mínimo)
+    # 2) reposición usada en pantalla (si urgent_only, solo bajo mínimo)
     rep = summarize_replenishment(
         stock_by_alm,
         masters["thresholds"],
@@ -370,6 +394,50 @@ def main():
     c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
     c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
+    # =========================
+    # Check-ins presenciales (KPI + detalle)
+    # =========================
+    foco = dash["period_start"]  # date
+    op_foco = dash["operativa"].copy()
+    op_foco = op_foco[op_foco["Día"] == foco].copy()
+
+    op_foco["_APT_NORM"] = op_foco["APARTAMENTO"].map(_norm_apt_name)
+
+    mask_presential = op_foco["_APT_NORM"].isin(PRESENTIAL_APTS) & op_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])
+    presential_df = op_foco[mask_presential].copy()
+
+    st.divider()
+    cA, cB = st.columns([1, 3])
+    with cA:
+        st.metric("Check-ins presenciales (día foco)", int(len(presential_df)))
+
+    with cB:
+        if "show_presential" not in st.session_state:
+            st.session_state["show_presential"] = False
+
+        col_btn, col_hint = st.columns([1, 4])
+        with col_btn:
+            if st.button("Ver check-ins presenciales"):
+                st.session_state["show_presential"] = not st.session_state["show_presential"]
+        with col_hint:
+            st.caption("Criterio: Estado = ENTRADA / ENTRADA+SALIDA y aptos: Apolo 29, Apolo 180, Apolo 197, Serranos.")
+
+        if st.session_state["show_presential"]:
+            if presential_df.empty:
+                st.info("No hay check-ins presenciales en el día foco con esos apartamentos.")
+            else:
+                show_cols = ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"]
+                for c in show_cols:
+                    if c not in presential_df.columns:
+                        presential_df[c] = ""
+                presential_df = presential_df[show_cols].copy()
+
+                st.dataframe(
+                    presential_df.sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True),
+                    use_container_width=True,
+                    height=min(420, 40 + 35 * len(presential_df)),
+                )
+
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
@@ -394,7 +462,10 @@ def main():
 
     # Ordena para que los que tienen reposición vayan arriba, sin ocultar el resto
     operativa["__has_rep"] = operativa["Lista_reponer"].astype(str).str.strip().ne("")
-    operativa = operativa.sort_values(["Día", "ZONA", "__has_rep", "__prio", "APARTAMENTO"], ascending=[True, True, False, True, True])
+    operativa = operativa.sort_values(
+        ["Día", "ZONA", "__has_rep", "__prio", "APARTAMENTO"],
+        ascending=[True, True, False, True, True],
+    )
 
     for dia, ddf in operativa.groupby("Día", dropna=False):
         st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
@@ -459,7 +530,7 @@ def main():
     route_df = route_df[route_df["Día"].isin([today, tomorrow])].copy()
     route_df = route_df[route_df["Estado"].isin(visitable_states)].copy()
 
-    # Para rutas, mantenemos criterio: SOLO con Lista_reponer (si quieres rutear también "Completar con", te lo ajusto)
+    # Para rutas: SOLO con Lista_reponer
     route_df = route_df[route_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
     if zonas_sel:
