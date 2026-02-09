@@ -1,5 +1,7 @@
+# src/dashboard.py
 import pandas as pd
 from io import BytesIO
+
 
 STATE_PRIORITY = {
     "ENTRADA+SALIDA": 0,
@@ -162,12 +164,13 @@ def _diff_rep(rep_all: pd.DataFrame, rep_urgent: pd.DataFrame) -> pd.DataFrame:
 
 def build_dashboard_frames(
     avantio_df: pd.DataFrame,
-    replenishment_df: pd.DataFrame,          # lo que estás usando como "rep" (puede ser urgente)
+    base_apts: pd.DataFrame,                # NUEVO: base desde masters
+    replenishment_df: pd.DataFrame,         # rep usada (puede ser urgente)
     unclassified_products: pd.DataFrame | None = None,
     period_start=None,
     period_days: int = 2,
-    rep_all_df: pd.DataFrame | None = None,  # NUEVO: reposición completa (hasta máximo)
-    urgent_only: bool = False,               # NUEVO: si está activo, generamos "Completar con"
+    rep_all_df: pd.DataFrame | None = None, # reposición completa (hasta máximo)
+    urgent_only: bool = False,              # si activo, generamos "Completar con"
 ) -> dict:
     df = avantio_df.copy()
 
@@ -197,22 +200,27 @@ def build_dashboard_frames(
     date_list = [start + pd.Timedelta(days=i) for i in range(days)]
     end = (start + pd.Timedelta(days=days - 1)).normalize()
 
-    # Base apartments
+    # =========================
+    # BASE APARTMENTS (desde masters)
+    # =========================
+    base = base_apts.copy()
     base_cols = ["APARTAMENTO", "ZONA", "CAFE_TIPO", "ALMACEN"]
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = ""
 
-    base = df[base_cols].dropna(subset=["APARTAMENTO"]).drop_duplicates().copy()
+    for c in base_cols:
+        if c not in base.columns:
+            base[c] = ""
+
     base["APARTAMENTO"] = base["APARTAMENTO"].astype(str).str.strip()
     base["ZONA"] = base["ZONA"].astype(str).str.strip()
     base["CAFE_TIPO"] = base["CAFE_TIPO"].astype(str).str.strip()
     base["ALMACEN"] = base["ALMACEN"].astype(str).str.strip()
 
+    base = base.dropna(subset=["APARTAMENTO"]).drop_duplicates("APARTAMENTO").copy()
+
     # --- Lista_reponer (según rep actual) ---
     base = _build_list_per_apt(base, replenishment_df, "Lista_reponer")
 
-    # --- Completar con (solo si urgente_only) ---
+    # --- Completar con (solo si urgent_only) ---
     base["Completar con"] = ""
     if urgent_only and rep_all_df is not None and not rep_all_df.empty:
         rep_rest = _diff_rep(rep_all_df, replenishment_df)
@@ -224,6 +232,7 @@ def build_dashboard_frames(
         day_start = d
         day_end = d + pd.Timedelta(days=1)
 
+        # reservas que ocupan el día (cruce por rango)
         day_res = df[(df["in_dt"] < day_end) & (df["out_dt"] > day_start)].copy()
 
         in_today = df[df["in_dt"].dt.normalize() == day_start][["APARTAMENTO", "in_dt", "CLIENTE"]].copy()
