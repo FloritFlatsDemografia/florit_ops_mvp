@@ -1,9 +1,3 @@
-# app.py (COMPLETO) — incluye:
-# - Base_apts desde masters (para que salgan todos)
-# - Sin opción "Mostrar SOLO apartamentos con reposición"
-# - KPI Check-ins presenciales (Apolo 29/180/197 + Serranos)
-# - Ficha de apartamento en blanco por defecto
-# - FICHA con más días: crea dash_ficha (14 días) y la ficha usa dash_ficha["operativa"]
 import streamlit as st
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -25,7 +19,12 @@ def _coord_str(lat, lng):
         return None
 
 
-def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=False, optimize=True):
+def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=False):
+    """
+    IMPORTANT:
+    - Google Maps URL (/maps/dir/?api=1) NO soporta optimize:true (eso es de la Directions API).
+    - Si se incluye, Google lo interpreta como un waypoint más y rompe el cálculo.
+    """
     clean = []
     seen = set()
     for c in coords:
@@ -46,8 +45,6 @@ def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=Fals
         waypoints = clean[:-1]
 
     wp = "|".join(waypoints)
-    if wp and optimize:
-        wp = "optimize:true|" + wp
 
     url = "https://www.google.com/maps/dir/?api=1"
     url += f"&origin={quote(origin)}"
@@ -55,15 +52,6 @@ def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=Fals
     if wp:
         url += f"&waypoints={quote(wp)}"
     url += f"&travelmode={quote(travelmode)}"
-    return url
-
-
-def build_gmaps_place_url(coord: str):
-    """Abre Google Maps centrado en una coordenada 'lat,lng'."""
-    if not coord or not isinstance(coord, str) or "," not in coord:
-        return None
-    url = "https://www.google.com/maps/search/?api=1"
-    url += f"&query={quote(coord)}"
     return url
 
 
@@ -178,30 +166,6 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
     return items_df, totals_df
 
 
-# =========================
-# Normalización aptos (check-ins presenciales)
-# =========================
-def _norm_apt_name(x: str) -> str:
-    """
-    Normaliza nombres para casar:
-    - mayúsculas
-    - espacios
-    - APOLO 029 == APOLO 29
-    """
-    s = "" if x is None else str(x)
-    s = s.strip().upper()
-    s = re.sub(r"\s+", " ", s)
-
-    m = re.match(r"^(APOLO)\s+0*([0-9]+)$", s)
-    if m:
-        return f"{m.group(1)} {int(m.group(2))}"
-    return s
-
-
-PRESENTIAL_APTS_RAW = {"Apolo 029", "Apolo 197", "Apolo 180", "Serranos"}
-PRESENTIAL_APTS = {_norm_apt_name(a) for a in PRESENTIAL_APTS_RAW}
-
-
 def main():
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
@@ -220,7 +184,7 @@ def main():
 
 📌 Maestros en `data/` (GitHub):
 - Zonas
-- Apartamentos e Inventarios (ALMACEN + Localización)
+- Apartamentos e Inventarios (ALMACEN + Localización/coords)
 - Café por apartamento
 - Stock mínimo/máximo
 
@@ -228,7 +192,6 @@ def main():
 1) Parte Operativo (por día y ZONA)
 2) Sugerencia de Reposición (totales + dónde dejar)
 3) Ruta Google Maps (botones), al final
-4) Check-ins presenciales + Ficha de apartamento
 """
         )
 
@@ -295,7 +258,7 @@ def main():
         st.stop()
 
     # =========================
-    # Parse diarios
+    # Parse
     # =========================
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
@@ -305,19 +268,19 @@ def main():
         st.stop()
 
     # =========================
-    # Cruces maestros con Avantio
+    # Cruces maestros
     # =========================
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
-    # apt_almacen (ALMACEN + coords)
     ap_map = masters["apt_almacen"].copy()
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
         st.stop()
 
+    # asegura LAT/LNG (vienen del loader si tienes Localizacion bien)
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
@@ -326,28 +289,7 @@ def main():
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # añade almacén/coords a las reservas
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
-
-    # =========================
-    # Base de apartamentos (desde masters)
-    # =========================
-    base_apts = masters["zonas"][["APARTAMENTO", "ZONA"]].copy()
-    base_apts["APARTAMENTO"] = base_apts["APARTAMENTO"].astype(str).str.strip()
-    base_apts["ZONA"] = base_apts["ZONA"].astype(str).str.strip()
-
-    # café
-    if "cafe" in masters and "APARTAMENTO" in masters["cafe"].columns:
-        cafe = masters["cafe"][["APARTAMENTO", "CAFE_TIPO"]].copy()
-        cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
-        base_apts = base_apts.merge(cafe, on="APARTAMENTO", how="left")
-    else:
-        base_apts["CAFE_TIPO"] = ""
-
-    # almacén + coords
-    base_apts = base_apts.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
-    base_apts["CAFE_TIPO"] = base_apts["CAFE_TIPO"].fillna("").astype(str)
-    base_apts["ALMACEN"] = base_apts["ALMACEN"].fillna("").astype(str)
 
     # =========================
     # Normaliza Odoo + stock por almacén
@@ -366,38 +308,35 @@ def main():
 
     urgent_only = mode.startswith("URGENTE")
 
-    rep_all = summarize_replenishment(stock_by_alm, masters["thresholds"], objective="max", urgent_only=False)
-    rep = summarize_replenishment(stock_by_alm, masters["thresholds"], objective="max", urgent_only=urgent_only)
+    # 1) reposición completa (hasta máximo) -> para "Completar con"
+    rep_all = summarize_replenishment(
+        stock_by_alm,
+        masters["thresholds"],
+        objective="max",
+        urgent_only=False,
+    )
+
+    # 2) reposición usada en pantalla (si urgent_only, solo bajo mínimo)
+    rep = summarize_replenishment(
+        stock_by_alm,
+        masters["thresholds"],
+        objective="max",
+        urgent_only=urgent_only,
+    )
 
     unclassified = odoo_norm[odoo_norm["AmenityKey"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # =========================
-    # Dashboard NORMAL (el que pinta Operativa y KPIs)
+    # Dashboard
     # =========================
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
-        base_apts=base_apts,
         replenishment_df=rep,
         rep_all_df=rep_all,
         urgent_only=urgent_only,
         unclassified_products=unclassified,
         period_start=period_start,
         period_days=period_days,
-    )
-
-    # =========================
-    # Dashboard extra SOLO para ficha (más días)
-    # =========================
-    FICHA_MAX_DIAS = 14  # <- aquí decides el máximo
-    dash_ficha = build_dashboard_frames(
-        avantio_df=avantio_df,
-        base_apts=base_apts,
-        replenishment_df=rep,
-        rep_all_df=rep_all,
-        urgent_only=urgent_only,
-        unclassified_products=unclassified,
-        period_start=period_start,
-        period_days=max(int(period_days), int(FICHA_MAX_DIAS)),
     )
 
     # =========================
@@ -411,154 +350,74 @@ def main():
     c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
     c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
-    # =========================
-    # Check-ins presenciales (KPI + detalle)
-    # =========================
-    foco = dash["period_start"]  # date
-    op_foco = dash["operativa"].copy()
-    op_foco = op_foco[op_foco["Día"] == foco].copy()
-    op_foco["_APT_NORM"] = op_foco["APARTAMENTO"].map(_norm_apt_name)
-
-    mask_presential = op_foco["_APT_NORM"].isin(PRESENTIAL_APTS) & op_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])
-    presential_df = op_foco[mask_presential].copy()
-
-    st.divider()
-    cA, cB = st.columns([1, 3])
-    with cA:
-        st.metric("Check-ins presenciales (día foco)", int(len(presential_df)))
-
-    with cB:
-        if "show_presential" not in st.session_state:
-            st.session_state["show_presential"] = False
-
-        col_btn, col_hint = st.columns([1, 4])
-        with col_btn:
-            if st.button("Ver check-ins presenciales"):
-                st.session_state["show_presential"] = not st.session_state["show_presential"]
-        with col_hint:
-            st.caption("Criterio: Estado = ENTRADA / ENTRADA+SALIDA y aptos: Apolo 29, Apolo 180, Apolo 197, Serranos.")
-
-        if st.session_state["show_presential"]:
-            if presential_df.empty:
-                st.info("No hay check-ins presenciales en el día foco con esos apartamentos.")
+    # Check-ins presenciales (si tu dashboard lo añade)
+    if "checkins_presenciales_count" in kpis:
+        colx, colb = st.columns([1, 3])
+        with colx:
+            st.metric("Check-ins presenciales (día foco)", kpis.get("checkins_presenciales_count", 0))
+        with colb:
+            if kpis.get("checkins_presenciales_count", 0) > 0:
+                with st.expander("Ver check-ins presenciales", expanded=False):
+                    st.dataframe(dash.get("checkins_presenciales", pd.DataFrame()), use_container_width=True)
             else:
-                show_cols = ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"]
-                for c in show_cols:
-                    if c not in presential_df.columns:
-                        presential_df[c] = ""
-                presential_df = presential_df[show_cols].copy()
-
-                st.dataframe(
-                    presential_df.sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True),
-                    use_container_width=True,
-                    height=min(420, 40 + 35 * len(presential_df)),
+                st.caption(
+                    "Criterio: Estado = ENTRADA / ENTRADA+SALIDA y aptos: Apolo 29, Apolo 180, Apolo 197, Serranos."
                 )
 
-    # =========================
-    # 7) Buscador + Ficha de apartamento (usa dash_ficha)
-    # =========================
-    st.divider()
-    st.subheader("🔎 Buscador · Ficha de apartamento")
-
-    operativa_all = dash_ficha["operativa"].copy()  # <- CLAVE: usa el dashboard largo
-    apt_list = sorted([a for a in operativa_all["APARTAMENTO"].dropna().astype(str).str.strip().unique().tolist() if a])
-
-    q = st.text_input("Buscar apartamento", value="", placeholder="Ej: Apolo 197, Serreria 04, Serranos...").strip()
-
-    if q:
-        q_norm = q.lower()
-        apt_filtered = [a for a in apt_list if q_norm in a.lower()]
-    else:
-        apt_filtered = apt_list
-
-    options = ["— Selecciona un apartamento —"] + (apt_filtered if apt_filtered else apt_list)
-
-    colS1, colS2 = st.columns([2, 1])
-    with colS1:
-        apt_sel = st.selectbox("Selecciona apartamento", options=options, index=0)
-
-    with colS2:
-        days_to_show = st.number_input("Días a mostrar (dentro del periodo)", min_value=1, max_value=14, value=7, step=1)
-
-    if apt_sel == "— Selecciona un apartamento —":
-        st.info("Selecciona un apartamento para ver su ficha.")
-    else:
-        apt_df = operativa_all[operativa_all["APARTAMENTO"].astype(str).str.strip() == str(apt_sel).strip()].copy()
-        apt_df = apt_df.sort_values("Día").reset_index(drop=True)
-
-        today_row = apt_df[apt_df["Día"] == foco].head(1)
-
-        foco_ts = pd.Timestamp(foco)
-        end_ts = foco_ts + pd.Timedelta(days=int(days_to_show) - 1)
-        next_days = apt_df[(pd.to_datetime(apt_df["Día"]) >= foco_ts) & (pd.to_datetime(apt_df["Día"]) <= end_ts)].copy()
-
-        coord = None
-        try:
-            rr = ap_map[ap_map["APARTAMENTO"].astype(str).str.strip() == str(apt_sel).strip()].head(1)
-            if not rr.empty:
-                coord = _coord_str(rr.iloc[0].get("LAT"), rr.iloc[0].get("LNG"))
-        except Exception:
-            coord = None
-
-        place_url = build_gmaps_place_url(coord) if coord else None
-        dir_url = build_gmaps_directions_url([coord], travelmode="driving", return_to_base=False, optimize=False) if coord else None
-
-        if not today_row.empty:
-            r = today_row.iloc[0]
-            estado_hoy = str(r.get("Estado", "") or "")
-            cliente_hoy = str(r.get("Cliente", "") or "")
-            prox_ent = r.get("Próxima Entrada", "")
-            cafe_tipo = str(r.get("CAFE_TIPO", "") or "")
-            lista = str(r.get("Lista_reponer", "") or "")
-            completar = str(r.get("Completar con", "") or "")
-            zona = str(r.get("ZONA", "") or "")
-        else:
-            estado_hoy, cliente_hoy, prox_ent, cafe_tipo, lista, completar, zona = "", "", "", "", "", "", ""
-
-        cA1, cB1, cC1, cD1 = st.columns([1, 2, 1, 1])
-        cA1.metric("Estado HOY", estado_hoy if estado_hoy else "-")
-        cB1.metric("Cliente HOY", cliente_hoy if cliente_hoy else "-")
-        cC1.metric("Zona", zona if zona else "-")
-        cD1.metric("Café", cafe_tipo if cafe_tipo else "-")
-
-        colL, colR = st.columns([3, 2])
-        with colL:
-            st.markdown("**Reposición (Lista_reponer)**")
-            st.write(lista if lista.strip() else "—")
-            st.markdown("**Completar con**")
-            st.write(completar if completar.strip() else "—")
-
-        with colR:
-            st.markdown("**Próxima Entrada**")
-            st.write(str(prox_ent) if str(prox_ent).strip() and str(prox_ent).lower() not in ["none", "nan"] else "—")
-            st.markdown("**Mapa**")
-            if place_url:
-                st.link_button("Ver en Maps", place_url)
-            else:
-                st.caption("Sin coordenadas (revisar maestro apt_almacen).")
-            if dir_url:
-                st.link_button("Ruta desde Florit Flats", dir_url)
-
-        st.markdown("**Próximos días (dentro del periodo actual)**")
-        show_cols = ["Día", "Estado", "Cliente", "Próxima Entrada", "Lista_reponer", "Completar con"]
-        for c in show_cols:
-            if c not in next_days.columns:
-                next_days[c] = ""
-        st.dataframe(
-            next_days[show_cols].reset_index(drop=True),
-            use_container_width=True,
-            height=min(420, 40 + 35 * len(next_days)),
-        )
-
-    # =========================
-    # Descarga Excel
-    # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
         file_name=dash["excel_filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    # =========================
+    # Buscador ficha (si existe en dash)
+    # =========================
+    if "apt_list" in dash:
+        st.divider()
+        st.subheader("🔎 Buscador · Ficha de apartamento")
+        st.caption("Busca y consulta estado, cliente, reposición, y próximos días dentro del periodo.")
+
+        apt_list = dash["apt_list"]
+        q = st.text_input("Buscar apartamento", value="", placeholder="Ej: Apolo 197, Serreria 04, Serranos...")
+        apt_filtered = [a for a in apt_list if q.strip().lower() in a.lower()] if q.strip() else apt_list
+
+        sel = st.selectbox("Selecciona apartamento", options=[""] + apt_filtered, index=0)
+        days_show = st.number_input(
+            "Días a mostrar (dentro del periodo)",
+            min_value=1,
+            max_value=int(dash.get("period_days", 14)),
+            value=min(2, int(dash.get("period_days", 2))),
+            step=1,
+        )
+
+        if sel:
+            ficha = dash["operativa"][dash["operativa"]["APARTAMENTO"] == sel].copy()
+            ficha = ficha.sort_values("Día").head(int(days_show))
+
+            hoy = ficha.iloc[0] if not ficha.empty else None
+
+            if hoy is not None:
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("Estado HOY", str(hoy.get("Estado", "")))
+                a2.metric("Cliente HOY", str(hoy.get("Cliente", "")))
+                a3.metric("Zona", str(hoy.get("ZONA", "")))
+                a4.metric("Café", str(hoy.get("CAFE_TIPO", "")))
+
+                st.markdown("**Reposición (Lista_reponer)**")
+                st.write(str(hoy.get("Lista_reponer", "")).strip() or "—")
+
+                st.markdown("**Completar con**")
+                st.write(str(hoy.get("Completar con", "")).strip() or "—")
+
+                st.markdown("**Próxima Entrada**")
+                st.write(str(hoy.get("Próxima Entrada", "")) if pd.notna(hoy.get("Próxima Entrada")) else "—")
+
+            st.markdown("### Próximos días (dentro del periodo actual)")
+            show_cols = ["Día", "Estado", "Cliente", "Próxima Entrada", "Lista_reponer", "Completar con"]
+            show_cols = [c for c in show_cols if c in ficha.columns]
+            st.dataframe(ficha[show_cols].reset_index(drop=True), use_container_width=True)
 
     # =========================
     # 1) PARTE OPERATIVO
@@ -575,11 +434,7 @@ def main():
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
 
-    operativa["__has_rep"] = operativa["Lista_reponer"].astype(str).str.strip().ne("")
-    operativa = operativa.sort_values(
-        ["Día", "ZONA", "__has_rep", "__prio", "APARTAMENTO"],
-        ascending=[True, True, False, True, True],
-    )
+    operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
 
     for dia, ddf in operativa.groupby("Día", dropna=False):
         st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
@@ -590,7 +445,7 @@ def main():
         for zona, zdf in ddf.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
-            show_df = zdf.drop(columns=["ZONA", "__prio", "__has_rep"], errors="ignore").copy()
+            show_df = zdf.drop(columns=["ZONA", "__prio"], errors="ignore").copy()
             st.dataframe(
                 _style_operativa(show_df),
                 use_container_width=True,
@@ -613,19 +468,15 @@ def main():
     if items_df.empty:
         st.info("No hay reposición sugerida para el periodo (con esos criterios) o faltan listas.")
     else:
-        colA2, colB2 = st.columns([1, 2])
+        colA, colB = st.columns([1, 2])
 
-        with colA2:
+        with colA:
             st.markdown("**Totales (preparar carrito)**")
             st.dataframe(totals_df, use_container_width=True, height=min(520, 40 + 35 * len(totals_df)))
 
-        with colB2:
+        with colB:
             st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
-            st.dataframe(
-                items_df,
-                use_container_width=True,
-                height=min(520, 40 + 28 * min(len(items_df), 25)),
-            )
+            st.dataframe(items_df, use_container_width=True, height=min(520, 40 + 28 * min(len(items_df), 25)))
 
     # =========================
     # 3) RUTAS GOOGLE MAPS (ABAJO)
@@ -643,6 +494,8 @@ def main():
     route_df = dash["operativa"].copy()
     route_df = route_df[route_df["Día"].isin([today, tomorrow])].copy()
     route_df = route_df[route_df["Estado"].isin(visitable_states)].copy()
+
+    # solo si hay reposición
     route_df = route_df[route_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
     if zonas_sel:
@@ -667,7 +520,7 @@ def main():
                     continue
 
                 for idx, chunk in enumerate(chunk_list(coords, MAX_STOPS), start=1):
-                    url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base, optimize=True)
+                    url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
                     if url:
                         st.link_button(f"Abrir ruta · {zona_label} (tramo {idx})", url)
 
