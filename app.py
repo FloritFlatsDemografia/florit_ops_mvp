@@ -297,7 +297,7 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     # apt_almacen (ALMACEN + coords)
-    ap_map = masters["apt_almacen"].s
+    ap_map = masters["apt_almacen"].copy()
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
