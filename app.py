@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -257,7 +258,7 @@ def main():
         st.stop()
 
     # =========================
-    # Parse
+    # Parse diarios
     # =========================
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
@@ -267,12 +268,13 @@ def main():
         st.stop()
 
     # =========================
-    # Cruces maestros
+    # Cruces maestros con Avantio
     # =========================
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
+    # apt_almacen (ALMACEN + coords)
     ap_map = masters["apt_almacen"].copy()
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
@@ -287,7 +289,29 @@ def main():
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
+    # añade almacén/coords a las reservas
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
+
+    # =========================
+    # Base de apartamentos (CLAVE)
+    # =========================
+    # La operativa debe incluir apartamentos aunque NO estén en Avantio ese día
+    base_apts = masters["zonas"][["APARTAMENTO", "ZONA"]].copy()
+    base_apts["APARTAMENTO"] = base_apts["APARTAMENTO"].astype(str).str.strip()
+    base_apts["ZONA"] = base_apts["ZONA"].astype(str).str.strip()
+
+    # café
+    if "cafe" in masters and "APARTAMENTO" in masters["cafe"].columns:
+        cafe = masters["cafe"][["APARTAMENTO", "CAFE_TIPO"]].copy()
+        cafe["APARTAMENTO"] = cafe["APARTAMENTO"].astype(str).str.strip()
+        base_apts = base_apts.merge(cafe, on="APARTAMENTO", how="left")
+    else:
+        base_apts["CAFE_TIPO"] = ""
+
+    # almacén + coords
+    base_apts = base_apts.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
+    base_apts["CAFE_TIPO"] = base_apts["CAFE_TIPO"].fillna("").astype(str)
+    base_apts["ALMACEN"] = base_apts["ALMACEN"].fillna("").astype(str)
 
     # =========================
     # Normaliza Odoo + stock por almacén
@@ -325,10 +349,11 @@ def main():
     unclassified = odoo_norm[odoo_norm["AmenityKey"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # =========================
-    # Dashboard  (IMPORTANTE: rep_all_df + urgent_only)
+    # Dashboard
     # =========================
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
+        base_apts=base_apts,
         replenishment_df=rep,
         rep_all_df=rep_all,
         urgent_only=urgent_only,
