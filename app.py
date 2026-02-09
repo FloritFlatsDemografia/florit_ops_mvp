@@ -7,6 +7,7 @@ import re
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
+
 # =========================
 # Google Maps helpers
 # =========================
@@ -18,10 +19,6 @@ def _coord_str(lat, lng):
 
 
 def build_gmaps_directions_url(coords, travelmode="walking", return_to_base=False):
-    """
-    Importante: NO usamos optimize:true porque en Google Maps URL a veces lo interpreta
-    como una parada literal (te salía "optimize:true" en la ruta).
-    """
     clean = []
     seen = set()
     for c in coords:
@@ -85,9 +82,6 @@ _ITEM_RX = re.compile(r"^\s*(.*?)\s*x\s*([0-9]+)\s*$", re.IGNORECASE)
 
 
 def parse_lista_reponer(s: str):
-    """
-    "Detergente x3, Insecticida x1" -> [("Detergente",3),("Insecticida",1)]
-    """
     if s is None:
         return []
     txt = str(s).strip()
@@ -108,18 +102,9 @@ def parse_lista_reponer(s: str):
 
 
 def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_completar: bool = False):
-    """
-    Devuelve:
-      items_df: Día, ZONA, APARTAMENTO, Producto, Cantidad, Fuente
-      totals_df: Producto, Total
-    Si include_completar=True, suma Lista_reponer + Completar con.
-    """
     df = operativa.copy()
-
-    # Solo estados “preparables”
     df = df[df["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA", "VACIO"])].copy()
 
-    # Zonas filtradas
     if zonas_sel:
         df = df[df["ZONA"].isin(zonas_sel)].copy()
 
@@ -164,7 +149,7 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# Helpers Google Sheet (nuevo)
+# Google Sheet helpers (para el bloque 8)
 # =========================
 def _agg_nonempty(series: pd.Series) -> str:
     vals = []
@@ -172,7 +157,6 @@ def _agg_nonempty(series: pd.Series) -> str:
         s = str(x).strip()
         if s and s.lower() not in {"nan", "none"}:
             vals.append(s)
-    # evita duplicados manteniendo orden
     seen = set()
     out = []
     for v in vals:
@@ -183,30 +167,19 @@ def _agg_nonempty(series: pd.Series) -> str:
 
 
 def _extract_ops_from_sheet(sheet_df: pd.DataFrame, foco_date: pd.Timestamp) -> pd.DataFrame:
-    """
-    Construye una tabla por APARTAMENTO con:
-      - Incidencias hoy (col G)
-      - Faltantes por entrada (col Q)
-      - Reposiciones café (col S)
-    Usando preferencia por headers; si no, por índice de columna.
-    """
     if sheet_df is None or sheet_df.empty:
         return pd.DataFrame(columns=["APARTAMENTO", "Incidencias hoy", "Faltantes por entrada", "Reposiciones café"])
 
     df = sheet_df.copy()
-
-    # Normaliza nombres
     df.columns = [str(c).strip() for c in df.columns]
 
     def pick_col(name_candidates, idx_fallback):
-        # 1) por nombre exacto o parecido
         low = {str(c).strip().lower(): c for c in df.columns}
         for cand in name_candidates:
             k = cand.strip().lower()
             for lk, orig in low.items():
                 if lk == k or k in lk:
                     return orig
-        # 2) por índice
         if df.shape[1] > idx_fallback:
             return df.columns[idx_fallback]
         return None
@@ -220,7 +193,6 @@ def _extract_ops_from_sheet(sheet_df: pd.DataFrame, foco_date: pd.Timestamp) -> 
     if not c_ts or not c_ap:
         return pd.DataFrame(columns=["APARTAMENTO", "Incidencias hoy", "Faltantes por entrada", "Reposiciones café"])
 
-    # Fecha
     df["_ts"] = pd.to_datetime(df[c_ts], errors="coerce", dayfirst=True)
     df["_date"] = df["_ts"].dt.normalize()
 
@@ -249,7 +221,9 @@ def main():
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
     from src.normalize import normalize_products, summarize_replenishment
     from src.dashboard import build_dashboard_frames
-    from src.gsheets import read_sheet_df  # NUEVO
+
+    # ✅ IMPORT CORRECTO
+    from src.gsheets import read_sheet_df
 
     st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
     st.title("Florit OPS – Parte diario (Operativa + Reposición)")
@@ -266,18 +240,9 @@ def main():
 - Apartamentos e Inventarios (ALMACEN + Localización)
 - Café por apartamento
 - Stock mínimo/máximo
-
-✅ Flujo:
-1) Parte Operativo (por día y ZONA)
-2) Sugerencia de Reposición (totales + dónde dejar)
-3) Ruta Google Maps (botones), al final
-4) (NUEVO) Incidencias / Faltantes / Café desde Google Sheet
 """
         )
 
-    # =========================
-    # Sidebar
-    # =========================
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
     odoo_file = st.sidebar.file_uploader("Odoo (stock.quant)", type=["xlsx", "csv"])
@@ -308,9 +273,6 @@ def main():
         travelmode = st.selectbox("Modo", ["walking", "driving"], index=0)
         return_to_base = st.checkbox("Volver a Florit Flats al final", value=False)
 
-    # =========================
-    # Load masters
-    # =========================
     try:
         masters = load_masters_repo()
         st.sidebar.success("Maestros cargados ✅")
@@ -325,26 +287,18 @@ def main():
         else []
     )
     zonas_all = sorted([z for z in zonas_all if z and z.lower() not in ["nan", "none"]])
-
     zonas_sel = st.sidebar.multiselect("ZONAS (multiselección)", options=zonas_all, default=zonas_all)
 
     if not (avantio_file and odoo_file):
         st.info("Sube Avantio + Odoo para generar el parte operativo.")
         st.stop()
 
-    # =========================
-    # Parse
-    # =========================
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
-
     if odoo_df is None or odoo_df.empty:
-        st.error("Odoo: no se pudieron leer datos del stock.quant (archivo vacío o columnas no detectadas).")
+        st.error("Odoo: no se pudieron leer datos del stock.quant.")
         st.stop()
 
-    # =========================
-    # Cruces maestros
-    # =========================
     avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
@@ -355,12 +309,10 @@ def main():
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
         st.stop()
 
-    # Asegura LAT/LNG si existen o intenta parsearlas desde Localizacion
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
 
-    # Si vienen en "Localizacion" como "lat, lng"
     if "Localizacion" in ap_map.columns:
         def _split_loc(x):
             s = str(x).strip()
@@ -381,11 +333,7 @@ def main():
 
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-    # =========================
-    # Normaliza Odoo + stock por almacén
-    # =========================
     odoo_norm = normalize_products(odoo_df)
-
     if "Ubicación" in odoo_norm.columns:
         odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
     odoo_norm["ALMACEN"] = odoo_norm["ALMACEN"].astype(str).str.strip()
@@ -397,7 +345,6 @@ def main():
     )
 
     urgent_only = mode.startswith("URGENTE")
-
     rep_all = summarize_replenishment(stock_by_alm, masters["thresholds"], objective="max", urgent_only=False)
     rep = summarize_replenishment(stock_by_alm, masters["thresholds"], objective="max", urgent_only=urgent_only)
 
@@ -413,9 +360,6 @@ def main():
         period_days=period_days,
     )
 
-    # =========================
-    # KPIs
-    # =========================
     kpis = dash.get("kpis", {})
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
@@ -424,41 +368,33 @@ def main():
     c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
     c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
-    # =========================
-    # NUEVO: Google Sheet (Incidencias / Faltantes / Café)
-    # =========================
+    # ==============
+    # BLOQUE 8: Sheet
+    # ==============
     st.divider()
-    st.subheader("🧾 Limpiezas / Incidencias (Google Sheet) · Día foco")
+    st.subheader("🧾 Incidencias / Faltantes / Café (Google Sheet) · Día foco")
 
     foco_date = pd.Timestamp(dash["period_start"])
-    sheet_ok = False
-    sheet_df = None
+    ops_today = pd.DataFrame(columns=["APARTAMENTO", "Incidencias hoy", "Faltantes por entrada", "Reposiciones café"])
+
     try:
         sheet_df = read_sheet_df()
-        sheet_ok = sheet_df is not None and not sheet_df.empty
-        if sheet_ok:
-            st.caption("Fuente: Google Sheet conectado por Secrets.")
+        if sheet_df is None or sheet_df.empty:
+            st.info("Google Sheet: sin datos (o no se pudo leer).")
         else:
-            st.info("Google Sheet: sin datos o no se pudo leer.")
+            ops_today = _extract_ops_from_sheet(sheet_df, foco_date)
+
+            colX, colY, colZ = st.columns(3)
+            colX.metric("Aptos con incidencias hoy", int((ops_today["Incidencias hoy"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
+            colY.metric("Aptos con faltantes por entrada", int((ops_today["Faltantes por entrada"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
+            colZ.metric("Aptos con reposición café", int((ops_today["Reposiciones café"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
+
+            with st.expander("Ver detalle (hoy)", expanded=False):
+                st.dataframe(ops_today, use_container_width=True)
     except Exception as e:
-        st.warning("No pude leer el Google Sheet. Revisa Secrets/compartido con service account.")
+        st.warning("No pude leer el Google Sheet. Revisa Secrets + compartir con service account.")
         st.exception(e)
 
-    ops_today = pd.DataFrame(columns=["APARTAMENTO", "Incidencias hoy", "Faltantes por entrada", "Reposiciones café"])
-    if sheet_ok:
-        ops_today = _extract_ops_from_sheet(sheet_df, foco_date)
-
-        colX, colY, colZ = st.columns([1, 1, 1])
-        colX.metric("Aptos con incidencias hoy", int((ops_today["Incidencias hoy"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-        colY.metric("Aptos con faltantes por entrada", int((ops_today["Faltantes por entrada"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-        colZ.metric("Aptos con reposición café", int((ops_today["Reposiciones café"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-
-        with st.expander("Ver detalle (hoy)", expanded=False):
-            st.dataframe(ops_today, use_container_width=True)
-
-    # =========================
-    # Descargar Excel
-    # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
@@ -477,23 +413,8 @@ def main():
 
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
-
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
-
-    # Enlaza info del Sheet al operativa (solo para el día foco; si quieres para todos los días, se puede)
-    if sheet_ok and not ops_today.empty:
-        ops_today_merge = ops_today.copy()
-        ops_today_merge["APARTAMENTO"] = ops_today_merge["APARTAMENTO"].astype(str).str.strip().str.upper()
-        operativa["APARTAMENTO_UP"] = operativa["APARTAMENTO"].astype(str).str.strip().str.upper()
-        operativa = operativa.merge(
-            ops_today_merge,
-            left_on="APARTAMENTO_UP",
-            right_on="APARTAMENTO",
-            how="left",
-            suffixes=("", "_gs"),
-        )
-        operativa = operativa.drop(columns=["APARTAMENTO_gs"], errors="ignore")
 
     operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
 
@@ -506,7 +427,7 @@ def main():
         for zona, zdf in ddf.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
-            show_df = zdf.drop(columns=["ZONA", "__prio", "APARTAMENTO_UP"], errors="ignore").copy()
+            show_df = zdf.drop(columns=["ZONA", "__prio"], errors="ignore").copy()
             st.dataframe(
                 _style_operativa(show_df),
                 use_container_width=True,
@@ -520,7 +441,7 @@ def main():
     st.subheader("Sugerencia de Reposición")
 
     if urgent_only:
-        st.caption("Modo URGENTE: Totales + dónde dejar, incluyendo Lista_reponer (urgente) y Completar con (aprovechar viaje).")
+        st.caption("Modo URGENTE: Totales + dónde dejar, incluyendo Lista_reponer (urgente) y Completar con.")
         items_df, totals_df = build_sugerencia_df(dash["operativa"], zonas_sel, include_completar=True)
     else:
         st.caption("Resumen del periodo: ENTRADA / ENTRADA+SALIDA / VACIO con reposición. Totales + dónde dejar.")
@@ -530,17 +451,15 @@ def main():
         st.info("No hay reposición sugerida para el periodo (con esos criterios) o faltan listas.")
     else:
         colA, colB = st.columns([1, 2])
-
         with colA:
             st.markdown("**Totales (preparar carrito)**")
             st.dataframe(totals_df, use_container_width=True, height=min(520, 40 + 35 * len(totals_df)))
-
         with colB:
             st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
             st.dataframe(items_df, use_container_width=True, height=min(520, 40 + 28 * min(len(items_df), 25)))
 
     # =========================
-    # 3) RUTAS GOOGLE MAPS (ABAJO)
+    # 3) RUTAS GOOGLE MAPS
     # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
@@ -573,7 +492,6 @@ def main():
             for zona, zdf in ddf.groupby("ZONA", dropna=False):
                 zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
                 coords = zdf["COORD"].tolist()
-
                 if not coords:
                     st.info(f"{zona_label}: sin coordenadas suficientes.")
                     continue
@@ -583,9 +501,6 @@ def main():
                     if url:
                         st.link_button(f"Abrir ruta · {zona_label} (tramo {idx})", url)
 
-    # =========================
-    # Debug opcional
-    # =========================
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
         st.dataframe(rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True), use_container_width=True)
