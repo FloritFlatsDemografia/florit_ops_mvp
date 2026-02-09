@@ -1,4 +1,4 @@
-# app.py
+# app.py (COMPLETO) — sin opción “Mostrar SOLO apartamentos con reposición”
 import streamlit as st
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -215,8 +215,6 @@ def main():
 
         st.divider()
         st.subheader("Filtros")
-        only_replenishment = st.checkbox("Mostrar SOLO apartamentos con reposición", value=True)
-
         estados_sel = st.multiselect(
             "Filtrar estados",
             ["ENTRADA", "SALIDA", "ENTRADA+SALIDA", "OCUPADO", "VACIO"],
@@ -293,9 +291,8 @@ def main():
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
     # =========================
-    # Base de apartamentos (CLAVE)
+    # Base de apartamentos (desde masters)
     # =========================
-    # La operativa debe incluir apartamentos aunque NO estén en Avantio ese día
     base_apts = masters["zonas"][["APARTAMENTO", "ZONA"]].copy()
     base_apts["APARTAMENTO"] = base_apts["APARTAMENTO"].astype(str).str.strip()
     base_apts["ZONA"] = base_apts["ZONA"].astype(str).str.strip()
@@ -395,10 +392,9 @@ def main():
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
 
-    if only_replenishment and "Lista_reponer" in operativa.columns:
-        operativa = operativa[operativa["Lista_reponer"].astype(str).str.strip().ne("")].copy()
-
-    operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
+    # Ordena para que los que tienen reposición vayan arriba, sin ocultar el resto
+    operativa["__has_rep"] = operativa["Lista_reponer"].astype(str).str.strip().ne("")
+    operativa = operativa.sort_values(["Día", "ZONA", "__has_rep", "__prio", "APARTAMENTO"], ascending=[True, True, False, True, True])
 
     for dia, ddf in operativa.groupby("Día", dropna=False):
         st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
@@ -409,7 +405,7 @@ def main():
         for zona, zdf in ddf.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
-            show_df = zdf.drop(columns=["ZONA", "__prio"], errors="ignore").copy()
+            show_df = zdf.drop(columns=["ZONA", "__prio", "__has_rep"], errors="ignore").copy()
             st.dataframe(
                 _style_operativa(show_df),
                 use_container_width=True,
@@ -463,7 +459,7 @@ def main():
     route_df = route_df[route_df["Día"].isin([today, tomorrow])].copy()
     route_df = route_df[route_df["Estado"].isin(visitable_states)].copy()
 
-    # en urgente, si quieres rutear solo urgentes -> Lista_reponer; si quieres incluir completar, cambia aquí
+    # Para rutas, mantenemos criterio: SOLO con Lista_reponer (si quieres rutear también "Completar con", te lo ajusto)
     route_df = route_df[route_df["Lista_reponer"].astype(str).str.strip().ne("")].copy()
 
     if zonas_sel:
