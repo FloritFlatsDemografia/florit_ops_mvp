@@ -383,6 +383,21 @@ def main():
         period_start=period_start,
         period_days=period_days,
     )
+    # =========================
+# Dashboard extra SOLO para ficha (más días)
+# =========================
+FICHA_MAX_DIAS = 14  # puedes poner 7 o 14
+dash_ficha = build_dashboard_frames(
+    avantio_df=avantio_df,
+    base_apts=base_apts,
+    replenishment_df=rep,
+    rep_all_df=rep_all,
+    urgent_only=urgent_only,
+    unclassified_products=unclassified,
+    period_start=period_start,
+    period_days=max(int(period_days), int(FICHA_MAX_DIAS)),
+    )
+
 
     # =========================
     # KPIs
