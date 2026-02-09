@@ -4,6 +4,9 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 
+# ✅ NUEVO: último informe por apartamento (LLAVES / OTRAS / INCIDENCIAS)
+from src.parsers.cleaning_last_report import build_last_report_view
+
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
@@ -184,10 +187,10 @@ def _extract_ops_from_sheet(sheet_df: pd.DataFrame, foco_date: pd.Timestamp) -> 
             return df.columns[idx_fallback]
         return None
 
-    c_ts = pick_col(["marca temporal", "timestamp", "fecha", "marca"], 0)      # A
-    c_ap = pick_col(["apartamento"], 1)                                       # B
-    c_inc = pick_col(["incidencias a realizar", "incidencias"], 6)           # G
-    c_falt = pick_col(["faltantes por entrada", "faltantes"], 16)            # Q
+    c_ts = pick_col(["marca temporal", "timestamp", "fecha", "marca"], 0)  # A
+    c_ap = pick_col(["apartamento"], 1)  # B
+    c_inc = pick_col(["incidencias a realizar", "incidencias"], 6)  # G
+    c_falt = pick_col(["faltantes por entrada", "faltantes"], 16)  # Q
     c_cafe = pick_col(["faltantes reposiciones café", "reposiciones café", "café"], 18)  # S
 
     if not c_ts or not c_ap:
@@ -314,6 +317,7 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
+
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -327,7 +331,11 @@ def main():
             ap_map.loc[miss, "LAT"] = [p[0] for p in loc_pairs]
             ap_map.loc[miss, "LNG"] = [p[1] for p in loc_pairs]
 
-    ap_map = ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]].dropna(subset=["APARTAMENTO", "ALMACEN"]).drop_duplicates()
+    ap_map = (
+        ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]]
+        .dropna(subset=["APARTAMENTO", "ALMACEN"])
+        .drop_duplicates()
+    )
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
@@ -385,12 +393,70 @@ def main():
             ops_today = _extract_ops_from_sheet(sheet_df, foco_date)
 
             colX, colY, colZ = st.columns(3)
-            colX.metric("Aptos con incidencias hoy", int((ops_today["Incidencias hoy"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-            colY.metric("Aptos con faltantes por entrada", int((ops_today["Faltantes por entrada"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-            colZ.metric("Aptos con reposición café", int((ops_today["Reposiciones café"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
+            colX.metric(
+                "Aptos con incidencias hoy",
+                int((ops_today["Incidencias hoy"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0,
+            )
+            colY.metric(
+                "Aptos con faltantes por entrada",
+                int((ops_today["Faltantes por entrada"].astype(str).str.strip() != "").sum())
+                if not ops_today.empty
+                else 0,
+            )
+            colZ.metric(
+                "Aptos con reposición café",
+                int((ops_today["Reposiciones café"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0,
+            )
 
             with st.expander("Ver detalle (hoy)", expanded=False):
                 st.dataframe(ops_today, use_container_width=True)
+
+            # =========================================================
+            # ✅ NUEVO BLOQUE: ÚLTIMO INFORME POR APARTAMENTO
+            #    (LLAVES + OTRAS REPOSICIONES + INCIDENCIAS/TAREAS)
+            # =========================================================
+            st.divider()
+            st.subheader("🧩 Último informe por apartamento (LLAVES · OTRAS REPOSICIONES · INCIDENCIAS)")
+
+            try:
+                last_view = build_last_report_view(sheet_df)
+
+                cA, cB, cC = st.columns(3)
+                cA.metric("Aptos con LLAVES", int(last_view["flag_llaves"].sum()) if not last_view.empty else 0)
+                cB.metric(
+                    "Aptos con OTRAS REPOSICIONES", int(last_view["flag_otras_repos"].sum()) if not last_view.empty else 0
+                )
+                cC.metric(
+                    "Aptos con INCIDENCIAS", int(last_view["flag_incidencias"].sum()) if not last_view.empty else 0
+                )
+
+                only_alerts_last = st.toggle(
+                    "Mostrar solo apartamentos con algo que revisar",
+                    value=True,
+                    key="only_alerts_last",
+                )
+
+                view_to_show = last_view.copy()
+                if only_alerts_last:
+                    view_to_show = view_to_show[
+                        view_to_show["flag_llaves"]
+                        | view_to_show["flag_otras_repos"]
+                        | view_to_show["flag_incidencias"]
+                    ].copy()
+
+                show_cols = ["APARTAMENTO", "ULTIMO_INFORME", "LLAVES", "OTRAS_REPOSICIONES", "INCIDENCIAS_TAREAS"]
+                show_df = view_to_show[show_cols].copy()
+
+                if pd.api.types.is_datetime64_any_dtype(show_df["ULTIMO_INFORME"]):
+                    show_df["ULTIMO_INFORME"] = show_df["ULTIMO_INFORME"].dt.strftime("%d/%m/%Y %H:%M")
+
+                with st.expander("Ver detalle (último por apartamento)", expanded=True):
+                    st.dataframe(show_df, use_container_width=True)
+
+            except Exception as e:
+                st.warning("No pude construir el 'último informe por apartamento'. Revisa cabeceras en la Sheet.")
+                st.exception(e)
+
     except Exception as e:
         st.warning("No pude leer el Google Sheet. Revisa Secrets + compartir con service account.")
         st.exception(e)
@@ -503,7 +569,10 @@ def main():
 
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
-        st.dataframe(rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True), use_container_width=True)
+        st.dataframe(
+            rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True),
+            use_container_width=True,
+        )
         if not unclassified.empty:
             st.warning("Hay productos sin clasificar (no entran en reposición).")
             st.dataframe(unclassified.reset_index(drop=True), use_container_width=True)
