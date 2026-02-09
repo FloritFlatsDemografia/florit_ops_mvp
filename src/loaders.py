@@ -1,235 +1,209 @@
 # src/loaders.py
-from __future__ import annotations
-
-from pathlib import Path
 import pandas as pd
+import streamlit as st
+import os
+import re
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+DATA_DIR = "data"
+
+FILES = {
+    "zonas": "Agrupacion apartamentos por zona.xlsx",
+    "apt_almacen": "Apartamentos e inventarios.xlsx",
+    "cafe": "Cafe por apartamento.xlsx",
+    "thresholds": "Stock minimo por almacen.xlsx",
+}
 
 
-def _data_dir() -> Path:
-    return _repo_root() / "data"
+def _read_excel(path: str) -> pd.DataFrame:
+    return pd.read_excel(path)
 
 
-def _read_excel_first_sheet(path: Path) -> pd.DataFrame:
-    return pd.read_excel(path, sheet_name=0, engine="openpyxl")
-
-
-def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = {str(c).strip().lower(): str(c).strip() for c in df.columns}
-    for cand in candidates:
-        k = cand.strip().lower()
-        if k in cols:
-            return cols[k]
-    return None
+def _safe_str(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in ["nan", "none"]:
+        return ""
+    return s
 
 
-def _list_excel_files(d: Path) -> list[Path]:
-    files = []
-    files += list(d.glob("*.xlsx"))
-    files += list(d.glob("*.xls"))
-    # orden estable
-    return sorted(files, key=lambda p: p.name.lower())
+_COORD_RX = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*$")
 
 
-def _best_match_file(d: Path, keywords: list[str]) -> Path | None:
+def _split_coord_to_lat_lng(coord_val):
     """
-    Elige el archivo Excel del data/ que más encaja por keywords (sin obligar a renombrar).
+    Convierte "39.47,-0.37" -> (39.47, -0.37)
+    Devuelve (None, None) si no puede.
     """
-    files = _list_excel_files(d)
-    if not files:
-        return None
+    if coord_val is None:
+        return None, None
+    s = str(coord_val).strip()
+    if not s or s.lower() in ["nan", "none"]:
+        return None, None
 
-    def score(p: Path) -> int:
-        name = p.name.lower()
-        s = 0
-        for kw in keywords:
-            if kw.lower() in name:
-                s += 10
-        # bonus por .xlsx
-        if p.suffix.lower() == ".xlsx":
-            s += 2
-        return s
-
-    ranked = sorted(files, key=lambda p: score(p), reverse=True)
-    # si el mejor score es 0, no hay match real
-    if score(ranked[0]) == 0:
-        return None
-    return ranked[0]
+    m = _COORD_RX.match(s)
+    if not m:
+        return None, None
+    try:
+        lat = float(m.group(1))
+        lng = float(m.group(2))
+        return lat, lng
+    except Exception:
+        return None, None
 
 
-# --------------------------
-# LOADERS individuales
-# --------------------------
-def _load_zonas(path: Path) -> pd.DataFrame:
-    df = _norm_cols(_read_excel_first_sheet(path))
+def _ensure_apt_almacen(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Espera poder obtener:
+      - APARTAMENTO
+      - ALMACEN (o equivalente)
+      - Coordenadas en columna C (3ª) o en alguna columna tipo COORD/Coord/Coordenadas
+    Devuelve df con columnas: APARTAMENTO, ALMACEN, LAT, LNG
+    """
+    df = _clean_cols(df)
 
-    c_ap = _find_col(df, ["APARTAMENTO", "Apartamento", "APARTAMENTOS"])
-    c_z = _find_col(df, ["ZONA", "Zona"])
+    # Detecta columna apartamento
+    apt_col = None
+    for c in df.columns:
+        cn = c.strip().lower()
+        if cn in ["apartamento", "apartment", "alojamiento", "nombre", "propiedad"]:
+            apt_col = c
+            break
+    if apt_col is None:
+        # fallback: primera columna
+        apt_col = df.columns[0]
 
-    # Caso A: formato largo APARTAMENTO/ZONA
-    if c_ap and c_z:
-        out = df[[c_ap, c_z]].copy()
-        out.columns = ["APARTAMENTO", "ZONA"]
-        out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
-        out["ZONA"] = out["ZONA"].astype(str).str.strip()
-        out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
-        return out.drop_duplicates()
+    # Detecta columna almacén
+    alm_col = None
+    for c in df.columns:
+        cn = c.strip().lower()
+        if cn in ["almacen", "almacén", "ubicacion", "ubicación", "location", "almacen/ubicacion"]:
+            alm_col = c
+            break
+    if alm_col is None:
+        # fallback: intenta segunda columna
+        alm_col = df.columns[1] if len(df.columns) > 1 else None
 
-    # Caso B: formato ancho (cada columna es una zona, filas = apartamentos)
-    rows = []
-    for col in df.columns:
-        zona = str(col).strip()
-        ser = df[col]
-        for v in ser.dropna().tolist():
-            apt = str(v).strip()
-            if apt and apt.lower() != "nan":
-                rows.append((apt, zona))
+    # Detecta columna coordenadas:
+    # 1) por nombre (coord/coordenadas/latlng)
+    coord_col = None
+    for c in df.columns:
+        cn = c.strip().lower()
+        if "coord" in cn or "coorden" in cn or "lat" in cn and "lng" in cn:
+            coord_col = c
+            break
 
-    out = pd.DataFrame(rows, columns=["APARTAMENTO", "ZONA"]).drop_duplicates()
-    out["ZONA"] = out["ZONA"].str.replace(r"^\s*Zona\s+", "", regex=True).str.strip()
-    return out
+    # 2) si no hay nombre, usa la columna C (3ª) como dices
+    if coord_col is None and len(df.columns) >= 3:
+        coord_col = df.columns[2]  # columna C
 
-
-def _load_cafe(path: Path) -> pd.DataFrame:
-    df = _norm_cols(_read_excel_first_sheet(path))
-
-    c_ap = _find_col(df, ["APARTAMENTO", "Apartamento"])
-    c_cafe = _find_col(df, ["CAFE_TIPO", "Café", "Cafe", "CAFE", "TIPO CAFE", "Tipo cafe", "Tipo Café"])
-
-    if c_ap and c_cafe:
-        out = df[[c_ap, c_cafe]].copy()
-        out.columns = ["APARTAMENTO", "CAFE_TIPO"]
-        out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
-        out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
-        out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
-        return out.drop_duplicates()
-
-    # fallback si el excel viene sin headers reales
-    df2 = pd.read_excel(path, sheet_name=0, header=None, engine="openpyxl")
-    if df2.shape[1] >= 2:
-        out = df2.iloc[:, :2].copy()
-        out.columns = ["APARTAMENTO", "CAFE_TIPO"]
-        out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
-        out["CAFE_TIPO"] = out["CAFE_TIPO"].astype(str).str.strip()
-        out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
-        return out.drop_duplicates()
-
-    return pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
-
-
-def _load_apt_almacen(path: Path) -> pd.DataFrame:
-    df = _norm_cols(_read_excel_first_sheet(path))
-
-    c_alm = _find_col(df, ["ALMACEN", "Almacen", "ALMACÉN", "Almacén"])
-    c_ap = _find_col(df, ["APARTAMENTO", "Apartamento"])
-    # soporta Localizacion/Localización y tu errata Localiación
-    c_loc = _find_col(df, ["Localizacion", "Localización", "Localiación", "LOCALIZACION", "LOCALIZACIÓN"])
-
-    if not c_alm or not c_ap:
-        raise ValueError(
-            f"APT↔ALMACÉN: debe tener ALMACEN y APARTAMENTO. Columnas detectadas: {list(df.columns)}"
-        )
-
-    cols = [c_alm, c_ap] + ([c_loc] if c_loc else [])
-    out = df[cols].copy()
-    out = out.rename(
-        columns={
-            c_alm: "ALMACEN",
-            c_ap: "APARTAMENTO",
-            **({c_loc: "Localizacion"} if c_loc else {}),
-        }
-    )
-
-    out["ALMACEN"] = out["ALMACEN"].astype(str).str.strip()
-    out["APARTAMENTO"] = out["APARTAMENTO"].astype(str).str.strip()
-
-    if "Localizacion" not in out.columns:
-        out["Localizacion"] = ""
-    out["Localizacion"] = out["Localizacion"].astype(str).str.strip()
-
-    out = out[out["APARTAMENTO"].ne("") & out["APARTAMENTO"].ne("nan")]
-    return out.drop_duplicates()
-
-
-def _load_thresholds(path: Path) -> pd.DataFrame:
-    df = _norm_cols(_read_excel_first_sheet(path))
-
-    c_am = _find_col(df, ["Amenity", "AMENITY", "Producto", "PRODUCTO", "Item", "ITEM"])
-    c_min = _find_col(df, ["Minimo", "Mínimo", "Min", "MIN", "STOCK_MIN", "MINIMO"])
-    c_max = _find_col(df, ["Maximo", "Máximo", "Max", "MAX", "STOCK_MAX", "MAXIMO"])
-
-    if not c_am:
-        raise ValueError(f"THRESHOLDS: no encuentro columna Amenity/Producto. Columnas: {list(df.columns)}")
-
-    # Construir salida estándar
     out = pd.DataFrame()
-    out["Amenity"] = df[c_am].astype(str).str.strip()
+    out["APARTAMENTO"] = df[apt_col].map(_safe_str)
+    out["ALMACEN"] = df[alm_col].map(_safe_str) if alm_col else ""
 
-    if c_min:
-        out["Minimo"] = pd.to_numeric(df[c_min], errors="coerce")
+    # Si ya existen LAT/LNG, respétalas; si no, créalas desde coord_col
+    lat_col = None
+    lng_col = None
+    for c in df.columns:
+        cn = c.strip().lower()
+        if cn in ["lat", "latitude"]:
+            lat_col = c
+        if cn in ["lng", "lon", "long", "longitude"]:
+            lng_col = c
+
+    if lat_col and lng_col:
+        out["LAT"] = pd.to_numeric(df[lat_col], errors="coerce")
+        out["LNG"] = pd.to_numeric(df[lng_col], errors="coerce")
     else:
-        out["Minimo"] = 0
+        # parsea "lat,lng" desde columna C (o detectada)
+        lats = []
+        lngs = []
+        for v in df[coord_col] if coord_col in df.columns else []:
+            lat, lng = _split_coord_to_lat_lng(v)
+            lats.append(lat)
+            lngs.append(lng)
+        out["LAT"] = pd.to_numeric(pd.Series(lats), errors="coerce")
+        out["LNG"] = pd.to_numeric(pd.Series(lngs), errors="coerce")
 
-    if c_max:
-        out["Maximo"] = pd.to_numeric(df[c_max], errors="coerce")
-    else:
-        # si no hay max, por defecto igual al mínimo
-        out["Maximo"] = out["Minimo"]
+    out = out.dropna(subset=["APARTAMENTO", "ALMACEN"]).copy()
+    out = out[out["APARTAMENTO"].astype(str).str.strip().ne("")].copy()
+    out = out[out["ALMACEN"].astype(str).str.strip().ne("")].copy()
 
-    out = out[out["Amenity"].ne("") & out["Amenity"].ne("nan")].copy()
-    out["Minimo"] = out["Minimo"].fillna(0)
-    out["Maximo"] = out["Maximo"].fillna(out["Minimo"])
+    # No obligamos a tener coords, pero si están, que sean numéricas
+    out["LAT"] = pd.to_numeric(out["LAT"], errors="coerce")
+    out["LNG"] = pd.to_numeric(out["LNG"], errors="coerce")
 
-    return out.drop_duplicates()
+    return out.drop_duplicates(subset=["APARTAMENTO", "ALMACEN"])
 
 
-
-# --------------------------
-# MAIN: carga masters
-# --------------------------
+@st.cache_data(show_spinner=False)
 def load_masters_repo() -> dict:
-    d = _data_dir()
-    if not d.exists():
-        raise FileNotFoundError("No existe la carpeta data/ en el repo.")
+    """
+    Carga maestros desde data/ dentro del repo.
+    Devuelve dict con keys:
+      - zonas
+      - apt_almacen   (incluye LAT/LNG ya parseado)
+      - cafe
+      - thresholds
+    """
+    masters = {}
 
-    # ✅ detección por keywords (no por nombre exacto)
-    zonas_path = _best_match_file(d, ["agrupacion", "agrupación", "zona"])
-    cafe_path = _best_match_file(d, ["cafe", "café", "apart"])
-    apt_path = _best_match_file(d, ["apartamentos", "inventarios"])
-    thr_path = _best_match_file(d, ["stock", "minimo", "mínimo", "almacen", "almacén"])
+    # ZONAS
+    p = os.path.join(DATA_DIR, FILES["zonas"])
+    zonas = _read_excel(p)
+    zonas = _clean_cols(zonas)
+    # Normaliza nombres esperados
+    # Debe existir: APARTAMENTO, ZONA
+    if "APARTAMENTO" not in zonas.columns:
+        # intenta detectar
+        for c in zonas.columns:
+            if str(c).strip().lower() in ["apartamento", "alojamiento"]:
+                zonas = zonas.rename(columns={c: "APARTAMENTO"})
+                break
+    if "ZONA" not in zonas.columns:
+        for c in zonas.columns:
+            if str(c).strip().lower() == "zona":
+                zonas = zonas.rename(columns={c: "ZONA"})
+                break
+    zonas["APARTAMENTO"] = zonas["APARTAMENTO"].map(_safe_str)
+    zonas["ZONA"] = zonas["ZONA"].map(_safe_str)
+    masters["zonas"] = zonas[["APARTAMENTO", "ZONA"]].dropna(subset=["APARTAMENTO"]).drop_duplicates()
 
-    # zonas/café pueden faltar sin matar la app (se verá "Sin zona" y café vacío)
-    if zonas_path is None:
-        zonas = pd.DataFrame(columns=["APARTAMENTO", "ZONA"])
-    else:
-        zonas = _load_zonas(zonas_path)
+    # APARTAMENTOS + INVENTARIOS (ALMACEN + COORDS)
+    p = os.path.join(DATA_DIR, FILES["apt_almacen"])
+    apt = _read_excel(p)
+    apt = _ensure_apt_almacen(apt)
+    masters["apt_almacen"] = apt
 
-    if cafe_path is None:
-        cafe = pd.DataFrame(columns=["APARTAMENTO", "CAFE_TIPO"])
-    else:
-        cafe = _load_cafe(cafe_path)
+    # CAFE
+    p = os.path.join(DATA_DIR, FILES["cafe"])
+    cafe = _read_excel(p)
+    cafe = _clean_cols(cafe)
+    if "APARTAMENTO" not in cafe.columns:
+        for c in cafe.columns:
+            if str(c).strip().lower() in ["apartamento", "alojamiento"]:
+                cafe = cafe.rename(columns={c: "APARTAMENTO"})
+                break
+    if "CAFE_TIPO" not in cafe.columns:
+        for c in cafe.columns:
+            if "cafe" in str(c).strip().lower():
+                cafe = cafe.rename(columns={c: "CAFE_TIPO"})
+                break
+    cafe["APARTAMENTO"] = cafe["APARTAMENTO"].map(_safe_str)
+    cafe["CAFE_TIPO"] = cafe["CAFE_TIPO"].map(_safe_str)
+    masters["cafe"] = cafe[["APARTAMENTO", "CAFE_TIPO"]].dropna(subset=["APARTAMENTO"]).drop_duplicates()
 
-    # apt_almacen y thresholds sí son críticos para reposición y rutas
-    if apt_path is None:
-        raise FileNotFoundError("No encuentro en data/ el Excel de APT↔ALMACEN (Apartamentos e Inventarios).")
-    if thr_path is None:
-        raise FileNotFoundError("No encuentro en data/ el Excel de THRESHOLDS (Stock mínimo por almacén).")
+    # THRESHOLDS
+    p = os.path.join(DATA_DIR, FILES["thresholds"])
+    thr = _read_excel(p)
+    thr = _clean_cols(thr)
+    masters["thresholds"] = thr
 
-    apt_almacen = _load_apt_almacen(apt_path)
-    thresholds = _load_thresholds(thr_path)
-
-    return {
-        "zonas": zonas,
-        "cafe": cafe,
-        "apt_almacen": apt_almacen,
-        "thresholds": thresholds,
-    }
+    return masters
