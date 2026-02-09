@@ -2,7 +2,8 @@
 # - Base_apts desde masters (para que salgan todos)
 # - Sin opción "Mostrar SOLO apartamentos con reposición"
 # - KPI Check-ins presenciales (Apolo 29/180/197 + Serranos)
-# - Opción 7: Buscador + Ficha de apartamento (en blanco por defecto; solo muestra si eliges)
+# - Ficha de apartamento en blanco por defecto
+# - FICHA con más días: crea dash_ficha (14 días) y la ficha usa dash_ficha["operativa"]
 import streamlit as st
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -371,7 +372,7 @@ def main():
     unclassified = odoo_norm[odoo_norm["AmenityKey"].isna()][["ALMACEN", "Producto", "Cantidad"]].copy()
 
     # =========================
-    # Dashboard
+    # Dashboard NORMAL (el que pinta Operativa y KPIs)
     # =========================
     dash = build_dashboard_frames(
         avantio_df=avantio_df,
@@ -383,21 +384,21 @@ def main():
         period_start=period_start,
         period_days=period_days,
     )
-    # =========================
-# Dashboard extra SOLO para ficha (más días)
-# =========================
-FICHA_MAX_DIAS = 14  # puedes poner 7 o 14
-dash_ficha = build_dashboard_frames(
-    avantio_df=avantio_df,
-    base_apts=base_apts,
-    replenishment_df=rep,
-    rep_all_df=rep_all,
-    urgent_only=urgent_only,
-    unclassified_products=unclassified,
-    period_start=period_start,
-    period_days=max(int(period_days), int(FICHA_MAX_DIAS)),
-    )
 
+    # =========================
+    # Dashboard extra SOLO para ficha (más días)
+    # =========================
+    FICHA_MAX_DIAS = 14  # <- aquí decides el máximo
+    dash_ficha = build_dashboard_frames(
+        avantio_df=avantio_df,
+        base_apts=base_apts,
+        replenishment_df=rep,
+        rep_all_df=rep_all,
+        urgent_only=urgent_only,
+        unclassified_products=unclassified,
+        period_start=period_start,
+        period_days=max(int(period_days), int(FICHA_MAX_DIAS)),
+    )
 
     # =========================
     # KPIs
@@ -454,12 +455,12 @@ dash_ficha = build_dashboard_frames(
                 )
 
     # =========================
-    # 7) Buscador + Ficha de apartamento (EN BLANCO POR DEFECTO)
+    # 7) Buscador + Ficha de apartamento (usa dash_ficha)
     # =========================
     st.divider()
     st.subheader("🔎 Buscador · Ficha de apartamento")
 
-    operativa_all = dash_ficha["operativa"].copy()
+    operativa_all = dash_ficha["operativa"].copy()  # <- CLAVE: usa el dashboard largo
     apt_list = sorted([a for a in operativa_all["APARTAMENTO"].dropna().astype(str).str.strip().unique().tolist() if a])
 
     q = st.text_input("Buscar apartamento", value="", placeholder="Ej: Apolo 197, Serreria 04, Serranos...").strip()
@@ -470,7 +471,6 @@ dash_ficha = build_dashboard_frames(
     else:
         apt_filtered = apt_list
 
-    # Placeholder: en blanco por defecto
     options = ["— Selecciona un apartamento —"] + (apt_filtered if apt_filtered else apt_list)
 
     colS1, colS2 = st.columns([2, 1])
@@ -478,7 +478,7 @@ dash_ficha = build_dashboard_frames(
         apt_sel = st.selectbox("Selecciona apartamento", options=options, index=0)
 
     with colS2:
-        days_to_show = st.number_input("Días a mostrar (dentro del periodo)", min_value=1, max_value=14, value=2, step=1)
+        days_to_show = st.number_input("Días a mostrar (dentro del periodo)", min_value=1, max_value=14, value=7, step=1)
 
     if apt_sel == "— Selecciona un apartamento —":
         st.info("Selecciona un apartamento para ver su ficha.")
@@ -575,7 +575,6 @@ dash_ficha = build_dashboard_frames(
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
 
-    # Ordena para que los que tienen reposición vayan arriba, sin ocultar el resto
     operativa["__has_rep"] = operativa["Lista_reponer"].astype(str).str.strip().ne("")
     operativa = operativa.sort_values(
         ["Día", "ZONA", "__has_rep", "__prio", "APARTAMENTO"],
