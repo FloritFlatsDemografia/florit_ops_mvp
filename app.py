@@ -4,116 +4,9 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 import unicodedata
-from datetime import datetime, date, timedelta
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
-
-
-# =========================
-# PAX MAX (hardcode)
-# =========================
-PAX_MAX = {
-    "ALFARO": 5,
-    "ALMIRANTE 01": 4,
-    "ALMIRANTE 02": 4,
-    "APOLO 029": 2,
-    "APOLO 180": 3,
-    "APOLO 197": 4,
-    "BENICALAP 01": 4,
-    "BENICALAP 02": 4,
-    "BENICALAP 03": 3,
-    "BENICALAP 05": 4,
-    "BENICALAP 06": 4,
-    "CADIZ": 4,
-    "CARCAIXENT 01": 4,
-    "CARCAIXENT 02": 4,
-    "DENIA 61": 4,
-    "DOLORES ALCAYDE 01": 4,
-    "DOLORES ALCAYDE 02": 4,
-    "DOLORES ALCAYDE 03": 4,
-    "DOLORES ALCAYDE 04": 4,
-    "DOLORES ALCAYDE 05": 4,
-    "DOLORES ALCAYDE 06": 4,
-    "DR.LLUCH": 4,
-    "ERUDITO": 4,
-    "GOZALBO": 4,
-    "LA ELIANA": 5,
-    "LLADRO Y MALLI 01": 5,
-    "LLADRO Y MALLI 02": 7,
-    "LLADRO Y MALLI 03": 5,
-    "LLADRO Y MALLI 04": 7,
-    "LLADRO Y MALLI BAJO A": 5,
-    "LLADRO Y MALLI BAJO B": 4,
-    "LUIS MERELO 01": 2,
-    "LUIS MERELO 02": 2,
-    "LUIS MERELO 03": 4,
-    "LUIS MERELO 04": 4,
-    "LUIS MERELO 05": 4,
-    "LUIS MERELO 06": 4,
-    "LUIS MERELO 07": 4,
-    "LUIS MERELO 08": 4,
-    "LUIS MERELO 09": 4,
-    "MARIANO CUBER 01": 2,
-    "MARIANO CUBER 02": 3,
-    "MARIANO CUBER 03": 2,
-    "MARIANO CUBER 04": 4,
-    "MARIANO CUBER 05": 4,
-    "OLIVERETA 1": 4,
-    "OLIVERETA 2": 4,
-    "OLIVERETA 3": 4,
-    "OLIVERETA 4": 4,
-    "OVE 01": 4,
-    "OVE 02": 4,
-    "PADRE PORTA 01": 4,
-    "PADRE PORTA 02": 4,
-    "PADRE PORTA 03": 6,
-    "PADRE PORTA 04": 3,
-    "PADRE PORTA 05": 4,
-    "PADRE PORTA 06": 6,
-    "PADRE PORTA 07": 6,
-    "PADRE PORTA 08": 4,
-    "PADRE PORTA 09": 4,
-    "PADRE PORTA 10": 4,
-    "PASAJE AYF 01": 4,
-    "PASAJE AYF 02": 4,
-    "PASAJE AYF 03": 4,
-    "PINTOR": 3,
-    "QUART I": 4,
-    "QUART II": 4,
-    "RETOR A": 4,
-    "RETOR B": 4,
-    "SAN LUIS": 6,
-    "SERRANOS": 4,
-    "SERRERIA 01": 6,
-    "SERRERIA 02": 4,
-    "SERRERIA 03": 4,
-    "SERRERIA 04": 4,
-    "SERRERIA 05": 4,
-    "SERRERIA 06": 4,
-    "SERRERIA 07": 3,
-    "SERRERIA 08": 3,
-    "SERRERIA 09": 4,
-    "SERRERIA 10": 4,
-    "SERRERIA 11": 4,
-    "SERRERIA 12": 4,
-    "SERRERIA 13": 4,
-    "SEVILLA": 2,
-    "TRAFALGAR 01": 4,
-    "TRAFALGAR 02": 4,
-    "TRAFALGAR 03": 4,
-    "TRAFALGAR 04": 2,
-    "TRAFALGAR 05": 4,
-    "TRAFALGAR 06": 4,
-    "TRAFALGAR 07": 4,
-    "TUNDIDORES": 4,
-    "VALLE": 4,
-    "VISITACION": 6,
-    "ZAPATEROS 10-2": 4,
-    "ZAPATEROS 10-6": 4,
-    "ZAPATEROS 10-8": 5,
-    "ZAPATEROS 12-5": 2,
-}
 
 
 # =========================
@@ -274,91 +167,30 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# Disponibilidad (FUENTE = Avantio Entradas / Reservas)
+# Google Sheet helpers
 # =========================
-def _to_dt(x):
-    # acepta string dd/mm/yyyy hh:mm o dd/mm/yyyy
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return pd.NaT
-    if isinstance(x, (datetime, pd.Timestamp)):
-        return pd.Timestamp(x)
-    s = str(x).strip()
-    if not s:
-        return pd.NaT
-    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+def _agg_nonempty(series: pd.Series) -> str:
+    vals = []
+    for x in series.tolist():
+        s = str(x).strip()
+        if s and s.lower() not in {"nan", "none"}:
+            vals.append(s)
+    seen = set()
+    out = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return " | ".join(out)
 
 
-def compute_available_apts_from_avantio(
-    avantio_res_df: pd.DataFrame,
-    zonas_df: pd.DataFrame,
-    start_d: date,
-    end_d: date,
-    zona_sel: str,
-    pax_min: int,
-) -> pd.DataFrame:
-    """
-    Devuelve disponibles según reservas que SOLAPAN con [start_d, end_d).
-    Si una reserva tiene entrada < end_d y salida > start_d => OCUPADO.
-    """
-    if start_d >= end_d:
-        return pd.DataFrame(columns=["APARTAMENTO", "ZONA", "PAX_MAX"])
-
-    # base: lista completa de apartamentos conocidos por PAX
-    base = pd.DataFrame({"APARTAMENTO": list(PAX_MAX.keys())})
-    base["APARTAMENTO_KEY"] = base["APARTAMENTO"].map(_apt_key)
-    base["PAX_MAX"] = base["APARTAMENTO"].map(lambda x: int(PAX_MAX.get(x, 0)))
-
-    # zonas
-    zmap = zonas_df.copy() if zonas_df is not None else pd.DataFrame(columns=["APARTAMENTO", "ZONA"])
-    if "APARTAMENTO" in zmap.columns:
-        zmap["APARTAMENTO_KEY"] = zmap["APARTAMENTO"].map(_apt_key)
-    if "ZONA" not in zmap.columns:
-        zmap["ZONA"] = "Sin zona"
-
-    base = base.merge(zmap[["APARTAMENTO_KEY", "ZONA"]].drop_duplicates(), on="APARTAMENTO_KEY", how="left")
-    base["ZONA"] = base["ZONA"].fillna("Sin zona")
-
-    # filtro zona
-    if zona_sel and zona_sel != "Todas":
-        base = base[base["ZONA"] == zona_sel].copy()
-
-    # filtro pax
-    base = base[base["PAX_MAX"] >= int(pax_min)].copy()
-
-    if base.empty:
-        return pd.DataFrame(columns=["APARTAMENTO", "ZONA", "PAX_MAX"])
-
-    # si no hay reservas, todos disponibles
-    if avantio_res_df is None or avantio_res_df.empty:
-        return base[["APARTAMENTO", "ZONA", "PAX_MAX"]].sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True)
-
-    df = avantio_res_df.copy()
-
-    # columnas típicas tras parse_avantio_entradas
-    # (si tu parser usa otros nombres, ajusta aquí SOLO estas 3 líneas)
-    col_apt = "Alojamiento" if "Alojamiento" in df.columns else ("APARTAMENTO" if "APARTAMENTO" in df.columns else None)
-    col_in = "Fecha entrada hora" if "Fecha entrada hora" in df.columns else ("Fecha entrada" if "Fecha entrada" in df.columns else None)
-    col_out = "Fecha salida hora" if "Fecha salida hora" in df.columns else ("Fecha salida" if "Fecha salida" in df.columns else None)
-
-    if not col_apt or not col_in or not col_out:
-        # si no se encuentran, mejor no “inventar”: devolvemos base para que no falten aptos
-        return base[["APARTAMENTO", "ZONA", "PAX_MAX"]].sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True)
-
-    df["_apt_key"] = df[col_apt].map(_apt_key)
-    df["_in"] = df[col_in].map(_to_dt)
-    df["_out"] = df[col_out].map(_to_dt)
-    df = df.dropna(subset=["_apt_key", "_in", "_out"]).copy()
-
-    start_ts = pd.Timestamp(start_d)
-    end_ts = pd.Timestamp(end_d)
-
-    # Solape de intervalos: in < end AND out > start
-    occ = df[(df["_in"] < end_ts) & (df["_out"] > start_ts)]["_apt_key"].dropna().unique().tolist()
-    occ_set = set(occ)
-
-    out = base[~base["APARTAMENTO_KEY"].isin(occ_set)].copy()
-    out = out[["APARTAMENTO", "ZONA", "PAX_MAX"]].sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True)
-    return out
+def _kpi_table(df: pd.DataFrame, title: str):
+    if df is None or df.empty:
+        st.info("Sin resultados.")
+        return
+    cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"] if c in df.columns]
+    st.markdown(f"#### {title}")
+    st.dataframe(df[cols_show].reset_index(drop=True), use_container_width=True)
 
 
 def main():
@@ -452,7 +284,7 @@ def main():
         st.stop()
 
     # Normaliza APARTAMENTO
-    avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip() if "Alojamiento" in avantio_df.columns else avantio_df.get("APARTAMENTO", "").astype(str).str.strip()
+    avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     avantio_df["APARTAMENTO_KEY"] = avantio_df["APARTAMENTO"].map(_apt_key)
 
     # Maestros
@@ -470,7 +302,6 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
-
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -519,53 +350,24 @@ def main():
     )
 
     # =========================
-    # 🔎 BUSCAR DISPONIBLES (FUENTE: Avantio Entradas)
+    # ✅ DASHBOARD ARRIBA + "CLICK" (botones) para ver listados
     # =========================
-    st.divider()
-    st.subheader("🔎 Buscar disponibles (según Entradas / Reservas)")
+    if "kpi_open" not in st.session_state:
+        st.session_state["kpi_open"] = ""
 
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-    with col1:
-        q_start = st.date_input("Entrada", value=pd.Timestamp.today().date())
-    with col2:
-        q_end = st.date_input("Salida", value=(pd.Timestamp.today() + pd.Timedelta(days=3)).date())
-    with col3:
-        pax_min = st.number_input("PAX mínimo", min_value=1, max_value=10, value=2, step=1)
-    with col4:
-        zona_opt = ["Todas"] + zonas_all
-        zona_pick = st.selectbox("Zona", options=zona_opt, index=0)
-
-    if st.button("Buscar disponibles"):
-        avail = compute_available_apts_from_avantio(
-            avantio_res_df=avantio_df,
-            zonas_df=masters.get("zonas", pd.DataFrame(columns=["APARTAMENTO", "ZONA"])),
-            start_d=q_start,
-            end_d=q_end,
-            zona_sel=zona_pick,
-            pax_min=int(pax_min),
-        )
-        st.success(f"Disponibles: {len(avail)}")
-        st.dataframe(avail, use_container_width=True)
-
-    # =========================
-    # KPIs dashboard
-    # =========================
-    kpis = dash.get("kpis", {})
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
-    c2.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
-    c3.metric("Turnovers", kpis.get("turnovers_dia", 0))
-    c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
-    c5.metric("Vacíos", kpis.get("vacios_dia", 0))
-
-    # ✅ Check-ins presenciales HOY
     tz = ZoneInfo("Europe/Madrid")
     today = pd.Timestamp.now(tz=tz).normalize().date()
-    presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
-    presencial_keys = {_apt_key(x) for x in presencial_set}
+    foco_day = pd.Timestamp(dash.get("period_start")).normalize().date()
 
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
+
+    # Filas del "día foco"
+    oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
+
+    # Presenciales HOY
+    presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
+    presencial_keys = {_apt_key(x) for x in presencial_set}
 
     pres_today = oper_all[
         (oper_all["Día"] == today)
@@ -573,12 +375,72 @@ def main():
         & (oper_all["APARTAMENTO_KEY"].isin(presencial_keys))
     ].copy()
 
-    c6.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
+    kpis = dash.get("kpis", {})
+    st.divider()
+    st.subheader("📊 Dashboard (día foco)")
 
-    if len(pres_today) > 0:
-        with st.expander("Ver check-ins presenciales (HOY)", expanded=False):
-            cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada"] if c in pres_today.columns]
-            st.dataframe(pres_today[cols_show].reset_index(drop=True), use_container_width=True)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+    with c1:
+        st.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
+        if st.button("Ver entradas", key="kpi_btn_entradas"):
+            st.session_state["kpi_open"] = "entradas"
+
+    with c2:
+        st.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
+        if st.button("Ver salidas", key="kpi_btn_salidas"):
+            st.session_state["kpi_open"] = "salidas"
+
+    with c3:
+        st.metric("Turnovers", kpis.get("turnovers_dia", 0))
+        if st.button("Ver turnovers", key="kpi_btn_turnovers"):
+            st.session_state["kpi_open"] = "turnovers"
+
+    with c4:
+        st.metric("Ocupados", kpis.get("ocupados_dia", 0))
+        if st.button("Ver ocupados", key="kpi_btn_ocupados"):
+            st.session_state["kpi_open"] = "ocupados"
+
+    with c5:
+        st.metric("Vacíos", kpis.get("vacios_dia", 0))
+        if st.button("Ver vacíos", key="kpi_btn_vacios"):
+            st.session_state["kpi_open"] = "vacios"
+
+    with c6:
+        st.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
+        if st.button("Ver presenciales", key="kpi_btn_presenciales"):
+            st.session_state["kpi_open"] = "presenciales"
+
+    # Render del listado "clicado"
+    kpi_open = st.session_state.get("kpi_open", "")
+    if kpi_open:
+        st.divider()
+        st.subheader("📌 Detalle KPI")
+
+        if kpi_open == "entradas":
+            df = oper_foco[oper_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])].copy()
+            _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "salidas":
+            df = oper_foco[oper_foco["Estado"].isin(["SALIDA", "ENTRADA+SALIDA"])].copy()
+            _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "turnovers":
+            df = oper_foco[oper_foco["Estado"].isin(["ENTRADA+SALIDA"])].copy()
+            _kpi_table(df, f"Turnovers · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "ocupados":
+            df = oper_foco[oper_foco["Estado"].isin(["OCUPADO"])].copy()
+            _kpi_table(df, f"Ocupados · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "vacios":
+            df = oper_foco[oper_foco["Estado"].isin(["VACIO"])].copy()
+            _kpi_table(df, f"Vacíos · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "presenciales":
+            _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}")
+
+        st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
     # =========================
     # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
@@ -597,7 +459,7 @@ def main():
         placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE...",
     )
 
-    if st.button("Buscar"):
+    if st.button("Buscar", key="btn_buscar_apto"):
         st.session_state["apt_selected_key"] = _apt_key(st.session_state["apt_query"])
 
     apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
@@ -633,16 +495,18 @@ def main():
         if op_one.empty:
             st.info("No hay filas de operativa para ese apartamento en el periodo seleccionado.")
         else:
+            # Aplica filtros de sidebar
             if zonas_sel:
                 op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
             if estados_sel:
                 op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
 
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
+
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
             st.dataframe(_style_operativa(op_show), use_container_width=True)
 
-        # ===== Reposición (detalle en este apto) =====
+        # ===== Reposición (resumen de items en este apto) =====
         st.markdown("### 📦 Reposición (solo este apartamento)")
         if op_one.empty:
             st.info("Sin reposición (no hay operativa para este apartamento).")
@@ -653,19 +517,19 @@ def main():
                 st.info("No veo columnas de reposición en la operativa para este apartamento.")
             else:
                 rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
-                    lambda r: any(str(x).strip().lower() not in {"", "nan", "none"} for x in r), axis=1
+                    lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
+                    axis=1,
                 )
                 rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
                 if rep_rows.empty:
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
                     st.dataframe(rep_rows.reset_index(drop=True), use_container_width=True)
-
     else:
         st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
 
     # =========================
-    # Descargar Excel operativa
+    # Descarga Excel
     # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
