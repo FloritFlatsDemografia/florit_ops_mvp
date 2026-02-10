@@ -5,8 +5,115 @@ from urllib.parse import quote
 import re
 import unicodedata
 
+
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
+
+
+# =========================
+# PAX MAX (definido en código, como pediste)
+# =========================
+PAX_MAX_BY_APT = {
+    "ALFARO": 5,
+    "ALMIRANTE 01": 4,
+    "ALMIRANTE 02": 4,
+    "APOLO 029": 2,
+    "APOLO 180": 3,
+    "APOLO 197": 4,
+    "BENICALAP 01": 4,
+    "BENICALAP 02": 4,
+    "BENICALAP 03": 3,
+    "BENICALAP 05": 4,
+    "BENICALAP 06": 4,
+    "CADIZ": 4,
+    "CARCAIXENT 01": 4,
+    "CARCAIXENT 02": 4,
+    "DENIA 61": 4,
+    "DOLORES ALCAYDE 01": 4,
+    "DOLORES ALCAYDE 02": 4,
+    "DOLORES ALCAYDE 03": 4,
+    "DOLORES ALCAYDE 04": 4,
+    "DOLORES ALCAYDE 05": 4,
+    "DOLORES ALCAYDE 06": 4,
+    "DR.LLUCH": 4,
+    "ERUDITO": 4,
+    "GOZALBO": 4,
+    "LA ELIANA": 5,
+    "LLADRO Y MALLI 01": 5,
+    "LLADRO Y MALLI 02": 7,
+    "LLADRO Y MALLI 03": 5,
+    "LLADRO Y MALLI 04": 7,
+    "LLADRO Y MALLI BAJO A": 5,
+    "LLADRO Y MALLI BAJO B": 4,
+    "LUIS MERELO 01": 2,
+    "LUIS MERELO 02": 2,
+    "LUIS MERELO 03": 4,
+    "LUIS MERELO 04": 4,
+    "LUIS MERELO 05": 4,
+    "LUIS MERELO 06": 4,
+    "LUIS MERELO 07": 4,
+    "LUIS MERELO 08": 4,
+    "LUIS MERELO 09": 4,
+    "MARIANO CUBER 01": 2,
+    "MARIANO CUBER 02": 3,
+    "MARIANO CUBER 03": 2,
+    "MARIANO CUBER 04": 4,
+    "MARIANO CUBER 05": 4,
+    "OLIVERETA 1": 4,
+    "OLIVERETA 2": 4,
+    "OLIVERETA 3": 4,
+    "OLIVERETA 4": 4,
+    "OVE 01": 4,
+    "OVE 02": 4,
+    "PADRE PORTA 01": 4,
+    "PADRE PORTA 02": 4,
+    "PADRE PORTA 03": 6,
+    "PADRE PORTA 04": 3,
+    "PADRE PORTA 05": 4,
+    "PADRE PORTA 06": 6,
+    "PADRE PORTA 07": 6,
+    "PADRE PORTA 08": 4,
+    "PADRE PORTA 09": 4,
+    "PADRE PORTA 10": 4,
+    "PASAJE AYF 01": 4,
+    "PASAJE AYF 02": 4,
+    "PASAJE AYF 03": 4,
+    "PINTOR": 3,
+    "QUART I": 4,
+    "QUART II": 4,
+    "RETOR A": 4,
+    "RETOR B": 4,
+    "SAN LUIS": 6,
+    "SERRANOS": 4,
+    "SERRERIA 01": 6,
+    "SERRERIA 02": 4,
+    "SERRERIA 03": 4,
+    "SERRERIA 04": 4,
+    "SERRERIA 05": 4,
+    "SERRERIA 06": 4,
+    "SERRERIA 07": 3,
+    "SERRERIA 08": 3,
+    "SERRERIA 09": 4,
+    "SERRERIA 10": 4,
+    "SERRERIA 11": 4,
+    "SERRERIA 12": 4,
+    "SERRERIA 13": 4,
+    "SEVILLA": 2,
+    "TRAFALGAR 01": 4,
+    "TRAFALGAR 02": 4,
+    "TRAFALGAR 03": 4,
+    "TRAFALGAR 04": 2,
+    "TRAFALGAR 05": 4,
+    "TRAFALGAR 06": 4,
+    "TRAFALGAR 07": 4,
+    "TUNDIDORES": 4,
+    "VALLE": 4,
+    "VISITACION": 6,
+    "ZAPATEROS 10-2": 4,
+    "ZAPATEROS 10-6": 4,
+    "ZAPATEROS 10-8": 5,
+    "ZAPATEROS 12-5": 2,
+}
 
 
 # =========================
@@ -21,9 +128,73 @@ def _apt_key(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # quita tildes
     s = re.sub(r"\s+", " ", s)
-    # Quita ceros iniciales en números sueltos: "APOLO 029" -> "APOLO 29"
-    s = re.sub(r"\b0+(\d)", r"\1", s)
+    s = re.sub(r"\b0+(\d)", r"\1", s)  # "APOLO 029" -> "APOLO 29"
     return s.upper().strip()
+
+
+def _pax_max_for(apt: str) -> int | None:
+    k = _apt_key(apt)
+    return PAX_MAX_BY_APT.get(k, None)
+
+
+# =========================
+# Disponibilidad (TELÉFONO)
+# Regla: disponible si VACIO todas las noches [CI .. CO-1]
+# =========================
+def _available_apartments_from_operativa(
+    operativa_df: pd.DataFrame,
+    check_in: pd.Timestamp,
+    check_out: pd.Timestamp,
+) -> pd.DataFrame:
+    if operativa_df is None or operativa_df.empty:
+        return pd.DataFrame(columns=["APARTAMENTO"])
+
+    need = {"Día", "APARTAMENTO", "Estado"}
+    if not need.issubset(operativa_df.columns):
+        return pd.DataFrame(columns=["APARTAMENTO"])
+
+    df = operativa_df.copy()
+    df["APARTAMENTO"] = df["APARTAMENTO"].astype(str).str.strip()
+    df["APARTAMENTO_KEY"] = df["APARTAMENTO"].map(_apt_key)
+    df["Día"] = pd.to_datetime(df["Día"], errors="coerce").dt.date
+    df["Estado"] = df["Estado"].astype(str).str.strip().str.upper()
+
+    ci = pd.to_datetime(check_in).normalize().date()
+    co = pd.to_datetime(check_out).normalize().date()
+    if co <= ci:
+        return pd.DataFrame(columns=["APARTAMENTO"])
+
+    last_night = (pd.to_datetime(check_out).normalize() - pd.Timedelta(days=1)).date()
+
+    noches = []
+    cur = pd.to_datetime(ci)
+    end = pd.to_datetime(last_night)
+    while cur <= end:
+        noches.append(cur.date())
+        cur += pd.Timedelta(days=1)
+
+    df_n = df[df["Día"].isin(noches)].copy()
+    if df_n.empty:
+        return pd.DataFrame(columns=["APARTAMENTO"])
+
+    g = df_n.groupby("APARTAMENTO_KEY")["Estado"].apply(list).reset_index(name="estados")
+
+    def _all_vacio(estados):
+        return bool(estados) and all(e == "VACIO" for e in estados)
+
+    g["is_free"] = g["estados"].apply(_all_vacio)
+    free_keys = set(g[g["is_free"]]["APARTAMENTO_KEY"].tolist())
+
+    # Devolvemos nombre “bonito” (primera ocurrencia del periodo)
+    one_name = (
+        df[["APARTAMENTO_KEY", "APARTAMENTO"]]
+        .dropna()
+        .drop_duplicates(subset=["APARTAMENTO_KEY"])
+        .copy()
+    )
+    out = one_name[one_name["APARTAMENTO_KEY"].isin(free_keys)][["APARTAMENTO"]].copy()
+    out = out.sort_values("APARTAMENTO").reset_index(drop=True)
+    return out
 
 
 # =========================
@@ -293,6 +464,7 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
+
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -340,8 +512,12 @@ def main():
         period_days=period_days,
     )
 
+    # Operativa global (para reusar)
+    oper_all = dash["operativa"].copy()
+    oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
+
     # =========================
-    # KPIs dashboard
+    # KPIs dashboard + Check-ins presenciales
     # =========================
     kpis = dash.get("kpis", {})
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -351,65 +527,165 @@ def main():
     c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
     c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
-    # ✅ Check-ins presenciales HOY
     tz = ZoneInfo("Europe/Madrid")
     today = pd.Timestamp.now(tz=tz).normalize().date()
+
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
 
-    oper_all = dash["operativa"].copy()
-    oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
+    oper_today = oper_all.copy()
+    oper_today["Día"] = pd.to_datetime(oper_today["Día"], errors="coerce").dt.date
 
-    pres_today = oper_all[
-        (oper_all["Día"] == today)
-        & (oper_all["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
-        & (oper_all["APARTAMENTO_KEY"].isin(presencial_keys))
+    pres_today = oper_today[
+        (oper_today["Día"] == today)
+        & (oper_today["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
+        & (oper_today["APARTAMENTO_KEY"].isin(presencial_keys))
     ].copy()
 
     c6.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
 
     if len(pres_today) > 0:
         with st.expander("Ver check-ins presenciales (HOY)", expanded=False):
-            cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada"] if c in pres_today.columns]
+            cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado"] if c in pres_today.columns]
             st.dataframe(pres_today[cols_show].reset_index(drop=True), use_container_width=True)
 
     # =========================
-    # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
+    # 🔎 BUSCADOR TELÉFONO (Disponibilidad)
+    # =========================
+    st.divider()
+    st.subheader("📞 Búsqueda rápida (Teléfono) · Disponibilidad por fechas + Zona + PAX")
+
+    tcol1, tcol2, tcol3, tcol4 = st.columns([1, 1, 1, 1.2])
+    with tcol1:
+        tel_ci = st.date_input("Entrada", value=pd.Timestamp.today().date(), key="tel_ci")
+    with tcol2:
+        tel_co = st.date_input("Salida", value=(pd.Timestamp.today() + pd.Timedelta(days=2)).date(), key="tel_co")
+    with tcol3:
+        pax_min = st.number_input("PAX mínimo", min_value=1, max_value=20, value=2, step=1, key="tel_pax")
+    with tcol4:
+        zona_opts = ["Todas"] + (zonas_all if isinstance(zonas_all, list) else [])
+        tel_zona = st.selectbox("Zona", options=zona_opts, index=0, key="tel_zona")
+
+    do_tel = st.button("Buscar disponibles", key="tel_btn")
+
+    if do_tel:
+        ci = pd.Timestamp(tel_ci)
+        co = pd.Timestamp(tel_co)
+
+        if co <= ci:
+            st.error("La salida debe ser posterior a la entrada.")
+        else:
+            # Recalcular un periodo que cubra exactamente las NOCHES del rango (no hace falta buffer)
+            nights = int((co - ci).days)
+            try:
+                dash_tel = build_dashboard_frames(
+                    avantio_df=avantio_df,
+                    replenishment_df=rep,
+                    rep_all_df=rep_all,
+                    urgent_only=urgent_only,
+                    unclassified_products=unclassified,
+                    period_start=tel_ci,
+                    period_days=max(1, nights),
+                )
+                oper_tel = dash_tel["operativa"].copy()
+            except Exception as e:
+                st.warning("No pude recalcular para el rango; uso el periodo actual.")
+                st.exception(e)
+                oper_tel = oper_all.copy()
+
+            free_apts = _available_apartments_from_operativa(oper_tel, ci, co)
+            if free_apts.empty:
+                st.info("No hay apartamentos totalmente VACÍOS para esas noches (según entradas/operativa).")
+            else:
+                out = free_apts.copy()
+                out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
+                out["PAX_MAX"] = out["APARTAMENTO_KEY"].map(lambda k: PAX_MAX_BY_APT.get(k, None))
+
+                # Zona desde maestro
+                if "zonas" in masters and "APARTAMENTO" in masters["zonas"].columns:
+                    tmp_z = masters["zonas"][["APARTAMENTO", "ZONA"]].copy()
+                    tmp_z["APARTAMENTO_KEY"] = tmp_z["APARTAMENTO"].map(_apt_key)
+                    out = out.merge(tmp_z[["APARTAMENTO_KEY", "ZONA"]], on="APARTAMENTO_KEY", how="left")
+
+                if tel_zona != "Todas" and "ZONA" in out.columns:
+                    out = out[out["ZONA"] == tel_zona].copy()
+
+                out["PAX_MAX"] = pd.to_numeric(out["PAX_MAX"], errors="coerce")
+                out = out[out["PAX_MAX"].fillna(0) >= pax_min].copy()
+
+                out = out.sort_values(["ZONA", "APARTAMENTO"], na_position="last").reset_index(drop=True)
+                st.success(f"Disponibles: {len(out)}")
+                show_cols = [c for c in ["APARTAMENTO", "ZONA", "PAX_MAX"] if c in out.columns]
+                st.dataframe(out[show_cols], use_container_width=True, height=min(520, 40 + 35 * min(len(out), 25)))
+
+    # =========================
+    # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición) con dropdown
     # =========================
     st.divider()
     st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
 
+    # Estado UI: vacío por defecto
     if "apt_query" not in st.session_state:
         st.session_state["apt_query"] = ""
+    if "apt_choice" not in st.session_state:
+        st.session_state["apt_choice"] = ""
     if "apt_selected_key" not in st.session_state:
         st.session_state["apt_selected_key"] = ""
 
-    st.text_input(
-        "Escribe el apartamento (o parte) y pulsa Enter",
-        key="apt_query",
-        placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE...",
-    )
-
-    if st.button("Buscar"):
-        st.session_state["apt_selected_key"] = _apt_key(st.session_state["apt_query"])
-
-    apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
-
-    # Cargar sheet + construir último informe por apto
+    # Cargar sheet + construir último informe por apto (una vez por ejecución)
     last_view = pd.DataFrame()
     try:
         sheet_df = read_sheet_df()
         if sheet_df is not None and not sheet_df.empty:
             last_view = build_last_report_view(sheet_df)
-            # añade key
             last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
     except Exception as e:
         st.warning("No pude construir el último informe por apartamento desde Google Sheet.")
         st.exception(e)
 
+    # Universo de apartamentos (operativa + sheet + pax)
+    apts_from_oper = sorted(set(oper_all["APARTAMENTO"].dropna().astype(str).str.strip().tolist())) if not oper_all.empty else []
+    apts_from_sheet = sorted(set(last_view["Apartamento"].dropna().astype(str).str.strip().tolist())) if not last_view.empty else []
+    apts_from_pax = sorted(PAX_MAX_BY_APT.keys())
+
+    universe = sorted({_apt_key(x) for x in (apts_from_oper + apts_from_sheet + apts_from_pax) if str(x).strip()})
+    # Para mostrar nombres, preferimos el “bonito” que venga del propio texto original:
+    # construimos un mapping key -> display (primera coincidencia razonable)
+    display_map = {}
+    for name in apts_from_oper + apts_from_sheet + apts_from_pax:
+        k = _apt_key(name)
+        if k and k not in display_map:
+            display_map[k] = _apt_key(name)  # display en MAYUS normalizada
+
+    query = st.text_input(
+        "Escribe (o parte) y pulsa Enter. Luego elige en el desplegable y pulsa Aplicar.",
+        key="apt_query",
+        placeholder="Ej: SERRANOS, APOLO, BENICALAP, ALMIRANTE...",
+    ).strip()
+
+    matches = []
+    if query:
+        qk = _apt_key(query)
+        # matching por “contiene”
+        for k in universe:
+            if qk in k:
+                matches.append(display_map.get(k, k))
+        matches = sorted(set(matches))
+
+    if matches:
+        st.selectbox("Coincidencias", options=[""] + matches, key="apt_choice")
+        if st.button("Aplicar", key="apt_apply"):
+            st.session_state["apt_selected_key"] = _apt_key(st.session_state.get("apt_choice", ""))
+    else:
+        st.caption("Escribe para ver coincidencias. (Nada se muestra por defecto.)")
+
+    apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
+
     if apt_key_sel:
+        st.markdown(f"## ✅ Resumen: `{display_map.get(apt_key_sel, apt_key_sel)}`")
+
         # ===== Limpieza (último informe) =====
-        st.markdown("### 🧹 Última limpieza (según Marca temporal)")
+        st.markdown("### 🧹 Última limpieza (Marca temporal)")
         if last_view is None or last_view.empty:
             st.info("No hay datos de limpieza disponibles.")
         else:
@@ -417,7 +693,6 @@ def main():
             if one.empty:
                 st.info("No encuentro último informe para ese apartamento en la Sheet.")
             else:
-                # renombres para UI
                 show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
                 show_cols = [c for c in show_cols if c in one.columns]
                 st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True)
@@ -429,65 +704,44 @@ def main():
             st.info("No hay filas de operativa para ese apartamento en el periodo seleccionado.")
         else:
             # Aplica filtros de sidebar
-            if zonas_sel:
+            if zonas_sel and "ZONA" in op_one.columns:
                 op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
-            if estados_sel:
+            if estados_sel and "Estado" in op_one.columns:
                 op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
 
-            op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
+            # orden seguro (si faltan columnas internas, no peta)
+            sort_cols = [c for c in ["Día", "ZONA", "__prio", "APARTAMENTO"] if c in op_one.columns]
+            if sort_cols:
+                op_one = op_one.sort_values(sort_cols, ascending=True)
 
-            # limpia columnas internas
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
             st.dataframe(_style_operativa(op_show), use_container_width=True)
 
-        # ===== Reposición (resumen de items en este apto) =====
+        # ===== Reposición (solo apto) =====
         st.markdown("### 📦 Reposición (solo este apartamento)")
         if op_one.empty:
             st.info("Sin reposición (no hay operativa para este apartamento).")
         else:
-            # Solo filas con Lista_reponer / Completar
             cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
-            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
-            if rep_rows.empty:
+            if not cols_rep:
                 st.info("No veo columnas de reposición en la operativa para este apartamento.")
             else:
-                rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(lambda r: any(x.strip() not in {"", "nan", "none"} for x in r), axis=1)
-                rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
+                rep_rows = op_one[["Día", "ZONA", "APARTAMENTO"] + cols_rep].copy() if "ZONA" in op_one.columns else op_one[["Día", "APARTAMENTO"] + cols_rep].copy()
+                for c in cols_rep:
+                    rep_rows[c] = rep_rows[c].astype(str).fillna("").str.strip()
+
+                def _has_any_rep(r):
+                    for c in cols_rep:
+                        v = str(r.get(c, "")).strip()
+                        if v and v.lower() not in {"nan", "none"}:
+                            return True
+                    return False
+
+                rep_rows = rep_rows[rep_rows.apply(_has_any_rep, axis=1)].copy()
                 if rep_rows.empty:
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
                     st.dataframe(rep_rows.reset_index(drop=True), use_container_width=True)
-
-    else:
-        st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
-
-    # =========================
-    # Bloque Sheet (día foco) — lo dejamos como lo tienes
-    # =========================
-    st.divider()
-    st.subheader("🧾 Incidencias / Faltantes / Café (Google Sheet) · Día foco")
-
-    foco_date = pd.Timestamp(dash["period_start"]).normalize()
-
-    try:
-        sheet_df = read_sheet_df()
-        if sheet_df is None or sheet_df.empty:
-            st.info("Google Sheet: sin datos (o no se pudo leer).")
-        else:
-            # Este bloque lo mantienes como estaba (si lo quieres)
-            st.caption("Este bloque es independiente del buscador.")
-            with st.expander("Ver datos crudos (sheet)", expanded=False):
-                st.dataframe(sheet_df.head(50), use_container_width=True)
-    except Exception as e:
-        st.warning("No pude leer el Google Sheet. Revisa Secrets + compartir con service account.")
-        st.exception(e)
-
-    st.download_button(
-        "⬇️ Descargar Excel (Operativa)",
-        data=dash["excel_all"],
-        file_name=dash["excel_filename"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
     # =========================
     # PARTE OPERATIVO COMPLETO
@@ -504,7 +758,7 @@ def main():
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
 
-    operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
+    operativa = operativa.sort_values([c for c in ["Día", "ZONA", "__prio", "APARTAMENTO"] if c in operativa.columns])
 
     for dia, ddf in operativa.groupby("Día", dropna=False):
         st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
@@ -585,6 +839,13 @@ def main():
                     url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
                     if url:
                         st.link_button(f"Abrir ruta · {zona_label} (tramo {idx})", url)
+
+    st.download_button(
+        "⬇️ Descargar Excel (Operativa)",
+        data=dash["excel_all"],
+        file_name=dash["excel_filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
