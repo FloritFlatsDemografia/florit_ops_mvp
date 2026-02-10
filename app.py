@@ -591,9 +591,38 @@ def main():
         with colA:
             st.markdown("**Totales (preparar carrito)**")
             st.dataframe(totals_df, use_container_width=True, height=min(520, 40 + 35 * len(totals_df)))
+            
         with colB:
-            st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
-            st.dataframe(items_df, use_container_width=True, height=min(520, 40 + 28 * min(len(items_df), 25)))
+    st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
+
+    # Tabla rápida (puede truncar visualmente, pero es útil)
+    st.dataframe(
+        items_df,
+        use_container_width=True,
+        height=min(520, 40 + 28 * min(len(items_df), 25)),
+    )
+
+    # Vista SIN cortes (siempre muestra todo el texto)
+    with st.expander("Ver texto completo (sin cortes) · Lista_reponer / Completar con", expanded=False):
+        # Si quieres agrupar por apto:
+        grp_cols = [c for c in ["ZONA", "APARTAMENTO"] if c in items_df.columns]
+        if grp_cols:
+            for (zona, apt), g in items_df.groupby(grp_cols, dropna=False):
+                zona_label = zona if str(zona).strip() not in {"", "nan", "None"} else "Sin zona"
+                st.markdown(f"### {zona_label} · {apt}")
+
+                for i, r in g.reset_index(drop=True).iterrows():
+                    dia = r.get("Día", "")
+                    prod = r.get("Producto", "")
+                    qty = r.get("Cantidad", "")
+                    fuente = r.get("Fuente", "")
+
+                    st.markdown(f"**{dia} · {prod} × {qty}**  _(Fuente: {fuente})_")
+                st.divider()
+        else:
+            # fallback simple
+            for i, r in items_df.reset_index(drop=True).iterrows():
+                st.write(dict(r))
 
     # =========================
     # RUTAS GOOGLE MAPS
