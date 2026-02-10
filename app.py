@@ -4,11 +4,22 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 
-# ✅ tu repo tiene src/cleaning_last_report.py (NO src/parsers/...)
+# ✅ tu repo tiene src/cleaning_last_report.py
 from src.cleaning_last_report import build_last_report_view
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
+
+
+# =========================
+# Helpers
+# =========================
+def _norm_apt_name(s: str) -> str:
+    s = "" if s is None else str(s).strip().upper()
+    s = re.sub(r"\s+", " ", s)
+    # "APOLO 029" -> "APOLO 29"
+    s = re.sub(r"\b0+(\d)", r"\1", s)
+    return s
 
 
 # =========================
@@ -152,7 +163,7 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# Google Sheet helpers (para el bloque 8)
+# Google Sheet helpers (día foco)
 # =========================
 def _agg_nonempty(series: pd.Series) -> str:
     vals = []
@@ -205,7 +216,7 @@ def _extract_ops_from_sheet(sheet_df: pd.DataFrame, foco_date: pd.Timestamp) -> 
     if df.empty:
         return pd.DataFrame(columns=["APARTAMENTO", "Incidencias hoy", "Faltantes por entrada", "Reposiciones café"])
 
-    df["_AP"] = df[c_ap].astype(str).str.strip().str.upper()
+    df["_AP"] = df[c_ap].astype(str).str.strip().str.upper().map(_norm_apt_name)
     df = df[df["_AP"].ne("") & df["_AP"].ne("NAN")].copy()
 
     out = df.groupby("_AP", as_index=False).agg(
@@ -217,6 +228,35 @@ def _extract_ops_from_sheet(sheet_df: pd.DataFrame, foco_date: pd.Timestamp) -> 
     )
     out = out.rename(columns={"_AP": "APARTAMENTO"}).sort_values("APARTAMENTO").reset_index(drop=True)
     return out
+
+
+# =========================
+# Presenciales helpers
+# =========================
+PRESENCIALES = {_norm_apt_name(x) for x in ["APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"]}
+
+
+def _get_presenciales_today_df(operativa_df: pd.DataFrame, tz_name: str = "Europe/Madrid") -> pd.DataFrame:
+    if operativa_df is None or operativa_df.empty:
+        return pd.DataFrame()
+
+    tz = ZoneInfo(tz_name)
+    today = pd.Timestamp.now(tz=tz).normalize().date()
+
+    df = operativa_df.copy()
+    if "Día" not in df.columns or "APARTAMENTO" not in df.columns:
+        return pd.DataFrame()
+
+    df["APARTAMENTO_NORM"] = df["APARTAMENTO"].astype(str).str.strip().str.upper().map(_norm_apt_name)
+
+    df_today = df[df["Día"] == today].copy()
+    df_today = df_today[df_today["APARTAMENTO_NORM"].isin(PRESENCIALES)].copy()
+
+    # Solo ENTRADAS del día (si existe Estado)
+    if "Estado" in df_today.columns:
+        df_today = df_today[df_today["Estado"].astype(str).str.upper().str.contains("ENTRADA", na=False)].copy()
+
+    return df_today
 
 
 def main():
@@ -367,7 +407,7 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # ✅ Lee Sheet UNA vez y prepara last_view para reusar
+    # ✅ Lee Sheet UNA vez y prepara last_view
     # ---------------------------------------------------------
     sheet_df = None
     last_view = pd.DataFrame()
@@ -382,7 +422,7 @@ def main():
                 "OTRAS REPOSICIONES": "OTRAS_REPOSICIONES",
                 "INCIDENCIAS/TAREAS A REALIZAR": "INCIDENCIAS",
             }).copy()
-            last_view["APARTAMENTO"] = last_view["APARTAMENTO"].astype(str).str.strip().str.upper()
+            last_view["APARTAMENTO"] = last_view["APARTAMENTO"].astype(str).str.strip().str.upper().map(_norm_apt_name)
     except Exception:
         sheet_df = None
         last_view = pd.DataFrame()
@@ -398,8 +438,31 @@ def main():
     c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
     c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
+    # =========================
+    # ✅ KPI: CHECK-INS PRESENCIALES HOY + DETALLE (clic)
+    # =========================
+    pres_today = _get_presenciales_today_df(dash.get("operativa", pd.DataFrame()))
+    n_pres = int(len(pres_today)) if pres_today is not None else 0
+
+    colP1, colP2 = st.columns([1, 3])
+    with colP1:
+        st.metric("Check-ins presenciales (hoy)", n_pres)
+    with colP2:
+        with st.expander("Ver cuáles (presenciales hoy)", expanded=False):
+            if pres_today is None or pres_today.empty:
+                st.info("No hay check-ins presenciales hoy.")
+            else:
+                show_cols = []
+                for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer"]:
+                    if c in pres_today.columns:
+                        show_cols.append(c)
+                if not show_cols:
+                    show_cols = pres_today.columns.tolist()
+                st.dataframe(pres_today[show_cols].reset_index(drop=True), use_container_width=True)
+
     # =========================================================
-    # 🔎 BUSCADOR GLOBAL POR APARTAMENTO (ARRIBA DEL TODO)
+    # 🔎 BUSCADOR GLOBAL POR APARTAMENTO (sin selección por defecto)
+    #    - No muestra nada hasta que pulses Enter en el input
     # =========================================================
     st.divider()
     st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
@@ -414,6 +477,7 @@ def main():
                 .astype(str)
                 .str.strip()
                 .str.upper()
+                .map(_norm_apt_name)
                 .unique()
                 .tolist()
             )
@@ -421,140 +485,145 @@ def main():
         apts_master = []
 
     apts_operativa = (
-        dash["operativa"]["APARTAMENTO"].dropna().astype(str).str.strip().str.upper().unique().tolist()
+        dash["operativa"]["APARTAMENTO"].dropna().astype(str).str.strip().str.upper().map(_norm_apt_name).unique().tolist()
         if "operativa" in dash and isinstance(dash["operativa"], pd.DataFrame) and not dash["operativa"].empty
         else []
     )
 
     apts_sheet = (
-        last_view["APARTAMENTO"].dropna().astype(str).str.strip().str.upper().unique().tolist()
+        last_view["APARTAMENTO"].dropna().astype(str).str.strip().str.upper().map(_norm_apt_name).unique().tolist()
         if isinstance(last_view, pd.DataFrame) and not last_view.empty and "APARTAMENTO" in last_view.columns
         else []
     )
 
     apts_all = sorted(set([a for a in (apts_master + apts_operativa + apts_sheet) if a]))
 
-    q = st.text_input("Buscar (escribe parte del nombre)", value="", placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE…")
-    if q.strip():
+    # Form para que SOLO ejecute al dar Enter o clicar botón
+    with st.form("apt_search_form", clear_on_submit=False):
+        q = st.text_input(
+            "Buscar (escribe parte del nombre y pulsa Enter)",
+            value="",
+            placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE…",
+        )
+        submitted = st.form_submit_button("Buscar")
+
+    # Si no se ha enviado, no mostramos nada (queda “en blanco”)
+    if submitted:
         filt = q.strip().upper()
-        apts_filtered = [a for a in apts_all if filt in a]
-    else:
-        apts_filtered = apts_all
-
-    if not apts_filtered:
-        st.info("No hay apartamentos que coincidan con esa búsqueda.")
-    else:
-        apt_sel = st.selectbox("Selecciona apartamento", options=apts_filtered, index=0)
-
-        # --- 1) Limpieza (último informe) ---
-        clean_row = None
-        if isinstance(last_view, pd.DataFrame) and not last_view.empty:
-            sub = last_view[last_view["APARTAMENTO"] == apt_sel].copy()
-            if not sub.empty:
-                clean_row = sub.iloc[0].to_dict()
-
-        # --- 2) Operativa del periodo ---
-        op_df = dash["operativa"].copy()
-        op_df["APARTAMENTO"] = op_df["APARTAMENTO"].astype(str).str.strip().str.upper()
-        op_sub = op_df[op_df["APARTAMENTO"] == apt_sel].copy()
-        if "Día" in op_sub.columns:
-            op_sub = op_sub.sort_values("Día")
-
-        # --- 3) Reposición del periodo (por ese apartamento) ---
-        rep_rows = op_sub.copy()
-        # nos quedamos con columnas que suelen existir
-        rep_cols = []
-        for c in ["Día", "ZONA", "Estado", "Lista_reponer", "Completar con"]:
-            if c in rep_rows.columns:
-                rep_cols.append(c)
-        rep_rows = rep_rows[rep_cols].copy() if rep_cols else pd.DataFrame()
-
-        # Construye items (Producto/Cantidad) solo para ese apartamento
-        items_rows = []
-        if not rep_rows.empty:
-            cols_src = []
-            if "Lista_reponer" in rep_rows.columns:
-                cols_src.append("Lista_reponer")
-            if "Completar con" in rep_rows.columns:
-                cols_src.append("Completar con")
-            for _, r in rep_rows.iterrows():
-                for col in cols_src:
-                    txt = r.get(col, "")
-                    if str(txt).strip() == "":
-                        continue
-                    for prod, qty in parse_lista_reponer(txt):
-                        items_rows.append({
-                            "Día": r.get("Día"),
-                            "Producto": prod,
-                            "Cantidad": int(qty),
-                            "Fuente": col,
-                        })
-        items_df_apt = pd.DataFrame(items_rows)
-        if not items_df_apt.empty:
-            totals_apt = (
-                items_df_apt.groupby("Producto", as_index=False)["Cantidad"]
-                .sum()
-                .sort_values(["Cantidad", "Producto"], ascending=[False, True])
-                .reset_index(drop=True)
-            )
+        if filt:
+            apts_filtered = [a for a in apts_all if filt in a]
         else:
-            totals_apt = pd.DataFrame(columns=["Producto", "Cantidad"])
+            apts_filtered = apts_all
 
-        # -------- Render resumen --------
-        tab1, tab2, tab3 = st.tabs(["Resumen", "Operativa", "Reposición"])
+        if not apts_filtered:
+            st.info("No hay apartamentos que coincidan con esa búsqueda.")
+        else:
+            # Selectbox sin valor por defecto: ponemos "— Selecciona —" al principio
+            options = ["— Selecciona apartamento —"] + apts_filtered
+            apt_sel = st.selectbox("Selecciona apartamento", options=options, index=0, key="apt_sel_after_search")
 
-        with tab1:
-            cA, cB = st.columns([1, 1])
+            if apt_sel != "— Selecciona apartamento —":
+                # --- 1) Limpieza (último informe) ---
+                clean_row = None
+                if isinstance(last_view, pd.DataFrame) and not last_view.empty:
+                    sub = last_view[last_view["APARTAMENTO"] == apt_sel].copy()
+                    if not sub.empty:
+                        clean_row = sub.iloc[0].to_dict()
 
-            with cA:
-                st.markdown("**🧽 Último informe de limpieza (Google Sheet)**")
-                if clean_row is None:
-                    st.info("Sin registro de limpieza para este apartamento (o no se pudo leer la Sheet).")
+                # --- 2) Operativa del periodo ---
+                op_df = dash["operativa"].copy()
+                op_df["APARTAMENTO"] = op_df["APARTAMENTO"].astype(str).str.strip().str.upper().map(_norm_apt_name)
+                op_sub = op_df[op_df["APARTAMENTO"] == apt_sel].copy()
+                if "Día" in op_sub.columns:
+                    op_sub = op_sub.sort_values("Día")
+
+                # --- 3) Reposición del periodo (por ese apartamento) ---
+                rep_rows = op_sub.copy()
+                rep_cols = [c for c in ["Día", "ZONA", "Estado", "Lista_reponer", "Completar con"] if c in rep_rows.columns]
+                rep_rows = rep_rows[rep_cols].copy() if rep_cols else pd.DataFrame()
+
+                items_rows = []
+                if not rep_rows.empty:
+                    cols_src = []
+                    if "Lista_reponer" in rep_rows.columns:
+                        cols_src.append("Lista_reponer")
+                    if "Completar con" in rep_rows.columns:
+                        cols_src.append("Completar con")
+                    for _, r in rep_rows.iterrows():
+                        for col in cols_src:
+                            txt = r.get(col, "")
+                            if str(txt).strip() == "":
+                                continue
+                            for prod, qty in parse_lista_reponer(txt):
+                                items_rows.append({
+                                    "Día": r.get("Día"),
+                                    "Producto": prod,
+                                    "Cantidad": int(qty),
+                                    "Fuente": col,
+                                })
+
+                items_df_apt = pd.DataFrame(items_rows)
+                if not items_df_apt.empty:
+                    totals_apt = (
+                        items_df_apt.groupby("Producto", as_index=False)["Cantidad"]
+                        .sum()
+                        .sort_values(["Cantidad", "Producto"], ascending=[False, True])
+                        .reset_index(drop=True)
+                    )
                 else:
-                    ts = clean_row.get("MARCA_TEMPORAL", "")
-                    if isinstance(ts, pd.Timestamp):
-                        ts_txt = ts.strftime("%d/%m/%Y %H:%M")
+                    totals_apt = pd.DataFrame(columns=["Producto", "Cantidad"])
+
+                tab1, tab2, tab3 = st.tabs(["Resumen", "Operativa", "Reposición"])
+
+                with tab1:
+                    cA, cB = st.columns([1, 1])
+
+                    with cA:
+                        st.markdown("**🧽 Último informe de limpieza (Google Sheet)**")
+                        if clean_row is None:
+                            st.info("Sin registro de limpieza para este apartamento (o no se pudo leer la Sheet).")
+                        else:
+                            ts = clean_row.get("MARCA_TEMPORAL", "")
+                            if isinstance(ts, pd.Timestamp):
+                                ts_txt = ts.strftime("%d/%m/%Y %H:%M")
+                            else:
+                                ts_txt = str(ts)
+
+                            st.write(f"**Marca temporal:** {ts_txt}")
+                            st.write(f"**Llaves:** {clean_row.get('LLAVES','')}")
+                            st.write(f"**Otras reposiciones:** {clean_row.get('OTRAS_REPOSICIONES','')}")
+                            st.write(f"**Incidencias:** {clean_row.get('INCIDENCIAS','')}")
+
+                    with cB:
+                        st.markdown("**📅 Operativa (periodo seleccionado)**")
+                        if op_sub.empty:
+                            st.info("Este apartamento no aparece en la operativa del periodo.")
+                        else:
+                            show = op_sub.copy()
+                            cols_show = [c for c in ["Día", "Estado", "ZONA", "Cliente", "Lista_reponer", "Completar con", "Próxima Entrada"] if c in show.columns]
+                            if not cols_show:
+                                cols_show = show.columns.tolist()[:10]
+                            st.dataframe(show[cols_show].reset_index(drop=True), use_container_width=True, height=220)
+
+                with tab2:
+                    st.markdown("**Operativa completa (solo este apartamento)**")
+                    if op_sub.empty:
+                        st.info("Sin filas de operativa en el periodo.")
                     else:
-                        ts_txt = str(ts)
+                        st.dataframe(op_sub.reset_index(drop=True), use_container_width=True)
 
-                    st.write(f"**Marca temporal:** {ts_txt}")
-                    st.write(f"**Llaves:** {clean_row.get('LLAVES','')}")
-                    st.write(f"**Otras reposiciones:** {clean_row.get('OTRAS_REPOSICIONES','')}")
-                    st.write(f"**Incidencias:** {clean_row.get('INCIDENCIAS','')}")
+                with tab3:
+                    st.markdown("**Totales de reposición (solo este apartamento, periodo)**")
+                    if totals_apt.empty:
+                        st.info("No hay reposición detectada en Lista_reponer / Completar con para este apartamento.")
+                    else:
+                        st.dataframe(totals_apt, use_container_width=True, height=260)
 
-            with cB:
-                st.markdown("**📅 Operativa (periodo seleccionado)**")
-                if op_sub.empty:
-                    st.info("Este apartamento no aparece en la operativa del periodo.")
-                else:
-                    show = op_sub.copy()
-                    cols_show = []
-                    for c in ["Día", "Estado", "ZONA", "Entrada", "Salida", "Huésped", "Lista_reponer"]:
-                        if c in show.columns:
-                            cols_show.append(c)
-                    if not cols_show:
-                        cols_show = show.columns.tolist()[:8]
-                    st.dataframe(show[cols_show].reset_index(drop=True), use_container_width=True, height=220)
-
-        with tab2:
-            st.markdown("**Operativa completa (solo este apartamento)**")
-            if op_sub.empty:
-                st.info("Sin filas de operativa en el periodo.")
-            else:
-                st.dataframe(op_sub.reset_index(drop=True), use_container_width=True)
-
-        with tab3:
-            st.markdown("**Totales de reposición (solo este apartamento, periodo)**")
-            if totals_apt.empty:
-                st.info("No hay reposición detectada en Lista_reponer / Completar con para este apartamento.")
-            else:
-                st.dataframe(totals_apt, use_container_width=True, height=260)
-
-            st.markdown("**Detalle por día/fuente**")
-            if items_df_apt.empty:
-                st.info("Sin detalle de reposición.")
-            else:
-                st.dataframe(items_df_apt.sort_values(["Día", "Producto"]).reset_index(drop=True), use_container_width=True)
+                    st.markdown("**Detalle por día/fuente**")
+                    if items_df_apt.empty:
+                        st.info("Sin detalle de reposición.")
+                    else:
+                        st.dataframe(items_df_apt.sort_values(["Día", "Producto"]).reset_index(drop=True), use_container_width=True)
 
     # ==============
     # BLOQUE 8: Sheet (día foco)
@@ -577,7 +646,7 @@ def main():
         st.exception(e)
 
     # =========================================================
-    # ✅ Tabla del último informe (opcional, con toggle)
+    # ✅ Tabla del último informe (opcional)
     # =========================================================
     if sheet_df is not None and not sheet_df.empty and isinstance(last_view, pd.DataFrame) and not last_view.empty:
         st.divider()
@@ -616,12 +685,10 @@ def main():
 
     operativa = dash["operativa"].copy()
 
-    # =========================================================
     # ✅ MERGE: Operativa + ÚLTIMO INFORME (Sheet)
-    # =========================================================
     try:
         if isinstance(last_view, pd.DataFrame) and not last_view.empty:
-            operativa["APARTAMENTO"] = operativa["APARTAMENTO"].astype(str).str.strip().str.upper()
+            operativa["APARTAMENTO"] = operativa["APARTAMENTO"].astype(str).str.strip().str.upper().map(_norm_apt_name)
             operativa = operativa.merge(
                 last_view[["APARTAMENTO", "MARCA_TEMPORAL", "LLAVES", "OTRAS_REPOSICIONES", "INCIDENCIAS"]],
                 on="APARTAMENTO",
