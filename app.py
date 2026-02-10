@@ -73,6 +73,35 @@ def chunk_list(xs, n):
 
 
 # =========================
+# ✅ WRAP de texto largo para que NO se "corte" visualmente
+# (en st.dataframe, si metes saltos de línea, se ve todo)
+# =========================
+_LONG_COLS = ["Lista_reponer", "Completar con"]
+
+
+def _wrap_commas_to_newlines(x: object) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+    # Inserta saltos de línea después de comas para que Streamlit envuelva el texto
+    # y NO se vea como “cortado”.
+    s = re.sub(r"\s*,\s*", ",\n", s)
+    return s
+
+
+def _apply_wrap_long_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in _LONG_COLS:
+        if c in out.columns:
+            out[c] = out[c].apply(_wrap_commas_to_newlines)
+    return out
+
+
+# =========================
 # Styles
 # =========================
 def _style_operativa(df: pd.DataFrame):
@@ -91,6 +120,33 @@ def _style_operativa(df: pd.DataFrame):
         return [""] * len(row)
 
     return df.style.apply(row_style, axis=1)
+
+
+def _df_column_config_for_long_text(df: pd.DataFrame) -> dict:
+    cfg = {}
+    # Ensancha las columnas largas y permite multiline (por \n).
+    # No recorta datos: solo mejora visual.
+    for c in _LONG_COLS:
+        if c in df.columns:
+            cfg[c] = st.column_config.TextColumn(
+                c,
+                help="Texto completo (con saltos de línea).",
+                width="large",
+            )
+    return cfg
+
+
+def _render_operativa_table(df: pd.DataFrame, key: str, height: int | None = None, styled: bool = True):
+    """Render estándar: envuelve texto largo y lo muestra sin 'cortes' visuales."""
+    if df is None or df.empty:
+        st.info("Sin resultados.")
+        return
+    view = _apply_wrap_long_cols(df)
+    colcfg = _df_column_config_for_long_text(view)
+    if styled:
+        st.dataframe(_style_operativa(view), use_container_width=True, height=height, column_config=colcfg)
+    else:
+        st.dataframe(view, use_container_width=True, height=height, column_config=colcfg)
 
 
 # =========================
@@ -185,12 +241,26 @@ def _agg_nonempty(series: pd.Series) -> str:
 
 
 def _kpi_table(df: pd.DataFrame, title: str):
+    st.markdown(f"#### {title}")
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
-    cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"] if c in df.columns]
-    st.markdown(f"#### {title}")
-    st.dataframe(df[cols_show].reset_index(drop=True), use_container_width=True)
+    cols_show = [
+        c
+        for c in [
+            "Día",
+            "ZONA",
+            "APARTAMENTO",
+            "Cliente",
+            "Estado",
+            "Próxima Entrada",
+            "Lista_reponer",
+            "Completar con",
+        ]
+        if c in df.columns
+    ]
+    view = df[cols_show].copy()
+    _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
 
 
 def main():
@@ -302,6 +372,7 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
+
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -315,7 +386,11 @@ def main():
             ap_map.loc[miss, "LAT"] = [p[0] for p in loc_pairs]
             ap_map.loc[miss, "LNG"] = [p[1] for p in loc_pairs]
 
-    ap_map = ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]].dropna(subset=["APARTAMENTO", "ALMACEN"]).drop_duplicates()
+    ap_map = (
+        ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]]
+        .dropna(subset=["APARTAMENTO", "ALMACEN"])
+        .drop_duplicates()
+    )
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
@@ -485,7 +560,13 @@ def main():
             if one.empty:
                 st.info("No encuentro último informe para ese apartamento en la Sheet.")
             else:
-                show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
+                show_cols = [
+                    "Apartamento",
+                    "Último informe",
+                    "LLAVES",
+                    "OTRAS REPOSICIONES",
+                    "INCIDENCIAS/TAREAS A REALIZAR",
+                ]
                 show_cols = [c for c in show_cols if c in one.columns]
                 st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True)
 
@@ -504,7 +585,7 @@ def main():
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
 
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
-            st.dataframe(_style_operativa(op_show), use_container_width=True)
+            _render_operativa_table(op_show, key="apto_operativa", height=min(520, 40 + 35 * len(op_show)), styled=True)
 
         # ===== Reposición (resumen de items en este apto) =====
         st.markdown("### 📦 Reposición (solo este apartamento)")
@@ -524,7 +605,8 @@ def main():
                 if rep_rows.empty:
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
-                    st.dataframe(rep_rows.reset_index(drop=True), use_container_width=True)
+                    _render_operativa_table(rep_rows, key="apto_reposicion", styled=False)
+
     else:
         st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
 
@@ -565,10 +647,13 @@ def main():
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
             show_df = zdf.drop(columns=["ZONA", "__prio", "APARTAMENTO_KEY"], errors="ignore").copy()
-            st.dataframe(
-                _style_operativa(show_df),
-                use_container_width=True,
+
+            # ✅ aquí está la clave: envuelve Lista_reponer / Completar con para ver TODO
+            _render_operativa_table(
+                show_df,
+                key=f"oper_{pd.to_datetime(dia).strftime('%Y%m%d')}_{_apt_key(str(zona_label))}",
                 height=min(520, 40 + 35 * len(show_df)),
+                styled=True,
             )
 
     # =========================
