@@ -167,36 +167,23 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# Google Sheet helpers
+# Viewer texto completo (SIN HTML) + keys únicas (FIX StreamlitDuplicateElementId)
 # =========================
-def _agg_nonempty(series: pd.Series) -> str:
-    vals = []
-    for x in series.tolist():
-        s = str(x).strip()
-        if s and s.lower() not in {"nan", "none"}:
-            vals.append(s)
-    seen = set()
-    out = []
-    for v in vals:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return " | ".join(out)
-
-
-# =========================
-# ✅ SOLUCIÓN SIN HTML: visor de texto completo por fila
-# =========================
-def show_full_text_viewer(df: pd.DataFrame, long_cols=None, title="Ver detalle (texto completo)"):
+def show_full_text_viewer(
+    df: pd.DataFrame,
+    long_cols=None,
+    title="Detalle (texto completo)",
+    key_prefix="fulltext",
+):
     """
-    Muestra un selector de fila y enseña el contenido completo de columnas largas
-    en text_area (copiable y sin truncar). No usa HTML.
+    Selector de fila + muestra el contenido completo de columnas largas en st.text_area.
+    SIN HTML. Evita StreamlitDuplicateElementId usando keys únicas por fila/columna.
     """
     if df is None or df.empty:
         return
 
     if long_cols is None:
-        long_cols = ["Lista_reponer", "Completar con", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
+        long_cols = ["Lista_reponer", "Completar con", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
 
     cols_present = [c for c in long_cols if c in df.columns]
     if not cols_present:
@@ -205,39 +192,48 @@ def show_full_text_viewer(df: pd.DataFrame, long_cols=None, title="Ver detalle (
     with st.expander(f"🔍 {title}", expanded=False):
         df_reset = df.reset_index(drop=True).copy()
 
-        # Lista de filas para elegir (mostramos algo identificativo)
         label_cols = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado"] if c in df_reset.columns]
         if label_cols:
-            labels = []
-            for i, r in df_reset[label_cols].iterrows():
-                labels.append(f"{i} · " + " | ".join(str(r[c]) for c in label_cols))
+            labels = df_reset[label_cols].astype(str).fillna("").agg(" · ".join, axis=1).tolist()
         else:
-            labels = [str(i) for i in range(len(df_reset))]
+            labels = [f"Fila {i}" for i in range(len(df_reset))]
 
-        sel = st.selectbox("Selecciona fila", options=list(range(len(df_reset))), format_func=lambda i: labels[i])
+        default_idx = 0
+        if "APARTAMENTO" in df_reset.columns and df_reset["APARTAMENTO"].notna().any():
+            default_idx = 0
 
-        row = df_reset.iloc[int(sel)]
+        sel = st.selectbox(
+            "Selecciona una fila para ver el texto completo",
+            options=list(range(len(df_reset))),
+            format_func=lambda i: labels[i],
+            index=default_idx,
+            key=f"{key_prefix}_row_select",
+        )
+
+        row = df_reset.iloc[int(sel)].to_dict()
 
         for c in cols_present:
+            val = "" if pd.isna(row.get(c)) else str(row.get(c))
             st.text_area(
-                f"{c} (completo)",
-                value="" if pd.isna(row.get(c)) else str(row.get(c)),
-                height=140,
+                label=f"{c} (completo)",
+                value=val,
+                height=160,
+                key=f"{key_prefix}_{sel}_{_apt_key(row.get('APARTAMENTO',''))}_{c}",
             )
 
 
+# =========================
+# KPI tabla helper
+# =========================
 def _kpi_table(df: pd.DataFrame, title: str):
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
     cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"] if c in df.columns]
     st.markdown(f"#### {title}")
-
-    # Tabla normal (puede truncar visualmente)
     st.dataframe(df[cols_show].reset_index(drop=True), use_container_width=True)
-
-    # ✅ Visor de texto completo (sin truncado)
-    show_full_text_viewer(df[cols_show], title="Detalle KPI (Lista_reponer / Completar con)")
+    # visor completo para reposición (sin cortar)
+    show_full_text_viewer(df[cols_show], long_cols=["Lista_reponer", "Completar con"], title="Texto completo (entradas/salidas) – reposición", key_prefix=f"kpi_{_apt_key(title)}")
 
 
 def main():
@@ -247,6 +243,7 @@ def main():
     from src.dashboard import build_dashboard_frames
     from src.gsheets import read_sheet_df
 
+    # build_last_report_view puede estar en src/cleaning_last_report.py o src/parsers/cleaning_last_report.py
     try:
         from src.cleaning_last_report import build_last_report_view
     except Exception:
@@ -348,6 +345,7 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
+
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -396,7 +394,7 @@ def main():
     )
 
     # =========================
-    # ✅ DASHBOARD ARRIBA + "CLICK" (botones)
+    # ✅ DASHBOARD ARRIBA + "CLICK" para ver listados
     # =========================
     if "kpi_open" not in st.session_state:
         st.session_state["kpi_open"] = ""
@@ -427,32 +425,32 @@ def main():
 
     with c1:
         st.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
-        if st.button("Ver entradas", key="kpi_btn_entradas"):
+        if st.button("Ver", key="kpi_btn_entradas"):
             st.session_state["kpi_open"] = "entradas"
 
     with c2:
         st.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
-        if st.button("Ver salidas", key="kpi_btn_salidas"):
+        if st.button("Ver", key="kpi_btn_salidas"):
             st.session_state["kpi_open"] = "salidas"
 
     with c3:
         st.metric("Turnovers", kpis.get("turnovers_dia", 0))
-        if st.button("Ver turnovers", key="kpi_btn_turnovers"):
+        if st.button("Ver", key="kpi_btn_turnovers"):
             st.session_state["kpi_open"] = "turnovers"
 
     with c4:
         st.metric("Ocupados", kpis.get("ocupados_dia", 0))
-        if st.button("Ver ocupados", key="kpi_btn_ocupados"):
+        if st.button("Ver", key="kpi_btn_ocupados"):
             st.session_state["kpi_open"] = "ocupados"
 
     with c5:
         st.metric("Vacíos", kpis.get("vacios_dia", 0))
-        if st.button("Ver vacíos", key="kpi_btn_vacios"):
+        if st.button("Ver", key="kpi_btn_vacios"):
             st.session_state["kpi_open"] = "vacios"
 
     with c6:
         st.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
-        if st.button("Ver presenciales", key="kpi_btn_presenciales"):
+        if st.button("Ver", key="kpi_btn_presenciales"):
             st.session_state["kpi_open"] = "presenciales"
 
     kpi_open = st.session_state.get("kpi_open", "")
@@ -483,8 +481,10 @@ def main():
         elif kpi_open == "presenciales":
             _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}")
 
+        st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
+
     # =========================
-    # 🔎 BUSCADOR PRINCIPAL
+    # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
     # =========================
     st.divider()
     st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
@@ -505,6 +505,7 @@ def main():
 
     apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
 
+    # Cargar sheet + construir último informe por apto
     last_view = pd.DataFrame()
     try:
         sheet_df = read_sheet_df()
@@ -527,7 +528,14 @@ def main():
                 show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
                 show_cols = [c for c in show_cols if c in one.columns]
                 st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True)
-                show_full_text_viewer(one[show_cols], title="Detalle limpieza (texto completo)")
+
+                # visor texto completo limpieza (si es largo)
+                show_full_text_viewer(
+                    one[show_cols],
+                    long_cols=["LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"],
+                    title="Texto completo (limpieza)",
+                    key_prefix=f"limpieza_{apt_key_sel}",
+                )
 
         st.markdown("### 🧾 Parte Operativo (solo este apartamento)")
         op_one = oper_all[oper_all["APARTAMENTO_KEY"] == apt_key_sel].copy()
@@ -541,21 +549,19 @@ def main():
 
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
-
             st.dataframe(_style_operativa(op_show), use_container_width=True)
-            show_full_text_viewer(op_show, title="Detalle operativa (texto completo)")
 
         st.markdown("### 📦 Reposición (solo este apartamento)")
         if op_one.empty:
             st.info("Sin reposición (no hay operativa para este apartamento).")
         else:
             cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
-            rep_rows = op_one[["Día", "ZONA", "APARTAMENTO"] + cols_rep].copy() if cols_rep else pd.DataFrame()
+            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado"]].copy() if cols_rep else pd.DataFrame()
             if rep_rows.empty:
                 st.info("No veo columnas de reposición en la operativa para este apartamento.")
             else:
                 rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
-                    lambda r: any(str(x).strip().lower() not in {"", "nan", "none"} for x in r),
+                    lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
                     axis=1,
                 )
                 rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
@@ -563,7 +569,14 @@ def main():
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
                     st.dataframe(rep_rows.reset_index(drop=True), use_container_width=True)
-                    show_full_text_viewer(rep_rows, title="Detalle reposición (texto completo)")
+
+                    # ✅ AQUÍ está la solución SIN HTML para ver TODO el texto
+                    show_full_text_viewer(
+                        rep_rows.reset_index(drop=True),
+                        long_cols=["Lista_reponer", "Completar con"],
+                        title="Texto completo (reposiciones)",
+                        key_prefix=f"repos_{apt_key_sel}",
+                    )
     else:
         st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
 
@@ -604,15 +617,22 @@ def main():
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
             show_df = zdf.drop(columns=["ZONA", "__prio", "APARTAMENTO_KEY"], errors="ignore").copy()
-
             st.dataframe(
                 _style_operativa(show_df),
                 use_container_width=True,
                 height=min(520, 40 + 35 * len(show_df)),
             )
 
-            # ✅ visor para leer TODO sin truncado (sin HTML)
-            show_full_text_viewer(show_df, title=f"Detalle {zona_label} · {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
+            # ✅ visor texto completo para este bloque (evita el “corte”)
+            # Solo si hay columnas largas
+            long_cols = [c for c in ["Lista_reponer", "Completar con"] if c in show_df.columns]
+            if long_cols:
+                show_full_text_viewer(
+                    show_df.reset_index(drop=True),
+                    long_cols=long_cols,
+                    title=f"Texto completo (día {pd.to_datetime(dia).strftime('%d/%m/%Y')} · {zona_label})",
+                    key_prefix=f"bloque_{pd.to_datetime(dia).strftime('%Y%m%d')}_{_apt_key(zona_label)}",
+                )
 
     # =========================
     # SUGERENCIA DE REPOSICIÓN
