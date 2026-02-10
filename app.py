@@ -4,7 +4,6 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 import unicodedata
-import html
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
@@ -25,79 +24,6 @@ def _apt_key(s: str) -> str:
     # Quita ceros iniciales en números sueltos: "APOLO 029" -> "APOLO 29"
     s = re.sub(r"\b0+(\d)", r"\1", s)
     return s.upper().strip()
-
-
-# =========================
-# HTML table con WRAP (para textos largos)
-# =========================
-def dataframe_wrap(df: pd.DataFrame, height_px: int = 520):
-    """
-    Renderiza un DataFrame como HTML con texto envuelto (wrap) y scroll.
-    Ideal para columnas largas (Lista_reponer / Completar con) porque st.dataframe trunca.
-    """
-    if df is None or df.empty:
-        st.info("Sin datos.")
-        return
-
-    df2 = df.copy()
-
-    # Escapar HTML para evitar problemas con caracteres raros
-    for c in df2.columns:
-        df2[c] = df2[c].map(lambda x: html.escape("" if x is None else str(x)))
-
-    css = f"""
-    <style>
-    .dfwrap {{
-        width: 100%;
-        max-height: {int(height_px)}px;
-        overflow: auto;
-        border: 1px solid #e6e6e6;
-        border-radius: 10px;
-    }}
-    .dfwrap table {{
-        width: 100%;
-        border-collapse: collapse;
-        table-layout: fixed; /* clave */
-        font-size: 0.92rem;
-    }}
-    .dfwrap th, .dfwrap td {{
-        border-bottom: 1px solid #f0f0f0;
-        padding: 10px 10px;
-        vertical-align: top;
-        white-space: normal;       /* wrap */
-        word-break: break-word;    /* wrap */
-        overflow-wrap: anywhere;   /* wrap */
-    }}
-    .dfwrap th {{
-        position: sticky;
-        top: 0;
-        background: #fafafa;
-        z-index: 1;
-        text-align: left;
-    }}
-    </style>
-    """
-
-    html_table = df2.to_html(index=False, escape=False)
-    st.markdown(css + f'<div class="dfwrap">{html_table}</div>', unsafe_allow_html=True)
-
-
-def _smart_table(df: pd.DataFrame, height_px: int = 520, prefer_wrap_cols=None):
-    """
-    Si detecta columnas largas, usa dataframe_wrap(). Si no, usa st.dataframe normal.
-    """
-    if prefer_wrap_cols is None:
-        prefer_wrap_cols = {"Lista_reponer", "Completar con", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"}
-
-    if df is None or df.empty:
-        st.info("Sin datos.")
-        return
-
-    cols = set(df.columns.astype(str).tolist())
-    if len(cols.intersection(set(prefer_wrap_cols))) > 0:
-        dataframe_wrap(df, height_px=height_px)
-    else:
-        st.dataframe(df, use_container_width=True, height=height_px)
 
 
 # =========================
@@ -147,7 +73,7 @@ def chunk_list(xs, n):
 
 
 # =========================
-# Styles (solo para el dataframe normal)
+# Styles
 # =========================
 def _style_operativa(df: pd.DataFrame):
     colors = {
@@ -256,6 +182,15 @@ def _agg_nonempty(series: pd.Series) -> str:
             seen.add(v)
             out.append(v)
     return " | ".join(out)
+
+
+def _kpi_table(df: pd.DataFrame, title: str):
+    if df is None or df.empty:
+        st.info("Sin resultados.")
+        return
+    cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"] if c in df.columns]
+    st.markdown(f"#### {title}")
+    st.dataframe(df[cols_show].reset_index(drop=True), use_container_width=True)
 
 
 def main():
@@ -415,15 +350,22 @@ def main():
     )
 
     # =========================
-    # KPIs dashboard
+    # ✅ DASHBOARD ARRIBA + "CLICK" (botones) para ver listados
     # =========================
-    kpis = dash.get("kpis", {})
+    if "kpi_open" not in st.session_state:
+        st.session_state["kpi_open"] = ""
+
     tz = ZoneInfo("Europe/Madrid")
     today = pd.Timestamp.now(tz=tz).normalize().date()
+    foco_day = pd.Timestamp(dash.get("period_start")).normalize().date()
 
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
+    # Filas del "día foco"
+    oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
+
+    # Presenciales HOY
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
 
@@ -433,18 +375,72 @@ def main():
         & (oper_all["APARTAMENTO_KEY"].isin(presencial_keys))
     ].copy()
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
-    c2.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
-    c3.metric("Turnovers", kpis.get("turnovers_dia", 0))
-    c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
-    c5.metric("Vacíos", kpis.get("vacios_dia", 0))
-    c6.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
+    kpis = dash.get("kpis", {})
+    st.divider()
+    st.subheader("📊 Dashboard (día foco)")
 
-    if len(pres_today) > 0:
-        with st.expander("Ver check-ins presenciales (HOY)", expanded=False):
-            cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"] if c in pres_today.columns]
-            _smart_table(pres_today[cols_show].reset_index(drop=True), height_px=420)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+    with c1:
+        st.metric("Entradas (día foco)", kpis.get("entradas_dia", 0))
+        if st.button("Ver entradas", key="kpi_btn_entradas"):
+            st.session_state["kpi_open"] = "entradas"
+
+    with c2:
+        st.metric("Salidas (día foco)", kpis.get("salidas_dia", 0))
+        if st.button("Ver salidas", key="kpi_btn_salidas"):
+            st.session_state["kpi_open"] = "salidas"
+
+    with c3:
+        st.metric("Turnovers", kpis.get("turnovers_dia", 0))
+        if st.button("Ver turnovers", key="kpi_btn_turnovers"):
+            st.session_state["kpi_open"] = "turnovers"
+
+    with c4:
+        st.metric("Ocupados", kpis.get("ocupados_dia", 0))
+        if st.button("Ver ocupados", key="kpi_btn_ocupados"):
+            st.session_state["kpi_open"] = "ocupados"
+
+    with c5:
+        st.metric("Vacíos", kpis.get("vacios_dia", 0))
+        if st.button("Ver vacíos", key="kpi_btn_vacios"):
+            st.session_state["kpi_open"] = "vacios"
+
+    with c6:
+        st.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
+        if st.button("Ver presenciales", key="kpi_btn_presenciales"):
+            st.session_state["kpi_open"] = "presenciales"
+
+    # Render del listado "clicado"
+    kpi_open = st.session_state.get("kpi_open", "")
+    if kpi_open:
+        st.divider()
+        st.subheader("📌 Detalle KPI")
+
+        if kpi_open == "entradas":
+            df = oper_foco[oper_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])].copy()
+            _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "salidas":
+            df = oper_foco[oper_foco["Estado"].isin(["SALIDA", "ENTRADA+SALIDA"])].copy()
+            _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "turnovers":
+            df = oper_foco[oper_foco["Estado"].isin(["ENTRADA+SALIDA"])].copy()
+            _kpi_table(df, f"Turnovers · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "ocupados":
+            df = oper_foco[oper_foco["Estado"].isin(["OCUPADO"])].copy()
+            _kpi_table(df, f"Ocupados · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "vacios":
+            df = oper_foco[oper_foco["Estado"].isin(["VACIO"])].copy()
+            _kpi_table(df, f"Vacíos · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+
+        elif kpi_open == "presenciales":
+            _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}")
+
+        st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
     # =========================
     # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
@@ -463,7 +459,7 @@ def main():
         placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE...",
     )
 
-    if st.button("Buscar"):
+    if st.button("Buscar", key="btn_buscar_apto"):
         st.session_state["apt_selected_key"] = _apt_key(st.session_state["apt_query"])
 
     apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
@@ -491,7 +487,7 @@ def main():
             else:
                 show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
                 show_cols = [c for c in show_cols if c in one.columns]
-                _smart_table(one[show_cols].reset_index(drop=True), height_px=220)
+                st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True)
 
         # ===== Operativa =====
         st.markdown("### 🧾 Parte Operativo (solo este apartamento)")
@@ -506,35 +502,34 @@ def main():
                 op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
 
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
+
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
+            st.dataframe(_style_operativa(op_show), use_container_width=True)
 
-            # Si hay columnas largas, usar wrap
-            _smart_table(op_show.reset_index(drop=True), height_px=420)
-
-        # ===== Reposición (solo ese apto) =====
+        # ===== Reposición (resumen de items en este apto) =====
         st.markdown("### 📦 Reposición (solo este apartamento)")
         if op_one.empty:
             st.info("Sin reposición (no hay operativa para este apartamento).")
         else:
             cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
-            if not cols_rep:
+            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
+            if rep_rows.empty:
                 st.info("No veo columnas de reposición en la operativa para este apartamento.")
             else:
-                rep_rows = op_one[["Día", "ZONA", "APARTAMENTO"] + cols_rep].copy()
-                rep_rows["__has_rep"] = rep_rows[cols_rep].astype(str).apply(
-                    lambda r: any(str(x).strip().lower() not in {"", "nan", "none"} for x in r), axis=1
+                rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
+                    lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
+                    axis=1,
                 )
-                rep_rows = rep_rows[rep_rows["__has_rep"]].drop(columns=["__has_rep"], errors="ignore")
+                rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
                 if rep_rows.empty:
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
-                    _smart_table(rep_rows.reset_index(drop=True), height_px=320)
-
+                    st.dataframe(rep_rows.reset_index(drop=True), use_container_width=True)
     else:
         st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
 
     # =========================
-    # Descargar Excel
+    # Descarga Excel
     # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
@@ -569,22 +564,12 @@ def main():
         for zona, zdf in ddf.groupby("ZONA", dropna=False):
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
-
             show_df = zdf.drop(columns=["ZONA", "__prio", "APARTAMENTO_KEY"], errors="ignore").copy()
-
-            # ✅ Wrap automático si hay columnas largas
-            # Si NO hay columnas largas, mantenemos tu tabla “bonita” con colores.
-            long_cols = {"Lista_reponer", "Completar con"}
-            height_px = min(520, 80 + 32 * len(show_df))
-
-            if any(c in show_df.columns for c in long_cols):
-                _smart_table(show_df.reset_index(drop=True), height_px=height_px)
-            else:
-                st.dataframe(
-                    _style_operativa(show_df),
-                    use_container_width=True,
-                    height=height_px,
-                )
+            st.dataframe(
+                _style_operativa(show_df),
+                use_container_width=True,
+                height=min(520, 40 + 35 * len(show_df)),
+            )
 
     # =========================
     # SUGERENCIA DE REPOSICIÓN
@@ -605,10 +590,10 @@ def main():
         colA, colB = st.columns([1, 2])
         with colA:
             st.markdown("**Totales (preparar carrito)**")
-            _smart_table(totals_df, height_px=min(520, 40 + 35 * len(totals_df)))
+            st.dataframe(totals_df, use_container_width=True, height=min(520, 40 + 35 * len(totals_df)))
         with colB:
             st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
-            _smart_table(items_df, height_px=min(520, 40 + 28 * min(len(items_df), 25)))
+            st.dataframe(items_df, use_container_width=True, height=min(520, 40 + 28 * min(len(items_df), 25)))
 
     # =========================
     # RUTAS GOOGLE MAPS
