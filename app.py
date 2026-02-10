@@ -4,6 +4,10 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 
+# ✅ IMPORT CORRECTO (tu repo tiene src/cleaning_last_report.py)
+from src.cleaning_last_report import build_last_report_view
+
+
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
@@ -184,10 +188,10 @@ def _extract_ops_from_sheet(sheet_df: pd.DataFrame, foco_date: pd.Timestamp) -> 
             return df.columns[idx_fallback]
         return None
 
-    c_ts = pick_col(["marca temporal", "timestamp", "fecha", "marca"], 0)      # A
-    c_ap = pick_col(["apartamento"], 1)                                       # B
-    c_inc = pick_col(["incidencias a realizar", "incidencias"], 6)           # G
-    c_falt = pick_col(["faltantes por entrada", "faltantes"], 16)            # Q
+    c_ts = pick_col(["marca temporal", "timestamp", "fecha", "marca"], 0)  # A
+    c_ap = pick_col(["apartamento"], 1)  # B
+    c_inc = pick_col(["incidencias a realizar", "incidencias"], 6)  # G
+    c_falt = pick_col(["faltantes por entrada", "faltantes"], 16)  # Q
     c_cafe = pick_col(["faltantes reposiciones café", "reposiciones café", "café"], 18)  # S
 
     if not c_ts or not c_ap:
@@ -314,6 +318,7 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
+
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -377,6 +382,9 @@ def main():
     foco_date = pd.Timestamp(dash["period_start"])
     ops_today = pd.DataFrame(columns=["APARTAMENTO", "Incidencias hoy", "Faltantes por entrada", "Reposiciones café"])
 
+    # Dejamos sheet_df en scope para luego hacer MERGE con operativa
+    sheet_df = None
+
     try:
         sheet_df = read_sheet_df()
         if sheet_df is None or sheet_df.empty:
@@ -384,13 +392,54 @@ def main():
         else:
             ops_today = _extract_ops_from_sheet(sheet_df, foco_date)
 
-            colX, colY, colZ = st.columns(3)
-            colX.metric("Aptos con incidencias hoy", int((ops_today["Incidencias hoy"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-            colY.metric("Aptos con faltantes por entrada", int((ops_today["Faltantes por entrada"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-            colZ.metric("Aptos con reposición café", int((ops_today["Reposiciones café"].astype(str).str.strip() != "").sum()) if not ops_today.empty else 0)
-
             with st.expander("Ver detalle (hoy)", expanded=False):
                 st.dataframe(ops_today, use_container_width=True)
+
+            # =========================================================
+            # ✅ ÚLTIMO INFORME POR APARTAMENTO (Marca temporal)
+            #    - SIN KPIs
+            # =========================================================
+            st.divider()
+            st.subheader("🧩 Último informe de limpieza por apartamento (según Marca temporal)")
+
+            try:
+                last_view_raw = build_last_report_view(sheet_df)
+
+                # Normalizamos nombres (sin tildes) para usarlo en la app
+                last_view = last_view_raw.rename(columns={
+                    "Apartamento": "APARTAMENTO",
+                    "Último informe": "MARCA_TEMPORAL",
+                    "LLAVES": "LLAVES",
+                    "OTRAS REPOSICIONES": "OTRAS_REPOSICIONES",
+                    "INCIDENCIAS/TAREAS A REALIZAR": "INCIDENCIAS",
+                }).copy()
+
+                last_view["APARTAMENTO"] = last_view["APARTAMENTO"].astype(str).str.strip().str.upper()
+
+                only_alerts_last = st.toggle(
+                    "Mostrar solo apartamentos con algo que revisar",
+                    value=True,
+                    key="only_alerts_last",
+                )
+
+                view_to_show = last_view.copy()
+                if only_alerts_last:
+                    view_to_show = view_to_show[
+                        view_to_show["flag_llaves"] | view_to_show["flag_otras_repos"] | view_to_show["flag_incidencias"]
+                    ].copy()
+
+                show_cols = ["APARTAMENTO", "MARCA_TEMPORAL", "LLAVES", "OTRAS_REPOSICIONES", "INCIDENCIAS"]
+                show_df = view_to_show[show_cols].copy()
+
+                if pd.api.types.is_datetime64_any_dtype(show_df["MARCA_TEMPORAL"]):
+                    show_df["MARCA_TEMPORAL"] = show_df["MARCA_TEMPORAL"].dt.strftime("%d/%m/%Y %H:%M")
+
+                st.dataframe(show_df, use_container_width=True)
+
+            except Exception as e:
+                st.warning("No pude construir el 'último informe por apartamento'.")
+                st.exception(e)
+
     except Exception as e:
         st.warning("No pude leer el Google Sheet. Revisa Secrets + compartir con service account.")
         st.exception(e)
@@ -410,6 +459,32 @@ def main():
     st.caption(f"Periodo: {dash['period_start']} → {dash['period_end']} · Prioridad: Entradas arriba · Agrupado por ZONA")
 
     operativa = dash["operativa"].copy()
+
+    # =========================================================
+    # ✅ MERGE: Operativa + ÚLTIMO INFORME (Sheet)
+    # =========================================================
+    try:
+        if sheet_df is not None and not sheet_df.empty:
+            last_view_raw = build_last_report_view(sheet_df)
+            last_view = last_view_raw.rename(columns={
+                "Apartamento": "APARTAMENTO",
+                "Último informe": "MARCA_TEMPORAL",
+                "LLAVES": "LLAVES",
+                "OTRAS REPOSICIONES": "OTRAS_REPOSICIONES",
+                "INCIDENCIAS/TAREAS A REALIZAR": "INCIDENCIAS",
+            }).copy()
+
+            last_view["APARTAMENTO"] = last_view["APARTAMENTO"].astype(str).str.strip().str.upper()
+            operativa["APARTAMENTO"] = operativa["APARTAMENTO"].astype(str).str.strip().str.upper()
+
+            operativa = operativa.merge(
+                last_view[["APARTAMENTO", "MARCA_TEMPORAL", "LLAVES", "OTRAS_REPOSICIONES", "INCIDENCIAS"]],
+                on="APARTAMENTO",
+                how="left",
+            )
+    except Exception as e:
+        st.warning("No pude enlazar Operativa con el último informe del Google Sheet.")
+        st.exception(e)
 
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
