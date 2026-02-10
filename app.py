@@ -8,6 +8,7 @@ import unicodedata
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
+
 # =========================
 # Apartamento key (matching robusto)
 # =========================
@@ -92,68 +93,57 @@ def _style_operativa(df: pd.DataFrame):
     return df.style.apply(row_style, axis=1)
 
 
-def _safe_height(n_rows: int, row_px: int = 34, base_px: int = 80, max_px: int = 680) -> int:
-    # Streamlit NO acepta None; siempre int > 0
-    h = base_px + row_px * max(1, int(n_rows))
-    return int(min(max_px, max(220, h)))
-
-
+# =========================
+# Render helper (NO HTML) + no cortar texto
+# =========================
 def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
+    """
+    Streamlit corta texto por:
+      - ancho de columna
+      - y, en algunas versiones, por max_chars interno
+
+    Solución sin HTML:
+      - column_config TextColumn con width="large" y max_chars MUY alto
+      - height="content" para evitar errores y que el grid crezca lo justo
+    """
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
 
     view = df.copy()
 
-    # Column_config para favorecer lectura; no "soluciona" truncado visual,
-    # pero ayuda + dejamos "visor de texto completo" debajo.
     colcfg = {}
-    for c in ["Lista_reponer", "Completar con"]:
+    # fuerza a NO truncar strings en estas columnas
+    for c in ["Lista_reponer", "Completar con", "Producto", "Cliente"]:
         if c in view.columns:
             colcfg[c] = st.column_config.TextColumn(
                 c,
                 width="large",
+                max_chars=10000,  # <- clave: evita truncado por límite interno
             )
 
-    height = _safe_height(len(view))
+    # también suele venir bien ensanchar APARTAMENTO
+    if "APARTAMENTO" in view.columns:
+        colcfg["APARTAMENTO"] = st.column_config.TextColumn("APARTAMENTO", width="medium", max_chars=5000)
 
+    # evita el None que te dio el error: height debe ser int/'content'/'stretch'
     if styled:
-        st.dataframe(_style_operativa(view), use_container_width=True, height=height, column_config=colcfg)
+        st.dataframe(_style_operativa(view), use_container_width=True, height="content", column_config=colcfg)
     else:
-        st.dataframe(view, use_container_width=True, height=height, column_config=colcfg)
+        st.dataframe(view, use_container_width=True, height="content", column_config=colcfg)
 
 
 # =========================
-# Reposición parsing + normalización
+# Reposición parsing
 # =========================
 _ITEM_RX = re.compile(r"^\s*(.*?)\s*x\s*([0-9]+)\s*$", re.IGNORECASE)
-
-DISPLAY_MAP = {
-    # Lo que tú quieres ver “bonito”
-    _apt_key("Capsula Tassimo"): "Tassimo",
-    _apt_key("Café en cápsula Colombia"): "Nespresso",
-    _apt_key("Champu Rituals"): "Champu",
-    _apt_key("Café Natural Molido"): "Café Molido",
-    _apt_key("Azúcar blanco en sobres Hacendado - Caja / 50 sobres"): "Caja Azucar",
-    # el resto se deja tal cual (p.ej. Detergente, Gel de manos...)
-}
-
-COFFEE_BY_TIPO = {
-    "Tassimo": _apt_key("Capsula Tassimo"),
-    "Nespresso": _apt_key("Café en cápsula Colombia"),
-    "Molido": _apt_key("Café Natural Molido"),
-}
-
-def _display_name(amenity: str) -> str:
-    k = _apt_key(amenity)
-    return DISPLAY_MAP.get(k, amenity)
 
 
 def parse_lista_reponer(s: str):
     if s is None:
         return []
     txt = str(s).strip()
-    if not txt or txt.lower() in {"nan", "none"}:
+    if not txt:
         return []
     parts = [p.strip() for p in txt.split(",") if p.strip()]
     out = []
@@ -167,154 +157,6 @@ def parse_lista_reponer(s: str):
         else:
             out.append((p, 1))
     return out
-
-
-def _pick_qty_col(rep_df: pd.DataFrame) -> str | None:
-    """
-    Detecta la columna que representa "cantidad a reponer" hacia máximo.
-    Esto evita depender de nombres exactos en src.normalize.
-    """
-    if rep_df is None or rep_df.empty:
-        return None
-
-    blacklist = {"min", "max", "stock", "exist", "cantidad_stock", "cantidad_stock_real"}
-    candidates = []
-    for c in rep_df.columns:
-        lc = str(c).strip().lower()
-        if lc in blacklist:
-            continue
-        if any(x in lc for x in ["to_max", "reponer", "need", "qty", "a_reponer", "replen", "faltan", "faltante"]):
-            candidates.append(c)
-
-    # Si hay candidatos "semánticos", probamos el que más suma positiva tenga.
-    def score(col):
-        try:
-            s = pd.to_numeric(rep_df[col], errors="coerce").fillna(0)
-            return float(s[s > 0].sum())
-        except Exception:
-            return 0.0
-
-    if candidates:
-        best = sorted(candidates, key=score, reverse=True)[0]
-        if score(best) > 0:
-            return best
-
-    # Fallback: primera numérica que tenga suma positiva relevante y no sea Min/Max/Stock
-    numeric_cols = []
-    for c in rep_df.columns:
-        if c in {"ALMACEN", "Amenity", "AmenityKey"}:
-            continue
-        try:
-            s = pd.to_numeric(rep_df[c], errors="coerce")
-            if s.notna().any():
-                numeric_cols.append(c)
-        except Exception:
-            pass
-
-    if not numeric_cols:
-        return None
-
-    best = sorted(numeric_cols, key=score, reverse=True)[0]
-    return best if score(best) > 0 else None
-
-
-def _rep_to_text_by_almacen(
-    rep_df: pd.DataFrame,
-    cafe_tipo_by_apto: dict[str, str],
-    apt_to_alm: dict[str, str],
-    master_amenities: set[str] | None = None,
-):
-    """
-    Construye texto COMPLETO (sin recortes) desde el dataframe de reposición por almacén.
-    Filtra el café según CAFE_TIPO del apartamento, para evitar mezclar Tassimo/Nespresso/Molido.
-    """
-    out_lista = {}  # (apto)->texto
-    if rep_df is None or rep_df.empty:
-        return out_lista
-
-    qty_col = _pick_qty_col(rep_df)
-    if qty_col is None:
-        return out_lista
-
-    # Detecta columna de amenity "humana"
-    amen_col = None
-    for c in ["Amenity", "AmenityName", "AmenityLabel"]:
-        if c in rep_df.columns:
-            amen_col = c
-            break
-    if amen_col is None:
-        # fallback: si no existe, usamos AmenityKey
-        for c in ["AmenityKey", "Amenity_key", "amenity_key"]:
-            if c in rep_df.columns:
-                amen_col = c
-                break
-    if amen_col is None:
-        return out_lista
-
-    rep = rep_df.copy()
-    rep["__qty"] = pd.to_numeric(rep[qty_col], errors="coerce").fillna(0).astype(int)
-    rep = rep[rep["__qty"] > 0].copy()
-    if rep.empty:
-        return out_lista
-
-    rep["__amen"] = rep[amen_col].astype(str)
-
-    # Normalización contra maestro (si existe) para evitar "Inse", "Det", etc.
-    # Nota: aquí no “inventamos” amenities; solo forzamos a los del maestro si encajan por prefijo.
-    if master_amenities:
-        master_keys = { _apt_key(x): x for x in master_amenities }
-
-        def normalize_to_master(x: str) -> str:
-            k = _apt_key(x)
-            if k in master_keys:
-                return master_keys[k]
-            # prefijo único (ej: INSE -> INSECTICIDA)
-            hits = [v for kk, v in master_keys.items() if kk.startswith(k) and k]
-            if len(hits) == 1:
-                return hits[0]
-            # prefijo inverso (ej: AZUCAR BLANCO... si viene más largo/variado)
-            hits2 = [v for kk, v in master_keys.items() if k.startswith(kk) and kk]
-            if len(hits2) == 1:
-                return hits2[0]
-            return x
-
-        rep["__amen_norm"] = rep["__amen"].map(normalize_to_master)
-    else:
-        rep["__amen_norm"] = rep["__amen"]
-
-    # Construye por ALMACEN una lista (amenity, qty)
-    by_alm = {}
-    for alm, g in rep.groupby("ALMACEN"):
-        items = []
-        for _, r in g.iterrows():
-            items.append((str(r["__amen_norm"]), int(r["__qty"])))
-        by_alm[str(alm).strip()] = items
-
-    # Ahora para cada apartamento, filtra café según su tipo, y aplica DISPLAY_MAP
-    for apt, alm in apt_to_alm.items():
-        alm = str(alm).strip()
-        items = by_alm.get(alm, [])
-        if not items:
-            continue
-
-        cafe_tipo = str(cafe_tipo_by_apto.get(apt, "")).strip()
-        cafe_key = COFFEE_BY_TIPO.get(cafe_tipo, None)  # amenity key normalizada del café permitido
-
-        built = []
-        for amen, qty in items:
-            ak = _apt_key(amen)
-
-            # Si es uno de los 3 cafés, solo incluir el que toca para ese apto
-            if ak in { _apt_key("Capsula Tassimo"), _apt_key("Café en cápsula Colombia"), _apt_key("Café Natural Molido") }:
-                if cafe_key is None or ak != cafe_key:
-                    continue
-
-            label = _display_name(amen)
-            built.append(f"{label} x{qty}")
-
-        out_lista[apt] = ", ".join(built)
-
-    return out_lista
 
 
 def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_completar: bool = False):
@@ -332,7 +174,7 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
     for _, r in df.iterrows():
         for col in cols:
             txt = r.get(col, "")
-            if str(txt).strip() == "" or str(txt).strip().lower() in {"nan", "none"}:
+            if str(txt).strip() == "":
                 continue
             items = parse_lista_reponer(txt)
             for prod, qty in items:
@@ -365,65 +207,44 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# Visor SIN HTML para texto completo (por fila)
+# Google Sheet helpers
 # =========================
-def show_full_text_viewer(df: pd.DataFrame, title: str, key_prefix: str):
-    """
-    Visor práctico: seleccionas 1 fila y te muestra el texto completo en text_area.
-    IMPORTANTE: keys únicas para evitar StreamlitDuplicateElementId.
-    """
-    if df is None or df.empty:
-        st.info("Sin datos para mostrar.")
-        return
-
-    cols_txt = [c for c in ["Lista_reponer", "Completar con"] if c in df.columns]
-    if not cols_txt:
-        st.info("No hay columnas de texto (Lista_reponer / Completar con).")
-        return
-
-    with st.expander(f"🔎 Texto completo ({title})", expanded=False):
-        st.caption("Selecciona una fila para ver el texto completo (sin cortes).")
-
-        # Opciones legibles
-        def _row_label(r):
-            dia = r.get("Día", "")
-            apt = r.get("APARTAMENTO", "")
-            cli = r.get("Cliente", "")
-            est = r.get("Estado", "")
-            return f"{dia} · {apt} · {cli} · {est}".strip(" ·")
-
-        df2 = df.copy().reset_index(drop=True)
-        options = list(range(len(df2)))
-        labels = [_row_label(df2.loc[i]) for i in options]
-
-        sel = st.selectbox(
-            "Fila",
-            options=options,
-            format_func=lambda i: labels[i] if i < len(labels) else str(i),
-            key=f"{key_prefix}_row_select",
-        )
-        row = df2.loc[int(sel)]
-
-        for c in cols_txt:
-            st.text_area(
-                f"{c} (completo)",
-                value="" if pd.isna(row.get(c)) else str(row.get(c)),
-                height=140,
-                key=f"{key_prefix}_{c}_{int(sel)}",  # <-- clave única real
-            )
+def _agg_nonempty(series: pd.Series) -> str:
+    vals = []
+    for x in series.tolist():
+        s = str(x).strip()
+        if s and s.lower() not in {"nan", "none"}:
+            vals.append(s)
+    seen = set()
+    out = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return " | ".join(out)
 
 
-def _kpi_table(df: pd.DataFrame, title: str, key_prefix: str):
+def _kpi_table(df: pd.DataFrame, title: str):
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
-
-    cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "CAFE_TIPO", "Lista_reponer", "Completar con", "Próxima Entrada"] if c in df.columns]
-    view = df[cols_show].reset_index(drop=True).copy()
-
+    cols_show = [
+        c
+        for c in [
+            "Día",
+            "ZONA",
+            "APARTAMENTO",
+            "Cliente",
+            "Estado",
+            "Próxima Entrada",
+            "Lista_reponer",
+            "Completar con",
+        ]
+        if c in df.columns
+    ]
     st.markdown(f"#### {title}")
-    _render_operativa_table(view, key=f"{key_prefix}_table", styled=False)
-    show_full_text_viewer(view, title=title, key_prefix=f"{key_prefix}_fulltext")
+    view = df[cols_show].reset_index(drop=True)
+    _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
 
 
 def main():
@@ -433,6 +254,7 @@ def main():
     from src.dashboard import build_dashboard_frames
     from src.gsheets import read_sheet_df
 
+    # build_last_report_view puede estar en src/cleaning_last_report.py o src/parsers/cleaning_last_report.py
     try:
         from src.cleaning_last_report import build_last_report_view
     except Exception:
@@ -440,6 +262,21 @@ def main():
 
     st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
     st.title("Florit OPS – Parte diario (Operativa + Reposición)")
+
+    with st.expander("📌 Cómo usar", expanded=False):
+        st.markdown(
+            """
+**Sube 2 archivos diarios:**
+- **Avantio (Entradas)**: .xls / .xlsx / .csv / (xls HTML de Avantio)
+- **Odoo (stock.quant)**: .xlsx / .csv
+
+📌 Maestros en `data/` (GitHub):
+- Zonas
+- Apartamentos e Inventarios (ALMACEN + Localización)
+- Café por apartamento
+- Stock mínimo/máximo
+"""
+        )
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
@@ -519,6 +356,7 @@ def main():
             ap_map[c] = pd.NA
 
     if "Localizacion" in ap_map.columns:
+
         def _split_loc(x):
             s = str(x).strip()
             if "," in s:
@@ -567,54 +405,6 @@ def main():
     )
 
     # =========================
-    # 🔥 FIX CLAVE: RECONSTRUIR Lista_reponer / Completar con SIN RECORTES
-    # (evita "Inse", "Det", "Gel d"...)
-    # =========================
-    oper_tmp = dash["operativa"].copy()
-
-    # map apto->almacen
-    apt_to_alm = {}
-    if "APARTAMENTO" in oper_tmp.columns and "ALMACEN" in oper_tmp.columns:
-        for _, r in oper_tmp[["APARTAMENTO", "ALMACEN"]].dropna().drop_duplicates().iterrows():
-            apt_to_alm[str(r["APARTAMENTO"]).strip()] = str(r["ALMACEN"]).strip()
-
-    # map apto->cafe_tipo
-    cafe_tipo_by_apto = {}
-    if "APARTAMENTO" in oper_tmp.columns and "CAFE_TIPO" in oper_tmp.columns:
-        for _, r in oper_tmp[["APARTAMENTO", "CAFE_TIPO"]].dropna().drop_duplicates().iterrows():
-            cafe_tipo_by_apto[str(r["APARTAMENTO"]).strip()] = str(r["CAFE_TIPO"]).strip()
-
-    # maestro amenities (para normalizar)
-    master_amenities = set()
-    try:
-        th = masters.get("thresholds")
-        if th is not None and not th.empty:
-            # intenta sacar nombre humano
-            for c in ["Amenity", "AmenityName", "Producto", "AmenityLabel"]:
-                if c in th.columns:
-                    master_amenities = set(th[c].dropna().astype(str).tolist())
-                    break
-    except Exception:
-        master_amenities = set()
-
-    # lista urgente (si aplica) y lista completa
-    urgent_text_by_ap = _rep_to_text_by_almacen(rep, cafe_tipo_by_apto, apt_to_alm, master_amenities=master_amenities)
-    all_text_by_ap = _rep_to_text_by_almacen(rep_all, cafe_tipo_by_apto, apt_to_alm, master_amenities=master_amenities)
-
-    # aplica en operativa:
-    # - En modo normal: "Lista_reponer" = all_text
-    # - En modo URGENTE: "Lista_reponer" = urgent_text y "Completar con" = all_text
-    if urgent_only:
-        oper_tmp["Lista_reponer"] = oper_tmp["APARTAMENTO"].map(lambda a: urgent_text_by_ap.get(str(a).strip(), ""))
-        oper_tmp["Completar con"] = oper_tmp["APARTAMENTO"].map(lambda a: all_text_by_ap.get(str(a).strip(), ""))
-    else:
-        oper_tmp["Lista_reponer"] = oper_tmp["APARTAMENTO"].map(lambda a: all_text_by_ap.get(str(a).strip(), ""))
-        if "Completar con" not in oper_tmp.columns:
-            oper_tmp["Completar con"] = ""
-
-    dash["operativa"] = oper_tmp  # <-- reemplazo definitivo
-
-    # =========================
     # ✅ DASHBOARD ARRIBA + "CLICK" (botones) para ver listados
     # =========================
     if "kpi_open" not in st.session_state:
@@ -627,10 +417,13 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
+    # Filas del "día foco"
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
+    # Presenciales HOY
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
+
     pres_today = oper_all[
         (oper_all["Día"] == today)
         & (oper_all["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
@@ -673,6 +466,7 @@ def main():
         if st.button("Ver presenciales", key="kpi_btn_presenciales"):
             st.session_state["kpi_open"] = "presenciales"
 
+    # Render del listado "clicado"
     kpi_open = st.session_state.get("kpi_open", "")
     if kpi_open:
         st.divider()
@@ -680,26 +474,28 @@ def main():
 
         if kpi_open == "entradas":
             df = oper_foco[oper_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])].copy()
-            _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", key_prefix="kpi_entradas")
+            _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "salidas":
             df = oper_foco[oper_foco["Estado"].isin(["SALIDA", "ENTRADA+SALIDA"])].copy()
-            _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", key_prefix="kpi_salidas")
+            _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "turnovers":
             df = oper_foco[oper_foco["Estado"].isin(["ENTRADA+SALIDA"])].copy()
-            _kpi_table(df, f"Turnovers · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", key_prefix="kpi_turnovers")
+            _kpi_table(df, f"Turnovers · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "ocupados":
             df = oper_foco[oper_foco["Estado"].isin(["OCUPADO"])].copy()
-            _kpi_table(df, f"Ocupados · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", key_prefix="kpi_ocupados")
+            _kpi_table(df, f"Ocupados · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "vacios":
             df = oper_foco[oper_foco["Estado"].isin(["VACIO"])].copy()
-            _kpi_table(df, f"Vacíos · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", key_prefix="kpi_vacios")
+            _kpi_table(df, f"Vacíos · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "presenciales":
-            _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}", key_prefix="kpi_presenciales")
+            _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}")
+
+        st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
     # =========================
     # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
@@ -723,6 +519,7 @@ def main():
 
     apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
 
+    # Cargar sheet + construir último informe por apto
     last_view = pd.DataFrame()
     try:
         sheet_df = read_sheet_df()
@@ -734,6 +531,7 @@ def main():
         st.exception(e)
 
     if apt_key_sel:
+        # ===== Limpieza (último informe) =====
         st.markdown("### 🧹 Última limpieza (según Marca temporal)")
         if last_view is None or last_view.empty:
             st.info("No hay datos de limpieza disponibles.")
@@ -744,24 +542,44 @@ def main():
             else:
                 show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
                 show_cols = [c for c in show_cols if c in one.columns]
-                st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True)
+                st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True, height="content")
 
+        # ===== Operativa =====
         st.markdown("### 🧾 Parte Operativo (solo este apartamento)")
         op_one = oper_all[oper_all["APARTAMENTO_KEY"] == apt_key_sel].copy()
         if op_one.empty:
             st.info("No hay filas de operativa para ese apartamento en el periodo seleccionado.")
         else:
+            # Aplica filtros de sidebar
             if zonas_sel:
                 op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
             if estados_sel:
                 op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
 
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
-            op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
-            _render_operativa_table(op_show, key="buscador_operativa", styled=True)
 
-            # visor texto completo por fila (aquí sí tiene sentido)
-            show_full_text_viewer(op_show, title="Buscador", key_prefix="buscador_fulltext")
+            op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
+            _render_operativa_table(op_show, key=f"apt_oper_{apt_key_sel}", styled=True)
+
+        # ===== Reposición (resumen de items en este apto) =====
+        st.markdown("### 📦 Reposición (solo este apartamento)")
+        if op_one.empty:
+            st.info("Sin reposición (no hay operativa para este apartamento).")
+        else:
+            cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
+            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
+            if rep_rows.empty:
+                st.info("No veo columnas de reposición en la operativa para este apartamento.")
+            else:
+                rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
+                    lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
+                    axis=1,
+                )
+                rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
+                if rep_rows.empty:
+                    st.info("No hay reposición indicada para este apartamento en el periodo.")
+                else:
+                    _render_operativa_table(rep_rows.reset_index(drop=True), key=f"apt_rep_{apt_key_sel}", styled=False)
     else:
         st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
 
@@ -802,13 +620,10 @@ def main():
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
             show_df = zdf.drop(columns=["ZONA", "__prio", "APARTAMENTO_KEY"], errors="ignore").copy()
-            _render_operativa_table(show_df, key=f"parte_{_apt_key(str(dia))}_{_apt_key(str(zona_label))}", styled=True)
-
-            # visor texto completo para esa tabla zona+día
-            show_full_text_viewer(show_df, title=f"{pd.to_datetime(dia).strftime('%d/%m/%Y')} · {zona_label}", key_prefix=f"full_{_apt_key(str(dia))}_{_apt_key(str(zona_label))}")
+            _render_operativa_table(show_df, key=f"oper_{pd.to_datetime(dia).strftime('%Y%m%d')}_{_apt_key(str(zona_label))}", styled=True)
 
     # =========================
-    # SUGERENCIA DE REPOSICIÓN (totales)
+    # SUGERENCIA DE REPOSICIÓN
     # =========================
     st.divider()
     st.subheader("Sugerencia de Reposición")
@@ -826,10 +641,10 @@ def main():
         colA, colB = st.columns([1, 2])
         with colA:
             st.markdown("**Totales (preparar carrito)**")
-            st.dataframe(totals_df, use_container_width=True, height=_safe_height(len(totals_df)))
+            st.dataframe(totals_df, use_container_width=True, height="content")
         with colB:
-            st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)**")
-            st.dataframe(items_df, use_container_width=True, height=_safe_height(min(len(items_df), 25)))
+            st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
+            _render_operativa_table(items_df, key="sugerencia_items", styled=False)
 
     # =========================
     # RUTAS GOOGLE MAPS
@@ -873,14 +688,10 @@ def main():
 
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
-        try:
-            st.dataframe(rep.sort_values(["ALMACEN"], na_position="last").reset_index(drop=True), use_container_width=True)
-        except Exception:
-            st.dataframe(rep.reset_index(drop=True), use_container_width=True)
-
+        st.dataframe(rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True), use_container_width=True, height="content")
         if not unclassified.empty:
             st.warning("Hay productos sin clasificar (no entran en reposición).")
-            st.dataframe(unclassified.reset_index(drop=True), use_container_width=True)
+            st.dataframe(unclassified.reset_index(drop=True), use_container_width=True, height="content")
 
 
 if __name__ == "__main__":
