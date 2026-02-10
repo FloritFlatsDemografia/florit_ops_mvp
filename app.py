@@ -4,16 +4,16 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 import unicodedata
-
+from datetime import datetime, date, timedelta
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
 
 # =========================
-# PAX MAX (definido en código, como pediste)
+# PAX MAX (hardcode)
 # =========================
-PAX_MAX_BY_APT = {
+PAX_MAX = {
     "ALFARO": 5,
     "ALMIRANTE 01": 4,
     "ALMIRANTE 02": 4,
@@ -128,73 +128,9 @@ def _apt_key(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # quita tildes
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\b0+(\d)", r"\1", s)  # "APOLO 029" -> "APOLO 29"
+    # Quita ceros iniciales en números sueltos: "APOLO 029" -> "APOLO 29"
+    s = re.sub(r"\b0+(\d)", r"\1", s)
     return s.upper().strip()
-
-
-def _pax_max_for(apt: str) -> int | None:
-    k = _apt_key(apt)
-    return PAX_MAX_BY_APT.get(k, None)
-
-
-# =========================
-# Disponibilidad (TELÉFONO)
-# Regla: disponible si VACIO todas las noches [CI .. CO-1]
-# =========================
-def _available_apartments_from_operativa(
-    operativa_df: pd.DataFrame,
-    check_in: pd.Timestamp,
-    check_out: pd.Timestamp,
-) -> pd.DataFrame:
-    if operativa_df is None or operativa_df.empty:
-        return pd.DataFrame(columns=["APARTAMENTO"])
-
-    need = {"Día", "APARTAMENTO", "Estado"}
-    if not need.issubset(operativa_df.columns):
-        return pd.DataFrame(columns=["APARTAMENTO"])
-
-    df = operativa_df.copy()
-    df["APARTAMENTO"] = df["APARTAMENTO"].astype(str).str.strip()
-    df["APARTAMENTO_KEY"] = df["APARTAMENTO"].map(_apt_key)
-    df["Día"] = pd.to_datetime(df["Día"], errors="coerce").dt.date
-    df["Estado"] = df["Estado"].astype(str).str.strip().str.upper()
-
-    ci = pd.to_datetime(check_in).normalize().date()
-    co = pd.to_datetime(check_out).normalize().date()
-    if co <= ci:
-        return pd.DataFrame(columns=["APARTAMENTO"])
-
-    last_night = (pd.to_datetime(check_out).normalize() - pd.Timedelta(days=1)).date()
-
-    noches = []
-    cur = pd.to_datetime(ci)
-    end = pd.to_datetime(last_night)
-    while cur <= end:
-        noches.append(cur.date())
-        cur += pd.Timedelta(days=1)
-
-    df_n = df[df["Día"].isin(noches)].copy()
-    if df_n.empty:
-        return pd.DataFrame(columns=["APARTAMENTO"])
-
-    g = df_n.groupby("APARTAMENTO_KEY")["Estado"].apply(list).reset_index(name="estados")
-
-    def _all_vacio(estados):
-        return bool(estados) and all(e == "VACIO" for e in estados)
-
-    g["is_free"] = g["estados"].apply(_all_vacio)
-    free_keys = set(g[g["is_free"]]["APARTAMENTO_KEY"].tolist())
-
-    # Devolvemos nombre “bonito” (primera ocurrencia del periodo)
-    one_name = (
-        df[["APARTAMENTO_KEY", "APARTAMENTO"]]
-        .dropna()
-        .drop_duplicates(subset=["APARTAMENTO_KEY"])
-        .copy()
-    )
-    out = one_name[one_name["APARTAMENTO_KEY"].isin(free_keys)][["APARTAMENTO"]].copy()
-    out = out.sort_values("APARTAMENTO").reset_index(drop=True)
-    return out
 
 
 # =========================
@@ -338,21 +274,91 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# Google Sheet helpers
+# Disponibilidad (FUENTE = Avantio Entradas / Reservas)
 # =========================
-def _agg_nonempty(series: pd.Series) -> str:
-    vals = []
-    for x in series.tolist():
-        s = str(x).strip()
-        if s and s.lower() not in {"nan", "none"}:
-            vals.append(s)
-    seen = set()
-    out = []
-    for v in vals:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return " | ".join(out)
+def _to_dt(x):
+    # acepta string dd/mm/yyyy hh:mm o dd/mm/yyyy
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return pd.NaT
+    if isinstance(x, (datetime, pd.Timestamp)):
+        return pd.Timestamp(x)
+    s = str(x).strip()
+    if not s:
+        return pd.NaT
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+
+def compute_available_apts_from_avantio(
+    avantio_res_df: pd.DataFrame,
+    zonas_df: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    zona_sel: str,
+    pax_min: int,
+) -> pd.DataFrame:
+    """
+    Devuelve disponibles según reservas que SOLAPAN con [start_d, end_d).
+    Si una reserva tiene entrada < end_d y salida > start_d => OCUPADO.
+    """
+    if start_d >= end_d:
+        return pd.DataFrame(columns=["APARTAMENTO", "ZONA", "PAX_MAX"])
+
+    # base: lista completa de apartamentos conocidos por PAX
+    base = pd.DataFrame({"APARTAMENTO": list(PAX_MAX.keys())})
+    base["APARTAMENTO_KEY"] = base["APARTAMENTO"].map(_apt_key)
+    base["PAX_MAX"] = base["APARTAMENTO"].map(lambda x: int(PAX_MAX.get(x, 0)))
+
+    # zonas
+    zmap = zonas_df.copy() if zonas_df is not None else pd.DataFrame(columns=["APARTAMENTO", "ZONA"])
+    if "APARTAMENTO" in zmap.columns:
+        zmap["APARTAMENTO_KEY"] = zmap["APARTAMENTO"].map(_apt_key)
+    if "ZONA" not in zmap.columns:
+        zmap["ZONA"] = "Sin zona"
+
+    base = base.merge(zmap[["APARTAMENTO_KEY", "ZONA"]].drop_duplicates(), on="APARTAMENTO_KEY", how="left")
+    base["ZONA"] = base["ZONA"].fillna("Sin zona")
+
+    # filtro zona
+    if zona_sel and zona_sel != "Todas":
+        base = base[base["ZONA"] == zona_sel].copy()
+
+    # filtro pax
+    base = base[base["PAX_MAX"] >= int(pax_min)].copy()
+
+    if base.empty:
+        return pd.DataFrame(columns=["APARTAMENTO", "ZONA", "PAX_MAX"])
+
+    # si no hay reservas, todos disponibles
+    if avantio_res_df is None or avantio_res_df.empty:
+        return base[["APARTAMENTO", "ZONA", "PAX_MAX"]].sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True)
+
+    df = avantio_res_df.copy()
+
+    # columnas típicas tras parse_avantio_entradas
+    # (si tu parser usa otros nombres, ajusta aquí SOLO estas 3 líneas)
+    col_apt = "Alojamiento" if "Alojamiento" in df.columns else ("APARTAMENTO" if "APARTAMENTO" in df.columns else None)
+    col_in = "Fecha entrada hora" if "Fecha entrada hora" in df.columns else ("Fecha entrada" if "Fecha entrada" in df.columns else None)
+    col_out = "Fecha salida hora" if "Fecha salida hora" in df.columns else ("Fecha salida" if "Fecha salida" in df.columns else None)
+
+    if not col_apt or not col_in or not col_out:
+        # si no se encuentran, mejor no “inventar”: devolvemos base para que no falten aptos
+        return base[["APARTAMENTO", "ZONA", "PAX_MAX"]].sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True)
+
+    df["_apt_key"] = df[col_apt].map(_apt_key)
+    df["_in"] = df[col_in].map(_to_dt)
+    df["_out"] = df[col_out].map(_to_dt)
+    df = df.dropna(subset=["_apt_key", "_in", "_out"]).copy()
+
+    start_ts = pd.Timestamp(start_d)
+    end_ts = pd.Timestamp(end_d)
+
+    # Solape de intervalos: in < end AND out > start
+    occ = df[(df["_in"] < end_ts) & (df["_out"] > start_ts)]["_apt_key"].dropna().unique().tolist()
+    occ_set = set(occ)
+
+    out = base[~base["APARTAMENTO_KEY"].isin(occ_set)].copy()
+    out = out[["APARTAMENTO", "ZONA", "PAX_MAX"]].sort_values(["ZONA", "APARTAMENTO"]).reset_index(drop=True)
+    return out
 
 
 def main():
@@ -446,7 +452,7 @@ def main():
         st.stop()
 
     # Normaliza APARTAMENTO
-    avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
+    avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip() if "Alojamiento" in avantio_df.columns else avantio_df.get("APARTAMENTO", "").astype(str).str.strip()
     avantio_df["APARTAMENTO_KEY"] = avantio_df["APARTAMENTO"].map(_apt_key)
 
     # Maestros
@@ -512,12 +518,37 @@ def main():
         period_days=period_days,
     )
 
-    # Operativa global (para reusar)
-    oper_all = dash["operativa"].copy()
-    oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
+    # =========================
+    # 🔎 BUSCAR DISPONIBLES (FUENTE: Avantio Entradas)
+    # =========================
+    st.divider()
+    st.subheader("🔎 Buscar disponibles (según Entradas / Reservas)")
+
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        q_start = st.date_input("Entrada", value=pd.Timestamp.today().date())
+    with col2:
+        q_end = st.date_input("Salida", value=(pd.Timestamp.today() + pd.Timedelta(days=3)).date())
+    with col3:
+        pax_min = st.number_input("PAX mínimo", min_value=1, max_value=10, value=2, step=1)
+    with col4:
+        zona_opt = ["Todas"] + zonas_all
+        zona_pick = st.selectbox("Zona", options=zona_opt, index=0)
+
+    if st.button("Buscar disponibles"):
+        avail = compute_available_apts_from_avantio(
+            avantio_res_df=avantio_df,
+            zonas_df=masters.get("zonas", pd.DataFrame(columns=["APARTAMENTO", "ZONA"])),
+            start_d=q_start,
+            end_d=q_end,
+            zona_sel=zona_pick,
+            pax_min=int(pax_min),
+        )
+        st.success(f"Disponibles: {len(avail)}")
+        st.dataframe(avail, use_container_width=True)
 
     # =========================
-    # KPIs dashboard + Check-ins presenciales
+    # KPIs dashboard
     # =========================
     kpis = dash.get("kpis", {})
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -527,112 +558,51 @@ def main():
     c4.metric("Ocupados", kpis.get("ocupados_dia", 0))
     c5.metric("Vacíos", kpis.get("vacios_dia", 0))
 
+    # ✅ Check-ins presenciales HOY
     tz = ZoneInfo("Europe/Madrid")
     today = pd.Timestamp.now(tz=tz).normalize().date()
-
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
 
-    oper_today = oper_all.copy()
-    oper_today["Día"] = pd.to_datetime(oper_today["Día"], errors="coerce").dt.date
+    oper_all = dash["operativa"].copy()
+    oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    pres_today = oper_today[
-        (oper_today["Día"] == today)
-        & (oper_today["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
-        & (oper_today["APARTAMENTO_KEY"].isin(presencial_keys))
+    pres_today = oper_all[
+        (oper_all["Día"] == today)
+        & (oper_all["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
+        & (oper_all["APARTAMENTO_KEY"].isin(presencial_keys))
     ].copy()
 
     c6.metric("Check-ins presenciales (HOY)", int(len(pres_today)))
 
     if len(pres_today) > 0:
         with st.expander("Ver check-ins presenciales (HOY)", expanded=False):
-            cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado"] if c in pres_today.columns]
+            cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada"] if c in pres_today.columns]
             st.dataframe(pres_today[cols_show].reset_index(drop=True), use_container_width=True)
 
     # =========================
-    # 🔎 BUSCADOR TELÉFONO (Disponibilidad)
-    # =========================
-    st.divider()
-    st.subheader("📞 Búsqueda rápida (Teléfono) · Disponibilidad por fechas + Zona + PAX")
-
-    tcol1, tcol2, tcol3, tcol4 = st.columns([1, 1, 1, 1.2])
-    with tcol1:
-        tel_ci = st.date_input("Entrada", value=pd.Timestamp.today().date(), key="tel_ci")
-    with tcol2:
-        tel_co = st.date_input("Salida", value=(pd.Timestamp.today() + pd.Timedelta(days=2)).date(), key="tel_co")
-    with tcol3:
-        pax_min = st.number_input("PAX mínimo", min_value=1, max_value=20, value=2, step=1, key="tel_pax")
-    with tcol4:
-        zona_opts = ["Todas"] + (zonas_all if isinstance(zonas_all, list) else [])
-        tel_zona = st.selectbox("Zona", options=zona_opts, index=0, key="tel_zona")
-
-    do_tel = st.button("Buscar disponibles", key="tel_btn")
-
-    if do_tel:
-        ci = pd.Timestamp(tel_ci)
-        co = pd.Timestamp(tel_co)
-
-        if co <= ci:
-            st.error("La salida debe ser posterior a la entrada.")
-        else:
-            # Recalcular un periodo que cubra exactamente las NOCHES del rango (no hace falta buffer)
-            nights = int((co - ci).days)
-            try:
-                dash_tel = build_dashboard_frames(
-                    avantio_df=avantio_df,
-                    replenishment_df=rep,
-                    rep_all_df=rep_all,
-                    urgent_only=urgent_only,
-                    unclassified_products=unclassified,
-                    period_start=tel_ci,
-                    period_days=max(1, nights),
-                )
-                oper_tel = dash_tel["operativa"].copy()
-            except Exception as e:
-                st.warning("No pude recalcular para el rango; uso el periodo actual.")
-                st.exception(e)
-                oper_tel = oper_all.copy()
-
-            free_apts = _available_apartments_from_operativa(oper_tel, ci, co)
-            if free_apts.empty:
-                st.info("No hay apartamentos totalmente VACÍOS para esas noches (según entradas/operativa).")
-            else:
-                out = free_apts.copy()
-                out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
-                out["PAX_MAX"] = out["APARTAMENTO_KEY"].map(lambda k: PAX_MAX_BY_APT.get(k, None))
-
-                # Zona desde maestro
-                if "zonas" in masters and "APARTAMENTO" in masters["zonas"].columns:
-                    tmp_z = masters["zonas"][["APARTAMENTO", "ZONA"]].copy()
-                    tmp_z["APARTAMENTO_KEY"] = tmp_z["APARTAMENTO"].map(_apt_key)
-                    out = out.merge(tmp_z[["APARTAMENTO_KEY", "ZONA"]], on="APARTAMENTO_KEY", how="left")
-
-                if tel_zona != "Todas" and "ZONA" in out.columns:
-                    out = out[out["ZONA"] == tel_zona].copy()
-
-                out["PAX_MAX"] = pd.to_numeric(out["PAX_MAX"], errors="coerce")
-                out = out[out["PAX_MAX"].fillna(0) >= pax_min].copy()
-
-                out = out.sort_values(["ZONA", "APARTAMENTO"], na_position="last").reset_index(drop=True)
-                st.success(f"Disponibles: {len(out)}")
-                show_cols = [c for c in ["APARTAMENTO", "ZONA", "PAX_MAX"] if c in out.columns]
-                st.dataframe(out[show_cols], use_container_width=True, height=min(520, 40 + 35 * min(len(out), 25)))
-
-    # =========================
-    # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición) con dropdown
+    # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
     # =========================
     st.divider()
     st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
 
-    # Estado UI: vacío por defecto
     if "apt_query" not in st.session_state:
         st.session_state["apt_query"] = ""
-    if "apt_choice" not in st.session_state:
-        st.session_state["apt_choice"] = ""
     if "apt_selected_key" not in st.session_state:
         st.session_state["apt_selected_key"] = ""
 
-    # Cargar sheet + construir último informe por apto (una vez por ejecución)
+    st.text_input(
+        "Escribe el apartamento (o parte) y pulsa Enter",
+        key="apt_query",
+        placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE...",
+    )
+
+    if st.button("Buscar"):
+        st.session_state["apt_selected_key"] = _apt_key(st.session_state["apt_query"])
+
+    apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
+
+    # Cargar sheet + construir último informe por apto
     last_view = pd.DataFrame()
     try:
         sheet_df = read_sheet_df()
@@ -643,49 +613,9 @@ def main():
         st.warning("No pude construir el último informe por apartamento desde Google Sheet.")
         st.exception(e)
 
-    # Universo de apartamentos (operativa + sheet + pax)
-    apts_from_oper = sorted(set(oper_all["APARTAMENTO"].dropna().astype(str).str.strip().tolist())) if not oper_all.empty else []
-    apts_from_sheet = sorted(set(last_view["Apartamento"].dropna().astype(str).str.strip().tolist())) if not last_view.empty else []
-    apts_from_pax = sorted(PAX_MAX_BY_APT.keys())
-
-    universe = sorted({_apt_key(x) for x in (apts_from_oper + apts_from_sheet + apts_from_pax) if str(x).strip()})
-    # Para mostrar nombres, preferimos el “bonito” que venga del propio texto original:
-    # construimos un mapping key -> display (primera coincidencia razonable)
-    display_map = {}
-    for name in apts_from_oper + apts_from_sheet + apts_from_pax:
-        k = _apt_key(name)
-        if k and k not in display_map:
-            display_map[k] = _apt_key(name)  # display en MAYUS normalizada
-
-    query = st.text_input(
-        "Escribe (o parte) y pulsa Enter. Luego elige en el desplegable y pulsa Aplicar.",
-        key="apt_query",
-        placeholder="Ej: SERRANOS, APOLO, BENICALAP, ALMIRANTE...",
-    ).strip()
-
-    matches = []
-    if query:
-        qk = _apt_key(query)
-        # matching por “contiene”
-        for k in universe:
-            if qk in k:
-                matches.append(display_map.get(k, k))
-        matches = sorted(set(matches))
-
-    if matches:
-        st.selectbox("Coincidencias", options=[""] + matches, key="apt_choice")
-        if st.button("Aplicar", key="apt_apply"):
-            st.session_state["apt_selected_key"] = _apt_key(st.session_state.get("apt_choice", ""))
-    else:
-        st.caption("Escribe para ver coincidencias. (Nada se muestra por defecto.)")
-
-    apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
-
     if apt_key_sel:
-        st.markdown(f"## ✅ Resumen: `{display_map.get(apt_key_sel, apt_key_sel)}`")
-
         # ===== Limpieza (último informe) =====
-        st.markdown("### 🧹 Última limpieza (Marca temporal)")
+        st.markdown("### 🧹 Última limpieza (según Marca temporal)")
         if last_view is None or last_view.empty:
             st.info("No hay datos de limpieza disponibles.")
         else:
@@ -703,45 +633,46 @@ def main():
         if op_one.empty:
             st.info("No hay filas de operativa para ese apartamento en el periodo seleccionado.")
         else:
-            # Aplica filtros de sidebar
-            if zonas_sel and "ZONA" in op_one.columns:
+            if zonas_sel:
                 op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
-            if estados_sel and "Estado" in op_one.columns:
+            if estados_sel:
                 op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
 
-            # orden seguro (si faltan columnas internas, no peta)
-            sort_cols = [c for c in ["Día", "ZONA", "__prio", "APARTAMENTO"] if c in op_one.columns]
-            if sort_cols:
-                op_one = op_one.sort_values(sort_cols, ascending=True)
-
+            op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
             st.dataframe(_style_operativa(op_show), use_container_width=True)
 
-        # ===== Reposición (solo apto) =====
+        # ===== Reposición (detalle en este apto) =====
         st.markdown("### 📦 Reposición (solo este apartamento)")
         if op_one.empty:
             st.info("Sin reposición (no hay operativa para este apartamento).")
         else:
             cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
-            if not cols_rep:
+            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
+            if rep_rows.empty:
                 st.info("No veo columnas de reposición en la operativa para este apartamento.")
             else:
-                rep_rows = op_one[["Día", "ZONA", "APARTAMENTO"] + cols_rep].copy() if "ZONA" in op_one.columns else op_one[["Día", "APARTAMENTO"] + cols_rep].copy()
-                for c in cols_rep:
-                    rep_rows[c] = rep_rows[c].astype(str).fillna("").str.strip()
-
-                def _has_any_rep(r):
-                    for c in cols_rep:
-                        v = str(r.get(c, "")).strip()
-                        if v and v.lower() not in {"nan", "none"}:
-                            return True
-                    return False
-
-                rep_rows = rep_rows[rep_rows.apply(_has_any_rep, axis=1)].copy()
+                rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
+                    lambda r: any(str(x).strip().lower() not in {"", "nan", "none"} for x in r), axis=1
+                )
+                rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
                 if rep_rows.empty:
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
                     st.dataframe(rep_rows.reset_index(drop=True), use_container_width=True)
+
+    else:
+        st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
+
+    # =========================
+    # Descargar Excel operativa
+    # =========================
+    st.download_button(
+        "⬇️ Descargar Excel (Operativa)",
+        data=dash["excel_all"],
+        file_name=dash["excel_filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     # =========================
     # PARTE OPERATIVO COMPLETO
@@ -758,7 +689,7 @@ def main():
     if estados_sel:
         operativa = operativa[operativa["Estado"].isin(estados_sel)].copy()
 
-    operativa = operativa.sort_values([c for c in ["Día", "ZONA", "__prio", "APARTAMENTO"] if c in operativa.columns])
+    operativa = operativa.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"])
 
     for dia, ddf in operativa.groupby("Día", dropna=False):
         st.markdown(f"### Día {pd.to_datetime(dia).strftime('%d/%m/%Y')}")
@@ -839,13 +770,6 @@ def main():
                     url = build_gmaps_directions_url(chunk, travelmode=travelmode, return_to_base=return_to_base)
                     if url:
                         st.link_button(f"Abrir ruta · {zona_label} (tramo {idx})", url)
-
-    st.download_button(
-        "⬇️ Descargar Excel (Operativa)",
-        data=dash["excel_all"],
-        file_name=dash["excel_filename"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
