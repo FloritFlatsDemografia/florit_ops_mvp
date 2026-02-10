@@ -94,6 +94,46 @@ def _style_operativa(df: pd.DataFrame):
 
 
 # =========================
+# Render helper (NO HTML) + no cortar texto
+# =========================
+def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
+    """
+    Streamlit corta texto por:
+      - ancho de columna
+      - y, en algunas versiones, por max_chars interno
+
+    Solución sin HTML:
+      - column_config TextColumn con width="large" y max_chars MUY alto
+      - height="content" para evitar errores y que el grid crezca lo justo
+    """
+    if df is None or df.empty:
+        st.info("Sin resultados.")
+        return
+
+    view = df.copy()
+
+    colcfg = {}
+    # fuerza a NO truncar strings en estas columnas
+    for c in ["Lista_reponer", "Completar con", "Producto", "Cliente"]:
+        if c in view.columns:
+            colcfg[c] = st.column_config.TextColumn(
+                c,
+                width="large",
+                max_chars=10000,  # <- clave: evita truncado por límite interno
+            )
+
+    # también suele venir bien ensanchar APARTAMENTO
+    if "APARTAMENTO" in view.columns:
+        colcfg["APARTAMENTO"] = st.column_config.TextColumn("APARTAMENTO", width="medium", max_chars=5000)
+
+    # evita el None que te dio el error: height debe ser int/'content'/'stretch'
+    if styled:
+        st.dataframe(_style_operativa(view), use_container_width=True, height="content", column_config=colcfg)
+    else:
+        st.dataframe(view, use_container_width=True, height="content", column_config=colcfg)
+
+
+# =========================
 # Reposición parsing
 # =========================
 _ITEM_RX = re.compile(r"^\s*(.*?)\s*x\s*([0-9]+)\s*$", re.IGNORECASE)
@@ -184,76 +224,27 @@ def _agg_nonempty(series: pd.Series) -> str:
     return " | ".join(out)
 
 
-# =========================
-# Visor de texto completo (sin HTML)
-# =========================
-def show_full_text_viewer(
-    df: pd.DataFrame,
-    title: str,
-    text_cols: list[str] | None = None,
-    key_prefix: str = "fulltext",
-):
-    """Visor para leer texto largo sin depender del render de la tabla.
-
-    - No usa HTML.
-    - Evita IDs duplicados usando keys únicas por fila/columna.
-    """
-    if df is None or df.empty:
-        return
-
-    if text_cols is None:
-        # por defecto, intenta estas columnas si existen
-        cand = ["Lista_reponer", "Completar con", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
-        text_cols = [c for c in cand if c in df.columns]
-
-    if not text_cols:
-        return
-
-    with st.expander(f"🔎 Texto completo · {title}", expanded=False):
-        st.caption("Selecciona una fila para ver el contenido completo (sin cortes).")
-
-        # Construye opciones de selección
-        def _row_label(i: int, row: pd.Series) -> str:
-            parts = []
-            for c in ["Día", "APARTAMENTO", "Cliente", "Estado", "ZONA"]:
-                if c in df.columns:
-                    v = row.get(c)
-                    if pd.notna(v) and str(v).strip():
-                        parts.append(str(v).strip())
-            if not parts:
-                parts = [f"Fila {i}"]
-            return " · ".join(parts)
-
-        rows = df.reset_index(drop=True).copy()
-        labels = [_row_label(i, rows.loc[i]) for i in range(len(rows))]
-        sel = st.selectbox(
-            "Fila",
-            options=list(range(len(rows))),
-            format_func=lambda i: labels[i],
-            key=f"{key_prefix}_sel_{title}",
-        )
-        row = rows.loc[int(sel)]
-
-        for c in text_cols:
-            val = "" if pd.isna(row.get(c)) else str(row.get(c))
-            st.text_area(
-                f"{c} (completo)",
-                value=val,
-                height=200,
-                key=f"{key_prefix}_ta_{title}_{int(sel)}_{c}",
-            )
-
-
-def _kpi_table(df: pd.DataFrame, title: str, enable_fulltext_viewer: bool = False):
+def _kpi_table(df: pd.DataFrame, title: str):
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
-    cols_show = [c for c in ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado", "Próxima Entrada", "Lista_reponer", "Completar con"] if c in df.columns]
+    cols_show = [
+        c
+        for c in [
+            "Día",
+            "ZONA",
+            "APARTAMENTO",
+            "Cliente",
+            "Estado",
+            "Próxima Entrada",
+            "Lista_reponer",
+            "Completar con",
+        ]
+        if c in df.columns
+    ]
     st.markdown(f"#### {title}")
     view = df[cols_show].reset_index(drop=True)
-    st.dataframe(view, use_container_width=True)
-    if enable_fulltext_viewer:
-        show_full_text_viewer(view, title=title, key_prefix=f"kpi_text_{_apt_key(title)}")
+    _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
 
 
 def main():
@@ -316,13 +307,6 @@ def main():
         st.subheader("Ruta (HOY + MAÑANA)")
         travelmode = st.selectbox("Modo", ["walking", "driving"], index=0)
         return_to_base = st.checkbox("Volver a Florit Flats al final", value=False)
-
-        st.divider()
-        st.subheader("Visualización")
-        enable_fulltext_viewer = st.checkbox(
-            "Activar visor de texto completo (Lista_reponer / Completar con)",
-            value=True,
-        )
 
     try:
         masters = load_masters_repo()
@@ -490,26 +474,26 @@ def main():
 
         if kpi_open == "entradas":
             df = oper_foco[oper_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])].copy()
-            _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", enable_fulltext_viewer=enable_fulltext_viewer)
+            _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "salidas":
             df = oper_foco[oper_foco["Estado"].isin(["SALIDA", "ENTRADA+SALIDA"])].copy()
-            _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", enable_fulltext_viewer=enable_fulltext_viewer)
+            _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "turnovers":
             df = oper_foco[oper_foco["Estado"].isin(["ENTRADA+SALIDA"])].copy()
-            _kpi_table(df, f"Turnovers · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", enable_fulltext_viewer=enable_fulltext_viewer)
+            _kpi_table(df, f"Turnovers · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "ocupados":
             df = oper_foco[oper_foco["Estado"].isin(["OCUPADO"])].copy()
-            _kpi_table(df, f"Ocupados · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", enable_fulltext_viewer=enable_fulltext_viewer)
+            _kpi_table(df, f"Ocupados · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "vacios":
             df = oper_foco[oper_foco["Estado"].isin(["VACIO"])].copy()
-            _kpi_table(df, f"Vacíos · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}", enable_fulltext_viewer=enable_fulltext_viewer)
+            _kpi_table(df, f"Vacíos · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "presenciales":
-            _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}", enable_fulltext_viewer=enable_fulltext_viewer)
+            _kpi_table(pres_today, f"Check-ins presenciales · HOY {pd.to_datetime(today).strftime('%d/%m/%Y')}")
 
         st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
@@ -558,10 +542,7 @@ def main():
             else:
                 show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
                 show_cols = [c for c in show_cols if c in one.columns]
-                view = one[show_cols].reset_index(drop=True)
-                st.dataframe(view, use_container_width=True)
-                if enable_fulltext_viewer:
-                    show_full_text_viewer(view, title=f"Limpieza · {one.iloc[0].get('Apartamento','')}", key_prefix=f"clean_{apt_key_sel}")
+                st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True, height="content")
 
         # ===== Operativa =====
         st.markdown("### 🧾 Parte Operativo (solo este apartamento)")
@@ -578,9 +559,7 @@ def main():
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
 
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
-            st.dataframe(_style_operativa(op_show), use_container_width=True)
-            if enable_fulltext_viewer:
-                show_full_text_viewer(op_show, title=f"Operativa · {apt_key_sel}", key_prefix=f"apt_oper_{apt_key_sel}")
+            _render_operativa_table(op_show, key=f"apt_oper_{apt_key_sel}", styled=True)
 
         # ===== Reposición (resumen de items en este apto) =====
         st.markdown("### 📦 Reposición (solo este apartamento)")
@@ -588,7 +567,7 @@ def main():
             st.info("Sin reposición (no hay operativa para este apartamento).")
         else:
             cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
-            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO", "Cliente", "Estado"]].copy() if cols_rep else pd.DataFrame()
+            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
             if rep_rows.empty:
                 st.info("No veo columnas de reposición en la operativa para este apartamento.")
             else:
@@ -600,11 +579,7 @@ def main():
                 if rep_rows.empty:
                     st.info("No hay reposición indicada para este apartamento en el periodo.")
                 else:
-                    view = rep_rows.reset_index(drop=True)
-                    st.dataframe(view, use_container_width=True)
-                    if enable_fulltext_viewer:
-                        show_full_text_viewer(view, title=f"Reposición · {apt_key_sel}", key_prefix=f"apt_rep_{apt_key_sel}")
-
+                    _render_operativa_table(rep_rows.reset_index(drop=True), key=f"apt_rep_{apt_key_sel}", styled=False)
     else:
         st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
 
@@ -645,17 +620,7 @@ def main():
             zona_label = zona if zona not in [None, "None", "", "nan"] else "Sin zona"
             st.markdown(f"#### {zona_label}")
             show_df = zdf.drop(columns=["ZONA", "__prio", "APARTAMENTO_KEY"], errors="ignore").copy()
-
-            st.dataframe(
-                _style_operativa(show_df),
-                use_container_width=True,
-                height=int(min(520, 40 + 35 * len(show_df))) if len(show_df) > 0 else 200,
-            )
-
-            if enable_fulltext_viewer:
-                # visor por zona y día (keys únicas)
-                keyp = f"zone_text_{pd.to_datetime(dia).strftime('%Y%m%d')}_{_apt_key(zona_label)}"
-                show_full_text_viewer(show_df, title=f"{pd.to_datetime(dia).strftime('%d/%m/%Y')} · {zona_label}", key_prefix=keyp)
+            _render_operativa_table(show_df, key=f"oper_{pd.to_datetime(dia).strftime('%Y%m%d')}_{_apt_key(str(zona_label))}", styled=True)
 
     # =========================
     # SUGERENCIA DE REPOSICIÓN
@@ -676,10 +641,10 @@ def main():
         colA, colB = st.columns([1, 2])
         with colA:
             st.markdown("**Totales (preparar carrito)**")
-            st.dataframe(totals_df, use_container_width=True, height=int(min(520, 40 + 35 * len(totals_df))) if len(totals_df) > 0 else 200)
+            st.dataframe(totals_df, use_container_width=True, height="content")
         with colB:
             st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
-            st.dataframe(items_df, use_container_width=True, height=int(min(520, 40 + 28 * min(len(items_df), 25))) if len(items_df) > 0 else 200)
+            _render_operativa_table(items_df, key="sugerencia_items", styled=False)
 
     # =========================
     # RUTAS GOOGLE MAPS
@@ -723,10 +688,10 @@ def main():
 
     with st.expander("🧪 Debug reposición (por almacén)", expanded=False):
         st.caption("Comprueba Min/Max/Stock y el cálculo final.")
-        st.dataframe(rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True), use_container_width=True)
+        st.dataframe(rep.sort_values(["ALMACEN", "Amenity"], na_position="last").reset_index(drop=True), use_container_width=True, height="content")
         if not unclassified.empty:
             st.warning("Hay productos sin clasificar (no entran en reposición).")
-            st.dataframe(unclassified.reset_index(drop=True), use_container_width=True)
+            st.dataframe(unclassified.reset_index(drop=True), use_container_width=True, height="content")
 
 
 if __name__ == "__main__":
