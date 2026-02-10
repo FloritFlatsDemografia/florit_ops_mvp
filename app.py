@@ -104,6 +104,33 @@ def _parse_time_to_hhmm(x) -> str:
 
 
 # =========================
+# Parse multi-apartamentos (buscador)
+# =========================
+_MULTI_SPLIT_RX = re.compile(r"[,\n;]+")
+
+def _parse_multi_apts(txt: str) -> list[str]:
+    """
+    Convierte un texto tipo:
+      "Apolo 29, Serranos; Benicalap 01"
+    a lista de APARTAMENTO_KEY.
+    """
+    if txt is None:
+        return []
+    raw = str(txt).strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in _MULTI_SPLIT_RX.split(raw) if p.strip()]
+    keys = []
+    seen = set()
+    for p in parts:
+        k = _apt_key(p)
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+
+# =========================
 # Google Maps helpers
 # =========================
 def _coord_str(lat, lng):
@@ -174,15 +201,6 @@ def _style_operativa(df: pd.DataFrame):
 # Render helper (NO HTML) + no cortar texto
 # =========================
 def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
-    """
-    Streamlit corta texto por:
-      - ancho de columna
-      - y, en algunas versiones, por max_chars interno
-
-    Solución sin HTML:
-      - column_config TextColumn con width="large" y max_chars MUY alto
-      - height="content" para evitar errores y que el grid crezca lo justo
-    """
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
@@ -190,20 +208,13 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     view = df.copy()
 
     colcfg = {}
-    # fuerza a NO truncar strings en estas columnas
     for c in ["Lista_reponer", "Completar con", "Producto", "Cliente"]:
         if c in view.columns:
-            colcfg[c] = st.column_config.TextColumn(
-                c,
-                width="large",
-                max_chars=10000,  # <- clave: evita truncado por límite interno
-            )
+            colcfg[c] = st.column_config.TextColumn(c, width="large", max_chars=10000)
 
-    # también suele venir bien ensanchar APARTAMENTO
     if "APARTAMENTO" in view.columns:
         colcfg["APARTAMENTO"] = st.column_config.TextColumn("APARTAMENTO", width="medium", max_chars=5000)
 
-    # evita el None que te dio el error: height debe ser int/'content'/'stretch'
     if styled:
         st.dataframe(_style_operativa(view), use_container_width=True, height="content", column_config=colcfg)
     else:
@@ -302,11 +313,6 @@ def _agg_nonempty(series: pd.Series) -> str:
 
 
 def _kpi_table(df: pd.DataFrame, title: str):
-    """
-    Detalle KPI:
-    - QUITAMOS 'Próxima Entrada'
-    - AÑADIMOS 'Nº Adultos', 'Nº Niños', 'Hora Check-in'
-    """
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
@@ -336,11 +342,6 @@ def _kpi_table(df: pd.DataFrame, title: str):
 # Enriquecimiento: adultos/niños/hora check-in desde Avantio (Entradas)
 # =========================
 def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
-    """
-    Intenta detectar la columna de fecha/hora de entrada.
-    1) Busca por nombre
-    2) Fallback a letra D (muy habitual en tus exports)
-    """
     name_hit = None
     for c in avantio_df.columns:
         cl = str(c).lower()
@@ -354,7 +355,6 @@ def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
     if name_hit is not None:
         return name_hit
 
-    # fallback: letra D
     try:
         return _col_by_excel_letter(avantio_df, "D")
     except Exception:
@@ -362,57 +362,41 @@ def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
 
 
 def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Añade a la operativa:
-      - Nº Adultos (H)
-      - Nº Niños (I)
-      - Hora Check-in (Z) default 16:00
-    Match por: APARTAMENTO_KEY + Día == fecha_entrada (date)
-    """
     if operativa_df is None or operativa_df.empty:
         return operativa_df
 
     if avantio_df is None or avantio_df.empty:
         out = operativa_df.copy()
-        # asegura columnas para que salgan en el Detalle KPI
-        if "Nº Adultos" not in out.columns:
-            out["Nº Adultos"] = 0
-        if "Nº Niños" not in out.columns:
-            out["Nº Niños"] = 0
-        if "Hora Check-in" not in out.columns:
-            out["Hora Check-in"] = "16:00"
+        out["Nº Adultos"] = 0
+        out["Nº Niños"] = 0
+        out["Hora Check-in"] = "16:00"
         return out
 
     av = avantio_df.copy()
 
-    # APARTAMENTO + KEY (ya los creas fuera, pero lo aseguro)
     if "APARTAMENTO" not in av.columns and "Alojamiento" in av.columns:
         av["APARTAMENTO"] = av["Alojamiento"].astype(str).str.strip()
     if "APARTAMENTO" in av.columns:
         av["APARTAMENTO"] = av["APARTAMENTO"].astype(str).str.strip()
         av["APARTAMENTO_KEY"] = av["APARTAMENTO"].map(_apt_key)
     else:
-        # si no hay ni Alojamiento ni APARTAMENTO, no podemos mapear
         out = operativa_df.copy()
         out["Nº Adultos"] = 0
         out["Nº Niños"] = 0
         out["Hora Check-in"] = "16:00"
         return out
 
-    # Columnas por letra (H, I, Z)
     try:
         col_ad = _col_by_excel_letter(av, "H")
         col_ch = _col_by_excel_letter(av, "I")
         col_ci = _col_by_excel_letter(av, "Z")
     except Exception:
-        # si el orden no coincide, no rompo la app
         out = operativa_df.copy()
         out["Nº Adultos"] = 0
         out["Nº Niños"] = 0
         out["Hora Check-in"] = "16:00"
         return out
 
-    # Fecha entrada (para casar con Día)
     dtcol = _detect_checkin_datetime_col(av)
     if dtcol is None:
         out = operativa_df.copy()
@@ -428,18 +412,10 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     av["Nº Niños"] = pd.to_numeric(av[col_ch], errors="coerce").fillna(0).astype(int)
     av["Hora Check-in"] = av[col_ci].apply(_parse_time_to_hhmm)
 
-    # Reducimos a claves únicas (si hay duplicados mismo apto/mismo día, nos quedamos con la primera fila no nula)
-    # (Esto suele pasar poco; si pasa, al menos no rompe.)
     av_small = (
         av.sort_values(["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .groupby(["APARTAMENTO_KEY", "_CHECKIN_DATE"], as_index=False)
-        .agg(
-            {
-                "Nº Adultos": "first",
-                "Nº Niños": "first",
-                "Hora Check-in": "first",
-            }
-        )
+        .agg({"Nº Adultos": "first", "Nº Niños": "first", "Hora Check-in": "first"})
         .rename(columns={"_CHECKIN_DATE": "Día"})
     )
 
@@ -447,21 +423,13 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     if "APARTAMENTO_KEY" not in out.columns:
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
-    # Asegura Día como date para merge
     out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
 
-    out = out.merge(
-        av_small,
-        on=["APARTAMENTO_KEY", "Día"],
-        how="left",
-        suffixes=("", "_av"),
-    )
+    out = out.merge(av_small, on=["APARTAMENTO_KEY", "Día"], how="left")
 
-    # Defaults si vacío
     out["Nº Adultos"] = pd.to_numeric(out.get("Nº Adultos"), errors="coerce").fillna(0).astype(int)
     out["Nº Niños"] = pd.to_numeric(out.get("Nº Niños"), errors="coerce").fillna(0).astype(int)
-    out["Hora Check-in"] = out.get("Hora Check-in")
-    out["Hora Check-in"] = out["Hora Check-in"].apply(_parse_time_to_hhmm)
+    out["Hora Check-in"] = out.get("Hora Check-in").apply(_parse_time_to_hhmm)
 
     return out
 
@@ -473,7 +441,6 @@ def main():
     from src.dashboard import build_dashboard_frames
     from src.gsheets import read_sheet_df
 
-    # build_last_report_view puede estar en src/cleaning_last_report.py o src/parsers/cleaning_last_report.py
     try:
         from src.cleaning_last_report import build_last_report_view
     except Exception:
@@ -636,13 +603,13 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # 👇 AQUI: enriquecemos la operativa con Adultos/Niños/Hora Check-in (desde Entradas)
+    # Enriquecemos la operativa con Adultos/Niños/Hora Check-in (desde Entradas)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
 
     # Filas del "día foco"
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
-    # Presenciales HOY
+    # ✅ Presenciales HOY: SOLO los que tienen ENTRADA hoy y son (Apolo 029/180/197/Serranos)
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
 
@@ -720,26 +687,27 @@ def main():
         st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
     # =========================
-    # 🔎 BUSCADOR PRINCIPAL (Limpieza + Operativa + Reposición)
+    # 🔎 BUSCADOR PRINCIPAL (MULTI) (Limpieza + Operativa + Reposición)
     # =========================
     st.divider()
     st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
+    st.caption("Puedes buscar varios separando por coma (,) o punto y coma (;). Ej: APOLO 29, SERRANOS")
 
     if "apt_query" not in st.session_state:
         st.session_state["apt_query"] = ""
-    if "apt_selected_key" not in st.session_state:
-        st.session_state["apt_selected_key"] = ""
+    if "apt_selected_keys" not in st.session_state:
+        st.session_state["apt_selected_keys"] = []
 
     st.text_input(
-        "Escribe el apartamento (o parte) y pulsa Enter",
+        "Escribe apartamento(s) y pulsa Enter",
         key="apt_query",
-        placeholder="Ej: APOLO 29, BENICALAP, ALMIRANTE...",
+        placeholder="Ej: APOLO 29, BENICALAP 01; SERRANOS",
     )
 
     if st.button("Buscar", key="btn_buscar_apto"):
-        st.session_state["apt_selected_key"] = _apt_key(st.session_state["apt_query"])
+        st.session_state["apt_selected_keys"] = _parse_multi_apts(st.session_state["apt_query"])
 
-    apt_key_sel = st.session_state.get("apt_selected_key", "").strip()
+    apt_keys_sel = st.session_state.get("apt_selected_keys", [])
 
     # Cargar sheet + construir último informe por apto
     last_view = pd.DataFrame()
@@ -752,46 +720,44 @@ def main():
         st.warning("No pude construir el último informe por apartamento desde Google Sheet.")
         st.exception(e)
 
-    if apt_key_sel:
+    if apt_keys_sel:
         # ===== Limpieza (último informe) =====
         st.markdown("### 🧹 Última limpieza (según Marca temporal)")
         if last_view is None or last_view.empty:
             st.info("No hay datos de limpieza disponibles.")
         else:
-            one = last_view[last_view["APARTAMENTO_KEY"] == apt_key_sel].copy()
+            one = last_view[last_view["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
             if one.empty:
-                st.info("No encuentro último informe para ese apartamento en la Sheet.")
+                st.info("No encuentro último informe para esos apartamentos en la Sheet.")
             else:
                 show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
                 show_cols = [c for c in show_cols if c in one.columns]
                 st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True, height="content")
 
         # ===== Operativa =====
-        st.markdown("### 🧾 Parte Operativo (solo este apartamento)")
-        op_one = oper_all[oper_all["APARTAMENTO_KEY"] == apt_key_sel].copy()
+        st.markdown("### 🧾 Parte Operativo (solo apartamentos seleccionados)")
+        op_one = oper_all[oper_all["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
         if op_one.empty:
-            st.info("No hay filas de operativa para ese apartamento en el periodo seleccionado.")
+            st.info("No hay filas de operativa para esos apartamentos en el periodo seleccionado.")
         else:
-            # Aplica filtros de sidebar
             if zonas_sel:
                 op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
             if estados_sel:
                 op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
 
             op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
-
             op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
-            _render_operativa_table(op_show, key=f"apt_oper_{apt_key_sel}", styled=True)
+            _render_operativa_table(op_show, key=f"apt_oper_multi_{'_'.join(apt_keys_sel[:3])}", styled=True)
 
-        # ===== Reposición (resumen de items en este apto) =====
-        st.markdown("### 📦 Reposición (solo este apartamento)")
+        # ===== Reposición (resumen de items en esos aptos) =====
+        st.markdown("### 📦 Reposición (solo apartamentos seleccionados)")
         if op_one.empty:
-            st.info("Sin reposición (no hay operativa para este apartamento).")
+            st.info("Sin reposición (no hay operativa para esos apartamentos).")
         else:
             cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
             rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
             if rep_rows.empty:
-                st.info("No veo columnas de reposición en la operativa para este apartamento.")
+                st.info("No veo columnas de reposición en la operativa para esos apartamentos.")
             else:
                 rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
                     lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
@@ -799,11 +765,11 @@ def main():
                 )
                 rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
                 if rep_rows.empty:
-                    st.info("No hay reposición indicada para este apartamento en el periodo.")
+                    st.info("No hay reposición indicada para esos apartamentos en el periodo.")
                 else:
-                    _render_operativa_table(rep_rows.reset_index(drop=True), key=f"apt_rep_{apt_key_sel}", styled=False)
+                    _render_operativa_table(rep_rows.reset_index(drop=True), key=f"apt_rep_multi_{'_'.join(apt_keys_sel[:3])}", styled=False)
     else:
-        st.caption("Escribe un apartamento y pulsa Enter o el botón Buscar. (No se muestra nada por defecto.)")
+        st.caption("Escribe uno o varios apartamentos y pulsa Buscar. (No se muestra nada por defecto.)")
 
     # =========================
     # Descarga Excel
@@ -824,8 +790,6 @@ def main():
 
     operativa = dash["operativa"].copy()
     operativa["APARTAMENTO_KEY"] = operativa["APARTAMENTO"].map(_apt_key)
-
-    # 👇 Importante: aquí también lo enriquecemos para que el PARTE COMPLETO lo tenga
     operativa = enrich_operativa_with_guest_fields(operativa, avantio_df)
 
     if zonas_sel:
