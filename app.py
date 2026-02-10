@@ -27,6 +27,83 @@ def _apt_key(s: str) -> str:
 
 
 # =========================
+# Excel-letter column helper
+# =========================
+def _col_by_excel_letter(df: pd.DataFrame, letter: str) -> str:
+    """
+    Devuelve el nombre de columna por letra Excel (A=0, B=1, ..., Z=25, AA=26...)
+    IMPORTANTE: depende de que el DF conserve el orden de columnas original del fichero.
+    """
+    letter = letter.upper().strip()
+    idx = 0
+    for ch in letter:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    idx -= 1
+    if idx < 0 or idx >= len(df.columns):
+        raise KeyError(f"No existe la columna {letter} en el DF (tamaño {len(df.columns)}).")
+    return df.columns[idx]
+
+
+# =========================
+# Hora check-in (default 16:00)
+# =========================
+def _parse_time_to_hhmm(x) -> str:
+    """
+    Convierte x a 'HH:MM'. Si está vacío/no parseable -> '16:00'
+    Acepta '16:00', '16.00', '16', '16h', '16:00:00', datetime/time, num.
+    """
+    if x is None:
+        return "16:00"
+    try:
+        if isinstance(x, float) and pd.isna(x):
+            return "16:00"
+    except Exception:
+        pass
+
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return "16:00"
+
+    s = s.lower().replace("h", "").replace(".", ":").strip()
+
+    # números tipo "16" / "16,0"
+    s_num = s.replace(",", ".")
+    try:
+        if ":" not in s_num and re.fullmatch(r"[0-9]+(\.[0-9]+)?", s_num):
+            hh = int(float(s_num))
+            hh = max(0, min(23, hh))
+            return f"{hh:02d}:00"
+    except Exception:
+        pass
+
+    # HH:MM(:SS)
+    try:
+        parts = s.split(":")
+        if len(parts) >= 2:
+            hh = int(parts[0])
+            mm = int(parts[1])
+            hh = max(0, min(23, hh))
+            mm = max(0, min(59, mm))
+            return f"{hh:02d}:{mm:02d}"
+        if len(parts) == 1 and parts[0].isdigit():
+            hh = int(parts[0])
+            hh = max(0, min(23, hh))
+            return f"{hh:02d}:00"
+    except Exception:
+        pass
+
+    # datetime/time
+    try:
+        dt = pd.to_datetime(x, errors="coerce")
+        if pd.notna(dt):
+            return dt.strftime("%H:%M")
+    except Exception:
+        pass
+
+    return "16:00"
+
+
+# =========================
 # Google Maps helpers
 # =========================
 def _coord_str(lat, lng):
@@ -225,9 +302,15 @@ def _agg_nonempty(series: pd.Series) -> str:
 
 
 def _kpi_table(df: pd.DataFrame, title: str):
+    """
+    Detalle KPI:
+    - QUITAMOS 'Próxima Entrada'
+    - AÑADIMOS 'Nº Adultos', 'Nº Niños', 'Hora Check-in'
+    """
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
+
     cols_show = [
         c
         for c in [
@@ -235,8 +318,10 @@ def _kpi_table(df: pd.DataFrame, title: str):
             "ZONA",
             "APARTAMENTO",
             "Cliente",
+            "Nº Adultos",
+            "Nº Niños",
+            "Hora Check-in",
             "Estado",
-            "Próxima Entrada",
             "Lista_reponer",
             "Completar con",
         ]
@@ -245,6 +330,140 @@ def _kpi_table(df: pd.DataFrame, title: str):
     st.markdown(f"#### {title}")
     view = df[cols_show].reset_index(drop=True)
     _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
+
+
+# =========================
+# Enriquecimiento: adultos/niños/hora check-in desde Avantio (Entradas)
+# =========================
+def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
+    """
+    Intenta detectar la columna de fecha/hora de entrada.
+    1) Busca por nombre
+    2) Fallback a letra D (muy habitual en tus exports)
+    """
+    name_hit = None
+    for c in avantio_df.columns:
+        cl = str(c).lower()
+        if "fecha" in cl and "entrada" in cl:
+            name_hit = c
+            break
+        if "check" in cl and "in" in cl:
+            name_hit = c
+            break
+
+    if name_hit is not None:
+        return name_hit
+
+    # fallback: letra D
+    try:
+        return _col_by_excel_letter(avantio_df, "D")
+    except Exception:
+        return None
+
+
+def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Añade a la operativa:
+      - Nº Adultos (H)
+      - Nº Niños (I)
+      - Hora Check-in (Z) default 16:00
+    Match por: APARTAMENTO_KEY + Día == fecha_entrada (date)
+    """
+    if operativa_df is None or operativa_df.empty:
+        return operativa_df
+
+    if avantio_df is None or avantio_df.empty:
+        out = operativa_df.copy()
+        # asegura columnas para que salgan en el Detalle KPI
+        if "Nº Adultos" not in out.columns:
+            out["Nº Adultos"] = 0
+        if "Nº Niños" not in out.columns:
+            out["Nº Niños"] = 0
+        if "Hora Check-in" not in out.columns:
+            out["Hora Check-in"] = "16:00"
+        return out
+
+    av = avantio_df.copy()
+
+    # APARTAMENTO + KEY (ya los creas fuera, pero lo aseguro)
+    if "APARTAMENTO" not in av.columns and "Alojamiento" in av.columns:
+        av["APARTAMENTO"] = av["Alojamiento"].astype(str).str.strip()
+    if "APARTAMENTO" in av.columns:
+        av["APARTAMENTO"] = av["APARTAMENTO"].astype(str).str.strip()
+        av["APARTAMENTO_KEY"] = av["APARTAMENTO"].map(_apt_key)
+    else:
+        # si no hay ni Alojamiento ni APARTAMENTO, no podemos mapear
+        out = operativa_df.copy()
+        out["Nº Adultos"] = 0
+        out["Nº Niños"] = 0
+        out["Hora Check-in"] = "16:00"
+        return out
+
+    # Columnas por letra (H, I, Z)
+    try:
+        col_ad = _col_by_excel_letter(av, "H")
+        col_ch = _col_by_excel_letter(av, "I")
+        col_ci = _col_by_excel_letter(av, "Z")
+    except Exception:
+        # si el orden no coincide, no rompo la app
+        out = operativa_df.copy()
+        out["Nº Adultos"] = 0
+        out["Nº Niños"] = 0
+        out["Hora Check-in"] = "16:00"
+        return out
+
+    # Fecha entrada (para casar con Día)
+    dtcol = _detect_checkin_datetime_col(av)
+    if dtcol is None:
+        out = operativa_df.copy()
+        out["Nº Adultos"] = 0
+        out["Nº Niños"] = 0
+        out["Hora Check-in"] = "16:00"
+        return out
+
+    av["_CHECKIN_DT"] = pd.to_datetime(av[dtcol], errors="coerce")
+    av["_CHECKIN_DATE"] = av["_CHECKIN_DT"].dt.date
+
+    av["Nº Adultos"] = pd.to_numeric(av[col_ad], errors="coerce").fillna(0).astype(int)
+    av["Nº Niños"] = pd.to_numeric(av[col_ch], errors="coerce").fillna(0).astype(int)
+    av["Hora Check-in"] = av[col_ci].apply(_parse_time_to_hhmm)
+
+    # Reducimos a claves únicas (si hay duplicados mismo apto/mismo día, nos quedamos con la primera fila no nula)
+    # (Esto suele pasar poco; si pasa, al menos no rompe.)
+    av_small = (
+        av.sort_values(["APARTAMENTO_KEY", "_CHECKIN_DATE"])
+        .groupby(["APARTAMENTO_KEY", "_CHECKIN_DATE"], as_index=False)
+        .agg(
+            {
+                "Nº Adultos": "first",
+                "Nº Niños": "first",
+                "Hora Check-in": "first",
+            }
+        )
+        .rename(columns={"_CHECKIN_DATE": "Día"})
+    )
+
+    out = operativa_df.copy()
+    if "APARTAMENTO_KEY" not in out.columns:
+        out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
+
+    # Asegura Día como date para merge
+    out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
+
+    out = out.merge(
+        av_small,
+        on=["APARTAMENTO_KEY", "Día"],
+        how="left",
+        suffixes=("", "_av"),
+    )
+
+    # Defaults si vacío
+    out["Nº Adultos"] = pd.to_numeric(out.get("Nº Adultos"), errors="coerce").fillna(0).astype(int)
+    out["Nº Niños"] = pd.to_numeric(out.get("Nº Niños"), errors="coerce").fillna(0).astype(int)
+    out["Hora Check-in"] = out.get("Hora Check-in")
+    out["Hora Check-in"] = out["Hora Check-in"].apply(_parse_time_to_hhmm)
+
+    return out
 
 
 def main():
@@ -416,6 +635,9 @@ def main():
 
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
+
+    # 👇 AQUI: enriquecemos la operativa con Adultos/Niños/Hora Check-in (desde Entradas)
+    oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
 
     # Filas del "día foco"
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
@@ -602,6 +824,9 @@ def main():
 
     operativa = dash["operativa"].copy()
     operativa["APARTAMENTO_KEY"] = operativa["APARTAMENTO"].map(_apt_key)
+
+    # 👇 Importante: aquí también lo enriquecemos para que el PARTE COMPLETO lo tenga
+    operativa = enrich_operativa_with_guest_fields(operativa, avantio_df)
 
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
