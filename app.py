@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 import unicodedata
+import os
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
@@ -29,10 +30,6 @@ def _apt_key(s: str) -> str:
 # Excel-letter column helper
 # =========================
 def _col_by_excel_letter(df: pd.DataFrame, letter: str) -> str:
-    """
-    Devuelve el nombre de columna por letra Excel (A=0, B=1, ..., Z=25, AA=26...)
-    OJO: esto SOLO es fiable si el DF conserva el orden exacto del Excel original.
-    """
     letter = letter.upper().strip()
     idx = 0
     for ch in letter:
@@ -123,14 +120,6 @@ def _clean_phone(x) -> str:
 # Acceso helpers
 # =========================
 def _norm_acceso(x) -> str:
-    """
-    Normaliza:
-    - Presencial
-    - Hoomvip
-    - Hoomvip + Candado
-    - Candado
-    Si viene vacío -> Presencial
-    """
     if x is None:
         return "Presencial"
     try:
@@ -156,11 +145,6 @@ def _norm_acceso(x) -> str:
 
 
 def _detect_acceso_col(df: pd.DataFrame) -> str | None:
-    """
-    Detecta la columna 'Acceso' del maestro de forma robusta:
-    1) Por nombre (exacto / contiene 'acceso')
-    2) Por contenido (la que más veces contiene presencial/hoomvip/candado)
-    """
     if df is None or df.empty:
         return None
 
@@ -185,10 +169,57 @@ def _detect_acceso_col(df: pd.DataFrame) -> str | None:
                 best = c
         except Exception:
             continue
+    return best if best_score > 0 else None
 
-    if best_score > 0:
-        return best
+
+# =========================
+# Localización helper (para sacar lat/lng)
+# =========================
+def _find_loc_col(cols) -> str | None:
+    for c in cols:
+        cl = str(c).lower().strip()
+        cl = (
+            cl.replace("ó", "o")
+            .replace("í", "i")
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("ú", "u")
+        )
+        if "local" in cl:
+            return c
     return None
+
+
+# =========================
+# Maestro override: leer Excel real si existe en /data
+# =========================
+def _load_apt_almacen_override(masters: dict) -> pd.DataFrame:
+    """
+    Prioridad:
+    1) data/Apartamentos e Inventarios.xlsx (o variantes)
+    2) masters["apt_almacen"]
+    """
+    candidates = [
+        os.path.join("data", "Apartamentos e Inventarios.xlsx"),
+        os.path.join("data", "Apartamentos_e_Inventarios.xlsx"),
+        os.path.join("data", "apartamentos e inventarios.xlsx"),
+        os.path.join("data", "apartamentos_e_inventarios.xlsx"),
+        os.path.join("data", "Apartamentos e Inventarios.xls"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                df = pd.read_excel(path, engine="openpyxl")
+                df.columns = [str(c).strip() for c in df.columns]
+                return df
+            except Exception:
+                pass
+
+    # fallback
+    if isinstance(masters, dict) and "apt_almacen" in masters:
+        return masters["apt_almacen"].copy()
+
+    return pd.DataFrame()
 
 
 # =========================
@@ -259,7 +290,7 @@ def _style_operativa(df: pd.DataFrame):
 
 
 # =========================
-# Render helper (NO HTML) + no cortar texto
+# Render helper
 # =========================
 def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     if df is None or df.empty:
@@ -275,10 +306,8 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
 
     if "APARTAMENTO" in view.columns:
         colcfg["APARTAMENTO"] = st.column_config.TextColumn("APARTAMENTO", width="medium", max_chars=5000)
-
     if "Acceso" in view.columns:
         colcfg["Acceso"] = st.column_config.TextColumn("Acceso", width="medium", max_chars=200)
-
     if "Teléfono" in view.columns:
         colcfg["Teléfono"] = st.column_config.TextColumn("Teléfono", width="medium", max_chars=200)
 
@@ -480,24 +509,6 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     return out
 
 
-# =========================
-# Localización helper (para sacar lat/lng)
-# =========================
-def _find_loc_col(cols) -> str | None:
-    for c in cols:
-        cl = str(c).lower().strip()
-        cl = (
-            cl.replace("ó", "o")
-            .replace("í", "i")
-            .replace("á", "a")
-            .replace("é", "e")
-            .replace("ú", "u")
-        )
-        if "local" in cl:
-            return c
-    return None
-
-
 def main():
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
@@ -512,15 +523,6 @@ def main():
 
     st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
     st.title("Florit OPS – Parte diario (Operativa + Reposición)")
-
-    with st.expander("📌 Cómo usar", expanded=False):
-        st.markdown(
-            """
-**Sube 2 archivos diarios:**
-- **Avantio (Entradas)**: .xls / .xlsx / .csv / (xls HTML de Avantio)
-- **Odoo (stock.quant)**: .xlsx / .csv
-"""
-        )
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
@@ -597,9 +599,25 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     # =========================
-    # Maestro apt_almacen (Apartamentos e Inventarios)
+    # Maestro apt_almacen (FORZADO desde data/ si existe)
     # =========================
-    ap_map = masters["apt_almacen"].copy()
+    ap_map = _load_apt_almacen_override(masters)
+
+    # Normaliza headers
+    ap_map.columns = [str(c).strip() for c in ap_map.columns]
+
+    # Asegura columnas base
+    if "APARTAMENTO" not in ap_map.columns:
+        # intenta detectar columna con nombre parecido
+        for c in ap_map.columns:
+            if "apart" in str(c).lower():
+                ap_map = ap_map.rename(columns={c: "APARTAMENTO"})
+                break
+    if "ALMACEN" not in ap_map.columns:
+        for c in ap_map.columns:
+            if "almac" in str(c).lower():
+                ap_map = ap_map.rename(columns={c: "ALMACEN"})
+                break
 
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
@@ -610,14 +628,14 @@ def main():
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
     ap_map["APARTAMENTO_KEY"] = ap_map["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Acceso: NO usamos "columna D". Detectamos columna real por nombre o contenido.
+    # Acceso real
     acc_col = _detect_acceso_col(ap_map)
     if acc_col is None:
         ap_map["Acceso"] = "Presencial"
     else:
         ap_map["Acceso"] = ap_map[acc_col].apply(_norm_acceso)
 
-    # Coordenadas desde "Localización"
+    # Coordenadas desde Localización
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
@@ -690,12 +708,28 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Acceso fijo del maestro (merge por KEY)
+    # ✅ Merge Acceso fijo (si no match -> NaN -> Presencial)
     oper_all = oper_all.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left")
     oper_all["Acceso"] = oper_all["Acceso"].apply(_norm_acceso)
 
     # Enriquecemos (adultos/niños/checkin/teléfono)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
+
+    # Debug: ver si está macheando
+    with st.expander("🧪 Debug Acceso (macheo maestro)", expanded=False):
+        st.write("Columna detectada como Acceso en maestro:", acc_col)
+        st.write("Distribución Acceso en maestro:")
+        st.dataframe(ap_map["Acceso"].value_counts(dropna=False).reset_index().rename(columns={"index": "Acceso", "Acceso": "n"}))
+
+        missing = oper_all[oper_all["APARTAMENTO_KEY"].notna() & oper_all["Acceso"].eq("Presencial")].copy()
+        # ojo: aquí "Presencial" incluye presenciales reales; por eso mostramos además los NO encontrados:
+        # detectamos no encontrados mirando el merge original antes de norm: recreamos rápido
+        tmp = dash["operativa"].copy()
+        tmp["APARTAMENTO_KEY"] = tmp["APARTAMENTO"].map(_apt_key)
+        tmp = tmp.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left", indicator=True)
+        no_match = tmp[tmp["_merge"] == "left_only"][["APARTAMENTO"]].drop_duplicates().head(50)
+        st.write("Apartamentos en operativa SIN MATCH en maestro (primeros 50):")
+        st.dataframe(no_match, use_container_width=True)
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
@@ -775,9 +809,6 @@ def main():
 
         st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
-    # =========================
-    # Descarga Excel
-    # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
@@ -785,9 +816,7 @@ def main():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # =========================
-    # PARTE OPERATIVO COMPLETO
-    # =========================
+    # PARTE OPERATIVO COMPLETO (sin cambios respecto a tu lógica previa)
     st.divider()
     st.subheader("PARTE OPERATIVO · Entradas / Salidas / Ocupación / Vacíos + Reposición")
     st.caption(f"Periodo: {dash['period_start']} → {dash['period_end']} · Prioridad: Entradas arriba · Agrupado por ZONA")
@@ -817,9 +846,6 @@ def main():
                 styled=True,
             )
 
-    # =========================
-    # SUGERENCIA DE REPOSICIÓN
-    # =========================
     st.divider()
     st.subheader("Sugerencia de Reposición")
 
@@ -841,9 +867,6 @@ def main():
             st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
             _render_operativa_table(items_df, key="sugerencia_items", styled=False)
 
-    # =========================
-    # RUTAS GOOGLE MAPS
-    # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
     st.caption("Criterio: con reposición y Estado == VACIO o ENTRADA o ENTRADA+SALIDA ese día. Botones directos a Maps.")
