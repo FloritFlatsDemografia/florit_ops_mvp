@@ -4,8 +4,6 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 import unicodedata
-import os
-import inspect
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
@@ -23,7 +21,8 @@ def _apt_key(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # quita tildes
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\b0+(\d)", r"\1", s)  # "APOLO 029" -> "APOLO 29"
+    # Quita ceros iniciales en números sueltos: "APOLO 029" -> "APOLO 29"
+    s = re.sub(r"\b0+(\d)", r"\1", s)
     return s.upper().strip()
 
 
@@ -31,6 +30,10 @@ def _apt_key(s: str) -> str:
 # Excel-letter column helper
 # =========================
 def _col_by_excel_letter(df: pd.DataFrame, letter: str) -> str:
+    """
+    Devuelve el nombre de columna por letra Excel (A=0, B=1, ..., Z=25, AA=26...)
+    IMPORTANTE: depende de que el DF conserve el orden de columnas original del fichero.
+    """
     letter = letter.upper().strip()
     idx = 0
     for ch in letter:
@@ -45,6 +48,10 @@ def _col_by_excel_letter(df: pd.DataFrame, letter: str) -> str:
 # Hora check-in (default 16:00)
 # =========================
 def _parse_time_to_hhmm(x) -> str:
+    """
+    Convierte x a 'HH:MM'. Si está vacío/no parseable -> '16:00'
+    Acepta '16:00', '16.00', '16', '16h', '16:00:00', datetime/time, num.
+    """
     if x is None:
         return "16:00"
     try:
@@ -59,6 +66,7 @@ def _parse_time_to_hhmm(x) -> str:
 
     s = s.lower().replace("h", "").replace(".", ":").strip()
 
+    # números tipo "16" / "16,0"
     s_num = s.replace(",", ".")
     try:
         if ":" not in s_num and re.fullmatch(r"[0-9]+(\.[0-9]+)?", s_num):
@@ -68,6 +76,7 @@ def _parse_time_to_hhmm(x) -> str:
     except Exception:
         pass
 
+    # HH:MM(:SS)
     try:
         parts = s.split(":")
         if len(parts) >= 2:
@@ -83,6 +92,7 @@ def _parse_time_to_hhmm(x) -> str:
     except Exception:
         pass
 
+    # datetime/time
     try:
         dt = pd.to_datetime(x, errors="coerce")
         if pd.notna(dt):
@@ -97,6 +107,12 @@ def _parse_time_to_hhmm(x) -> str:
 # Teléfono helpers
 # =========================
 def _clean_phone(x) -> str:
+    """
+    Limpieza conservadora:
+    - Mantiene dígitos
+    - Permite '+' al inicio
+    - Quita espacios y separadores raros
+    """
     if x is None:
         return ""
     try:
@@ -109,118 +125,12 @@ def _clean_phone(x) -> str:
     if not s or s.lower() in {"nan", "none"}:
         return ""
 
-    s = s.replace("\u00A0", " ").strip()
+    s = s.replace("\u00A0", " ").strip()  # nbsp
     has_plus = s.startswith("+")
     digits = re.sub(r"\D+", "", s)
     if not digits:
         return ""
     return ("+" if has_plus else "") + digits
-
-
-# =========================
-# Acceso helpers
-# =========================
-def _norm_acceso(x) -> str:
-    if x is None:
-        return "Presencial"
-    try:
-        if isinstance(x, float) and pd.isna(x):
-            return "Presencial"
-    except Exception:
-        pass
-
-    s = str(x).strip()
-    if not s or s.lower() in {"nan", "none"}:
-        return "Presencial"
-
-    s_low = s.lower()
-    if "hoomvip" in s_low and "candado" in s_low:
-        return "Hoomvip + Candado"
-    if "hoomvip" in s_low:
-        return "Hoomvip"
-    if "candado" in s_low:
-        return "Candado"
-    if "presencial" in s_low:
-        return "Presencial"
-    return s[:1].upper() + s[1:]
-
-
-def _detect_acceso_col(df: pd.DataFrame) -> str | None:
-    if df is None or df.empty:
-        return None
-
-    # 1) Por nombre
-    for c in df.columns:
-        if str(c).strip().lower() == "acceso":
-            return c
-    for c in df.columns:
-        if "acceso" in str(c).strip().lower():
-            return c
-
-    # 2) Por contenido
-    pat = r"(presencial|hoomvip|candado)"
-    best = None
-    best_score = 0
-    for c in df.columns:
-        try:
-            s = df[c].astype(str).str.lower()
-            score = int(s.str.contains(pat, na=False).sum())
-            if score > best_score:
-                best_score = score
-                best = c
-        except Exception:
-            continue
-    return best if best_score > 0 else None
-
-
-# =========================
-# Localización helper (para sacar lat/lng)
-# =========================
-def _find_loc_col(cols) -> str | None:
-    for c in cols:
-        cl = str(c).lower().strip()
-        cl = (
-            cl.replace("ó", "o")
-            .replace("í", "i")
-            .replace("á", "a")
-            .replace("é", "e")
-            .replace("ú", "u")
-        )
-        if "local" in cl:
-            return c
-    return None
-
-
-# =========================
-# Maestro override: leer Excel real si existe en /data
-# =========================
-def _load_apt_almacen_override(masters: dict) -> pd.DataFrame:
-    """
-    Prioridad:
-    1) data/Apartamentos e Inventarios.xlsx (o variantes)
-    2) masters["apt_almacen"]
-    """
-    candidates = [
-        os.path.join("data", "Apartamentos e Inventarios.xlsx"),
-        os.path.join("data", "Apartamentos_e_Inventarios.xlsx"),
-        os.path.join("data", "apartamentos e inventarios.xlsx"),
-        os.path.join("data", "apartamentos_e_inventarios.xlsx"),
-        os.path.join("data", "Apartamentos e Inventarios.xls"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                df = pd.read_excel(path, engine="openpyxl")
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-            except Exception:
-                pass
-
-    # fallback
-    if isinstance(masters, dict) and "apt_almacen" in masters:
-        return masters["apt_almacen"].copy()
-
-    return pd.DataFrame()
 
 
 # =========================
@@ -291,7 +201,7 @@ def _style_operativa(df: pd.DataFrame):
 
 
 # =========================
-# Render helper
+# Render helper (NO HTML) + no cortar texto
 # =========================
 def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     if df is None or df.empty:
@@ -303,12 +213,15 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     colcfg = {}
     for c in ["Lista_reponer", "Completar con", "Producto", "Cliente"]:
         if c in view.columns:
-            colcfg[c] = st.column_config.TextColumn(c, width="large", max_chars=10000)
+            colcfg[c] = st.column_config.TextColumn(
+                c,
+                width="large",
+                max_chars=10000,
+            )
 
     if "APARTAMENTO" in view.columns:
         colcfg["APARTAMENTO"] = st.column_config.TextColumn("APARTAMENTO", width="medium", max_chars=5000)
-    if "Acceso" in view.columns:
-        colcfg["Acceso"] = st.column_config.TextColumn("Acceso", width="medium", max_chars=200)
+
     if "Teléfono" in view.columns:
         colcfg["Teléfono"] = st.column_config.TextColumn("Teléfono", width="medium", max_chars=200)
 
@@ -392,9 +305,30 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 
 
 # =========================
-# KPI table
+# Google Sheet helpers
 # =========================
+def _agg_nonempty(series: pd.Series) -> str:
+    vals = []
+    for x in series.tolist():
+        s = str(x).strip()
+        if s and s.lower() not in {"nan", "none"}:
+            vals.append(s)
+    seen = set()
+    out = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return " | ".join(out)
+
+
 def _kpi_table(df: pd.DataFrame, title: str):
+    """
+    Detalle KPI:
+    - QUITAMOS 'Próxima Entrada'
+    - AÑADIMOS 'Nº Adultos', 'Nº Niños', 'Hora Check-in'
+    - AÑADIMOS 'Teléfono'
+    """
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
@@ -405,7 +339,6 @@ def _kpi_table(df: pd.DataFrame, title: str):
             "Día",
             "ZONA",
             "APARTAMENTO",
-            "Acceso",
             "Cliente",
             "Teléfono",
             "Nº Adultos",
@@ -417,7 +350,6 @@ def _kpi_table(df: pd.DataFrame, title: str):
         ]
         if c in df.columns
     ]
-
     st.markdown(f"#### {title}")
     view = df[cols_show].reset_index(drop=True)
     _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
@@ -427,12 +359,18 @@ def _kpi_table(df: pd.DataFrame, title: str):
 # Enriquecimiento: adultos/niños/hora check-in/teléfono desde Avantio (Entradas)
 # =========================
 def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
+    """
+    Intenta detectar la columna de fecha/hora de entrada.
+    1) Busca por nombre
+    2) Fallback a letra D (habitual en tus exports)
+    """
     for c in avantio_df.columns:
         cl = str(c).lower()
         if "fecha" in cl and "entrada" in cl:
             return c
         if "check" in cl and "in" in cl:
             return c
+
     try:
         return _col_by_excel_letter(avantio_df, "D")
     except Exception:
@@ -440,8 +378,19 @@ def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
 
 
 def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Añade a la operativa (desde Entradas):
+      - Nº Adultos (H)
+      - Nº Niños (I)
+      - Hora Check-in (Z) default 16:00
+      - Teléfono (N)
+
+    Match por: APARTAMENTO_KEY + Día == fecha_entrada (date)
+    Blindado: no revienta si faltan columnas o si no hay match.
+    """
     out = operativa_df.copy()
 
+    # 1) Garantiza columnas SIEMPRE (evita KeyError)
     if "Nº Adultos" not in out.columns:
         out["Nº Adultos"] = 0
     if "Nº Niños" not in out.columns:
@@ -458,6 +407,7 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
 
     av = avantio_df.copy()
 
+    # Alojamiento -> APARTAMENTO
     if "APARTAMENTO" not in av.columns and "Alojamiento" in av.columns:
         av["APARTAMENTO"] = av["Alojamiento"].astype(str).str.strip()
 
@@ -467,11 +417,12 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     av["APARTAMENTO"] = av["APARTAMENTO"].astype(str).str.strip()
     av["APARTAMENTO_KEY"] = av["APARTAMENTO"].map(_apt_key)
 
+    # Columnas por letra
     try:
         col_ad = _col_by_excel_letter(av, "H")
         col_ch = _col_by_excel_letter(av, "I")
         col_ci = _col_by_excel_letter(av, "Z")
-        col_tel = _col_by_excel_letter(av, "N")
+        col_tel = _col_by_excel_letter(av, "N")  # ✅ TELÉFONO (columna N)
     except Exception:
         return out
 
@@ -499,166 +450,25 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
     out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
+
     out = out.merge(av_small, on=["APARTAMENTO_KEY", "Día"], how="left")
 
-    out["Nº Adultos"] = pd.to_numeric(out["AV_ADULTOS"], errors="coerce").fillna(out["Nº Adultos"]).fillna(0).astype(int)
-    out["Nº Niños"] = pd.to_numeric(out["AV_NINOS"], errors="coerce").fillna(out["Nº Niños"]).fillna(0).astype(int)
+    # Coalesce + defaults
+    out["Nº Adultos"] = (
+        pd.to_numeric(out["AV_ADULTOS"], errors="coerce").fillna(out["Nº Adultos"]).fillna(0).astype(int)
+    )
+    out["Nº Niños"] = (
+        pd.to_numeric(out["AV_NINOS"], errors="coerce").fillna(out["Nº Niños"]).fillna(0).astype(int)
+    )
+
+    # Hora check-in: si viene vacía -> 16:00
     out["Hora Check-in"] = out["AV_CHECKIN"].fillna(out["Hora Check-in"]).apply(_parse_time_to_hhmm)
+
+    # Teléfono
     out["Teléfono"] = out["AV_TEL"].fillna(out["Teléfono"]).fillna("")
 
     out = out.drop(columns=["AV_ADULTOS", "AV_NINOS", "AV_CHECKIN", "AV_TEL"], errors="ignore")
     return out
-
-
-# =========================
-# Informe de limpieza (Drive/APPI) - robusto y visible
-# =========================
-def _get_secret_any(keys: list[str]) -> str | None:
-    # 1) st.secrets
-    for k in keys:
-        try:
-            v = st.secrets.get(k, None)
-            if v:
-                return str(v).strip()
-        except Exception:
-            pass
-    # 2) env
-    for k in keys:
-        v = os.environ.get(k)
-        if v:
-            return str(v).strip()
-    return None
-
-
-def render_informe_limpieza(read_sheet_df_func, build_last_report_view_func):
-    st.divider()
-    st.subheader("🧽 Informe de limpieza (Drive / APPI)")
-    st.caption("Si esto falla por credenciales/ID, aquí verás el error (no vuelve a ‘desaparecer’).")
-
-    cA, cB = st.columns([1, 2])
-    with cA:
-        force_reload = st.button("🔄 Recargar informe", key="btn_reload_cleaning_report")
-    with cB:
-        show_debug = st.checkbox("Mostrar debug", value=False, key="chk_debug_cleaning_report")
-
-    # Cache simple en session_state
-    if "cleaning_report_payload" not in st.session_state:
-        st.session_state["cleaning_report_payload"] = None
-
-    if force_reload:
-        st.session_state["cleaning_report_payload"] = None
-
-    if st.session_state["cleaning_report_payload"] is not None:
-        payload = st.session_state["cleaning_report_payload"]
-    else:
-        # Intenta resolver IDs típicos
-        sheet_id = _get_secret_any(
-            ["CLEANING_REPORT_SHEET_ID", "APPI_SHEET_ID", "INFORME_LIMPIEZA_SHEET_ID", "SHEET_ID_LIMPIEZA"]
-        )
-        folder_id = _get_secret_any(
-            ["CLEANING_REPORT_FOLDER_ID", "APPI_FOLDER_ID", "INFORME_LIMPIEZA_FOLDER_ID", "FOLDER_ID_LIMPIEZA"]
-        )
-        sheet_name = _get_secret_any(["CLEANING_REPORT_TAB", "APPI_TAB", "INFORME_LIMPIEZA_TAB"]) or None
-
-        try:
-            sig = inspect.signature(build_last_report_view_func)
-            kwargs = {}
-
-            # Pasamos lo que el builder declare
-            for p in sig.parameters.values():
-                nm = p.name.lower()
-
-                if nm in {"read_sheet_df", "reader", "read_df"}:
-                    kwargs[p.name] = read_sheet_df_func
-                elif nm in {"sheet_id", "spreadsheet_id", "gsheet_id", "id_sheet"} and sheet_id:
-                    kwargs[p.name] = sheet_id
-                elif nm in {"folder_id", "drive_folder_id"} and folder_id:
-                    kwargs[p.name] = folder_id
-                elif nm in {"sheet_name", "tab", "worksheet", "worksheet_name"} and sheet_name:
-                    kwargs[p.name] = sheet_name
-
-            payload = build_last_report_view_func(**kwargs)
-            st.session_state["cleaning_report_payload"] = payload
-
-        except TypeError as e:
-            # Fallback: llamadas comunes
-            try:
-                if sheet_id:
-                    payload = build_last_report_view_func(read_sheet_df_func, sheet_id)
-                else:
-                    payload = build_last_report_view_func(read_sheet_df_func)
-                st.session_state["cleaning_report_payload"] = payload
-            except Exception as e2:
-                st.error("Error construyendo Informe de limpieza.")
-                st.exception(e2)
-                if show_debug:
-                    st.write("sheet_id detectado:", sheet_id)
-                    st.write("folder_id detectado:", folder_id)
-                    st.write("sheet_name detectado:", sheet_name)
-                    st.write("Firma build_last_report_view:", str(inspect.signature(build_last_report_view_func)))
-                return
-        except Exception as e:
-            st.error("Error construyendo Informe de limpieza.")
-            st.exception(e)
-            if show_debug:
-                st.write("sheet_id detectado:", sheet_id)
-                st.write("folder_id detectado:", folder_id)
-                st.write("sheet_name detectado:", sheet_name)
-                st.write("Firma build_last_report_view:", str(inspect.signature(build_last_report_view_func)))
-            return
-
-    # Render del payload (acepta varios formatos)
-    try:
-        df = None
-        excel_bytes = None
-        meta = None
-
-        if isinstance(payload, pd.DataFrame):
-            df = payload
-        elif isinstance(payload, dict):
-            # formatos frecuentes
-            df = payload.get("df") or payload.get("data") or payload.get("table")
-            excel_bytes = payload.get("excel") or payload.get("xlsx") or payload.get("bytes")
-            meta = payload.get("meta") or payload.get("info")
-        elif isinstance(payload, (tuple, list)) and len(payload) >= 1:
-            # (df, excel_bytes?, meta?)
-            df = payload[0]
-            if len(payload) >= 2:
-                excel_bytes = payload[1]
-            if len(payload) >= 3:
-                meta = payload[2]
-
-        if meta and show_debug:
-            st.write("Meta:", meta)
-
-        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            st.warning("Informe cargado pero sin datos (o formato no reconocido).")
-            if show_debug:
-                st.write("Tipo payload:", type(payload))
-                st.write("Payload raw:", payload)
-            return
-
-        if not isinstance(df, pd.DataFrame):
-            # último intento: convertir
-            df = pd.DataFrame(df)
-
-        st.dataframe(df, use_container_width=True, height="content")
-
-        if excel_bytes:
-            st.download_button(
-                "⬇️ Descargar Informe (Excel)",
-                data=excel_bytes,
-                file_name="informe_limpieza.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_informe_limpieza",
-            )
-
-    except Exception as e:
-        st.error("No se pudo renderizar el Informe de limpieza (formato inesperado).")
-        st.exception(e)
-        if show_debug:
-            st.write("Tipo payload:", type(payload))
-            st.write("Payload raw:", payload)
 
 
 def main():
@@ -668,6 +478,7 @@ def main():
     from src.dashboard import build_dashboard_frames
     from src.gsheets import read_sheet_df
 
+    # build_last_report_view puede estar en src/cleaning_last_report.py o src/parsers/cleaning_last_report.py
     try:
         from src.cleaning_last_report import build_last_report_view
     except Exception:
@@ -675,6 +486,21 @@ def main():
 
     st.set_page_config(page_title="Florit OPS – Operativa & Reposición", layout="wide")
     st.title("Florit OPS – Parte diario (Operativa + Reposición)")
+
+    with st.expander("📌 Cómo usar", expanded=False):
+        st.markdown(
+            """
+**Sube 2 archivos diarios:**
+- **Avantio (Entradas)**: .xls / .xlsx / .csv / (xls HTML de Avantio)
+- **Odoo (stock.quant)**: .xlsx / .csv
+
+📌 Maestros en `data/` (GitHub):
+- Zonas
+- Apartamentos e Inventarios (ALMACEN + Localización)
+- Café por apartamento
+- Stock mínimo/máximo
+"""
+        )
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
@@ -735,7 +561,7 @@ def main():
         st.error("Odoo: no se pudieron leer datos del stock.quant.")
         st.stop()
 
-    # Normaliza APARTAMENTO (Avantio)
+    # Normaliza APARTAMENTO
     if "Alojamiento" in avantio_df.columns:
         avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     elif "APARTAMENTO" in avantio_df.columns:
@@ -750,75 +576,38 @@ def main():
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
-    # =========================
-    # Maestro apt_almacen (FORZADO desde data/ si existe)
-    # =========================
-    ap_map = _load_apt_almacen_override(masters)
-
-    # Normaliza headers
-    ap_map.columns = [str(c).strip() for c in ap_map.columns]
-
-    # Asegura columnas base
-    if "APARTAMENTO" not in ap_map.columns:
-        for c in ap_map.columns:
-            if "apart" in str(c).lower():
-                ap_map = ap_map.rename(columns={c: "APARTAMENTO"})
-                break
-    if "ALMACEN" not in ap_map.columns:
-        for c in ap_map.columns:
-            if "almac" in str(c).lower():
-                ap_map = ap_map.rename(columns={c: "ALMACEN"})
-                break
-
+    ap_map = masters["apt_almacen"].copy()
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
         st.stop()
 
-    ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
-    ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
-    ap_map["APARTAMENTO_KEY"] = ap_map["APARTAMENTO"].map(_apt_key)
-
-    # Acceso real
-    acc_col = _detect_acceso_col(ap_map)
-    if acc_col is None:
-        ap_map["Acceso"] = "Presencial"
-    else:
-        ap_map["Acceso"] = ap_map[acc_col].apply(_norm_acceso)
-
-    # Coordenadas desde Localización
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
 
-    loc_col = _find_loc_col(ap_map.columns)
+    if "Localizacion" in ap_map.columns:
 
-    def _split_loc(x):
-        s = str(x).strip()
-        if "," in s:
-            a, b = s.split(",", 1)
-            return a.strip(), b.strip()
-        return None, None
+        def _split_loc(x):
+            s = str(x).strip()
+            if "," in s:
+                a, b = s.split(",", 1)
+                return a.strip(), b.strip()
+            return None, None
 
-    if loc_col is not None:
         miss = ap_map["LAT"].isna() | ap_map["LNG"].isna()
         if miss.any():
-            loc_pairs = ap_map.loc[miss, loc_col].apply(_split_loc)
+            loc_pairs = ap_map.loc[miss, "Localizacion"].apply(_split_loc)
             ap_map.loc[miss, "LAT"] = [p[0] for p in loc_pairs]
             ap_map.loc[miss, "LNG"] = [p[1] for p in loc_pairs]
 
-    ap_map = (
-        ap_map[["APARTAMENTO", "APARTAMENTO_KEY", "ALMACEN", "LAT", "LNG", "Acceso"]]
-        .dropna(subset=["APARTAMENTO_KEY", "ALMACEN"])
-        .drop_duplicates(subset=["APARTAMENTO_KEY"], keep="first")
-    )
+    ap_map = ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]].dropna(subset=["APARTAMENTO", "ALMACEN"]).drop_duplicates()
+    ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
+    ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # Merge coords/almacén a Avantio (rutas)
-    avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
+    avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-    # =========================
     # Stock normalize
-    # =========================
     odoo_norm = normalize_products(odoo_df)
     if "Ubicación" in odoo_norm.columns:
         odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
@@ -847,7 +636,7 @@ def main():
     )
 
     # =========================
-    # DASHBOARD KPIs + detalle
+    # ✅ DASHBOARD ARRIBA + "CLICK" (botones) para ver listados
     # =========================
     if "kpi_open" not in st.session_state:
         st.session_state["kpi_open"] = ""
@@ -859,36 +648,22 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Merge Acceso fijo (si no match -> NaN -> Presencial)
-    oper_all = oper_all.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left")
-    oper_all["Acceso"] = oper_all["Acceso"].apply(_norm_acceso)
-
-    # Enriquecemos (adultos/niños/checkin/teléfono)
+    # Enriquecemos la operativa con Adultos/Niños/Hora Check-in/Teléfono (desde Entradas)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
 
-    # Debug: ver si está macheando
-    with st.expander("🧪 Debug Acceso (macheo maestro)", expanded=False):
-        st.write("Columna detectada como Acceso en maestro:", acc_col)
-        st.write("Distribución Acceso en maestro:")
-        st.dataframe(ap_map["Acceso"].value_counts(dropna=False).reset_index().rename(columns={"index": "Acceso", "Acceso": "n"}))
-
-        tmp = dash["operativa"].copy()
-        tmp["APARTAMENTO_KEY"] = tmp["APARTAMENTO"].map(_apt_key)
-        tmp = tmp.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left", indicator=True)
-        no_match = tmp[tmp["_merge"] == "left_only"][["APARTAMENTO"]].drop_duplicates().head(50)
-        st.write("Apartamentos en operativa SIN MATCH en maestro (primeros 50):")
-        st.dataframe(no_match, use_container_width=True)
-
+    # Filas del "día foco"
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
-    # Presenciales (tu lógica original)
+    # ✅ Presenciales calculados para el DÍA FOCO
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
+
     pres_df = oper_all[
         (oper_all["Día"] == foco_day)
         & (oper_all["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
         & (oper_all["APARTAMENTO_KEY"].isin(presencial_keys))
     ].copy()
+
     pres_label = "HOY" if foco_day == today_real else pd.to_datetime(foco_day).strftime("%d/%m/%Y")
 
     kpis = dash.get("kpis", {})
@@ -927,6 +702,7 @@ def main():
         if st.button("Ver presenciales", key="kpi_btn_presenciales"):
             st.session_state["kpi_open"] = "presenciales"
 
+    # Render del listado "clicado"
     kpi_open = st.session_state.get("kpi_open", "")
     if kpi_open:
         st.divider()
@@ -957,6 +733,105 @@ def main():
 
         st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
 
+    # =========================
+    # 🔎 BUSCADOR PRINCIPAL (MULTISELECT) (Limpieza + Operativa + Reposición)
+    # =========================
+    st.divider()
+    st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
+    st.caption("Selecciona uno o varios apartamentos del listado (es buscable).")
+
+    # opciones: listado completo desde apt_almacen (A)
+    apt_options = []
+    try:
+        apt_options = (
+            masters["apt_almacen"]["APARTAMENTO"].dropna().astype(str).str.strip().tolist()
+            if "apt_almacen" in masters and "APARTAMENTO" in masters["apt_almacen"].columns
+            else []
+        )
+    except Exception:
+        apt_options = []
+
+    apt_options = sorted([a for a in apt_options if a and a.lower() not in {"nan", "none"}])
+
+    # default: nada seleccionado
+    if "apt_selected" not in st.session_state:
+        st.session_state["apt_selected"] = []
+
+    selected_apts = st.multiselect(
+        "Apartamentos",
+        options=apt_options,
+        default=st.session_state["apt_selected"],
+        key="apt_selected",
+        placeholder="Escribe para buscar…",
+    )
+
+    apt_keys_sel = [_apt_key(a) for a in selected_apts]
+
+    # Cargar sheet + construir último informe por apto
+    last_view = pd.DataFrame()
+    try:
+        sheet_df = read_sheet_df()
+        if sheet_df is not None and not sheet_df.empty:
+            last_view = build_last_report_view(sheet_df)
+            last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
+    except Exception as e:
+        st.warning("No pude construir el último informe por apartamento desde Google Sheet.")
+        st.exception(e)
+
+    if apt_keys_sel:
+        # ===== Limpieza (último informe) =====
+        st.markdown("### 🧹 Última limpieza (según Marca temporal)")
+        if last_view is None or last_view.empty:
+            st.info("No hay datos de limpieza disponibles.")
+        else:
+            one = last_view[last_view["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
+            if one.empty:
+                st.info("No encuentro último informe para esos apartamentos en la Sheet.")
+            else:
+                show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
+                show_cols = [c for c in show_cols if c in one.columns]
+                st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True, height="content")
+
+        # ===== Operativa =====
+        st.markdown("### 🧾 Parte Operativo (apartamentos seleccionados)")
+        op_one = oper_all[oper_all["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
+        if op_one.empty:
+            st.info("No hay filas de operativa para esos apartamentos en el periodo seleccionado.")
+        else:
+            if zonas_sel:
+                op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
+            if estados_sel:
+                op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
+
+            op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
+            op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
+            _render_operativa_table(op_show, key="apt_oper_multiselect", styled=True)
+
+        # ===== Reposición =====
+        st.markdown("### 📦 Reposición (apartamentos seleccionados)")
+        if op_one.empty:
+            st.info("Sin reposición (no hay operativa para esos apartamentos).")
+        else:
+            cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
+            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO"]].copy() if cols_rep else pd.DataFrame()
+            if rep_rows.empty:
+                st.info("No veo columnas de reposición en la operativa para esos apartamentos.")
+            else:
+                rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
+                    lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
+                    axis=1,
+                )
+                rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
+                if rep_rows.empty:
+                    st.info("No hay reposición indicada para esos apartamentos en el periodo.")
+                else:
+                    _render_operativa_table(rep_rows.reset_index(drop=True), key="apt_rep_multiselect", styled=False)
+    else:
+        st.caption("Selecciona uno o varios apartamentos para ver el resumen.")
+
+    # =========================
+    # Descarga Excel
+    # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
@@ -965,16 +840,15 @@ def main():
     )
 
     # =========================
-    # ✅ INFORME DE LIMPIEZA (RESTURADO)
+    # PARTE OPERATIVO COMPLETO
     # =========================
-    render_informe_limpieza(read_sheet_df, build_last_report_view)
-
-    # PARTE OPERATIVO COMPLETO (sin cambios respecto a tu lógica previa)
     st.divider()
     st.subheader("PARTE OPERATIVO · Entradas / Salidas / Ocupación / Vacíos + Reposición")
     st.caption(f"Periodo: {dash['period_start']} → {dash['period_end']} · Prioridad: Entradas arriba · Agrupado por ZONA")
 
-    operativa = oper_all.copy()
+    operativa = dash["operativa"].copy()
+    operativa["APARTAMENTO_KEY"] = operativa["APARTAMENTO"].map(_apt_key)
+    operativa = enrich_operativa_with_guest_fields(operativa, avantio_df)
 
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
@@ -999,6 +873,9 @@ def main():
                 styled=True,
             )
 
+    # =========================
+    # SUGERENCIA DE REPOSICIÓN
+    # =========================
     st.divider()
     st.subheader("Sugerencia de Reposición")
 
@@ -1020,6 +897,9 @@ def main():
             st.markdown("**Dónde dejar cada producto** (por ZONA y APARTAMENTO)")
             _render_operativa_table(items_df, key="sugerencia_items", styled=False)
 
+    # =========================
+    # RUTAS GOOGLE MAPS
+    # =========================
     st.divider()
     st.subheader("📍 Ruta Google Maps · Reposición HOY + MAÑANA (por ZONA)")
     st.caption("Criterio: con reposición y Estado == VACIO o ENTRADA o ENTRADA+SALIDA ese día. Botones directos a Maps.")
