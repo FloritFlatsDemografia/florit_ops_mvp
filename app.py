@@ -111,7 +111,6 @@ def _clean_phone(x) -> str:
     Limpieza conservadora:
     - Mantiene dígitos
     - Permite '+' al inicio
-    - Quita separadores raros
     """
     if x is None:
         return ""
@@ -142,6 +141,7 @@ def _norm_acceso(x) -> str:
     - Presencial
     - Hoomvip
     - Hoomvip + Candado
+    - Candado
     Si viene vacío -> Presencial
     """
     if x is None:
@@ -364,6 +364,7 @@ def _kpi_table(df: pd.DataFrame, title: str):
         ]
         if c in df.columns
     ]
+
     st.markdown(f"#### {title}")
     view = df[cols_show].reset_index(drop=True)
     _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
@@ -498,17 +499,22 @@ def main():
 - **Avantio (Entradas)**: .xls / .xlsx / .csv / (xls HTML de Avantio)
 - **Odoo (stock.quant)**: .xlsx / .csv
 
-📌 Maestros en `data/` (GitHub):
-- Zonas
-- Apartamentos e Inventarios (ALMACEN + Localización + Acceso)
-- Café por apartamento
-- Stock mínimo/máximo
+📌 Maestros:
+- Por defecto se cargan desde `data/` (repo).
+- Si subes el maestro "Apartamentos e Inventarios" en la sidebar, se usa el subido.
 """
         )
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
     odoo_file = st.sidebar.file_uploader("Odoo (stock.quant)", type=["xlsx", "csv"])
+
+    # ✅ Maestro opcional para que NO dependa de GitHub mientras pruebas cambios
+    apt_master_file = st.sidebar.file_uploader(
+        "Maestro: Apartamentos e Inventarios (opcional)",
+        type=["xlsx", "xls"],
+        help="Si lo subes, se usará este archivo en vez del maestro del repo (data/).",
+    )
 
     with st.sidebar.expander("Avanzado (opcional)", expanded=True):
         st.subheader("Periodo operativo")
@@ -565,7 +571,7 @@ def main():
         st.error("Odoo: no se pudieron leer datos del stock.quant.")
         st.stop()
 
-    # Normaliza APARTAMENTO
+    # Normaliza APARTAMENTO en Avantio
     if "Alojamiento" in avantio_df.columns:
         avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     elif "APARTAMENTO" in avantio_df.columns:
@@ -576,14 +582,19 @@ def main():
 
     avantio_df["APARTAMENTO_KEY"] = avantio_df["APARTAMENTO"].map(_apt_key)
 
-    # Maestros
+    # Maestros (zonas + café)
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     # =========================
     # Maestro apt_almacen (Apartamentos e Inventarios)
     # =========================
-    ap_map = masters["apt_almacen"].copy()
+    if apt_master_file is not None:
+        ap_map = pd.read_excel(apt_master_file)
+        st.sidebar.success("Apt/Inventarios: usando maestro subido ✅")
+    else:
+        ap_map = masters["apt_almacen"].copy()
+
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
@@ -592,10 +603,12 @@ def main():
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
+    # Acceso
     if "Acceso" not in ap_map.columns:
         ap_map["Acceso"] = "Presencial"
     ap_map["Acceso"] = ap_map["Acceso"].apply(_norm_acceso)
 
+    # Coordenadas
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
@@ -616,7 +629,7 @@ def main():
             ap_map.loc[miss, "LAT"] = [p[0] for p in loc_pairs]
             ap_map.loc[miss, "LNG"] = [p[1] for p in loc_pairs]
 
-    # ✅ CLAVE robusta (esto arregla tu “todo Presencial”)
+    # ✅ KEY robusta para cruces
     ap_map["APARTAMENTO_KEY"] = ap_map["APARTAMENTO"].map(_apt_key)
 
     ap_map = (
@@ -624,6 +637,9 @@ def main():
         .dropna(subset=["APARTAMENTO_KEY", "ALMACEN"])
         .drop_duplicates(subset=["APARTAMENTO_KEY"], keep="first")
     )
+
+    # Debug (te dice en 1s si hay algo distinto a Presencial en el maestro)
+    st.sidebar.write("DEBUG maestro Acceso:", ap_map["Acceso"].value_counts(dropna=False).to_dict())
 
     # Merge ALMACEN/LAT/LNG al Avantio por nombre (rutas/almacén)
     avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
@@ -671,11 +687,12 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Acceso: merge por KEY (no por nombre literal)
+    # ✅ Acceso: merge por KEY
     oper_all = oper_all.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left")
-    if "Acceso" not in oper_all.columns:
-        oper_all["Acceso"] = "Presencial"
     oper_all["Acceso"] = oper_all["Acceso"].apply(_norm_acceso)
+
+    # Debug post-merge
+    st.sidebar.write("DEBUG operativa Acceso:", oper_all["Acceso"].value_counts(dropna=False).to_dict())
 
     # Guest fields + Teléfono
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
