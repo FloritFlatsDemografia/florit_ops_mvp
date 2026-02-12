@@ -21,8 +21,7 @@ def _apt_key(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # quita tildes
     s = re.sub(r"\s+", " ", s)
-    # Quita ceros iniciales en números sueltos: "APOLO 029" -> "APOLO 29"
-    s = re.sub(r"\b0+(\d)", r"\1", s)
+    s = re.sub(r"\b0+(\d)", r"\1", s)  # "APOLO 029" -> "APOLO 29"
     return s.upper().strip()
 
 
@@ -32,7 +31,7 @@ def _apt_key(s: str) -> str:
 def _col_by_excel_letter(df: pd.DataFrame, letter: str) -> str:
     """
     Devuelve el nombre de columna por letra Excel (A=0, B=1, ..., Z=25, AA=26...)
-    IMPORTANTE: depende de que el DF conserve el orden de columnas original del fichero.
+    OJO: esto SOLO es fiable si el DF conserva el orden exacto del Excel original.
     """
     letter = letter.upper().strip()
     idx = 0
@@ -48,10 +47,6 @@ def _col_by_excel_letter(df: pd.DataFrame, letter: str) -> str:
 # Hora check-in (default 16:00)
 # =========================
 def _parse_time_to_hhmm(x) -> str:
-    """
-    Convierte x a 'HH:MM'. Si está vacío/no parseable -> '16:00'
-    Acepta '16:00', '16.00', '16', '16h', '16:00:00', datetime/time, num.
-    """
     if x is None:
         return "16:00"
     try:
@@ -66,7 +61,6 @@ def _parse_time_to_hhmm(x) -> str:
 
     s = s.lower().replace("h", "").replace(".", ":").strip()
 
-    # números tipo "16" / "16,0"
     s_num = s.replace(",", ".")
     try:
         if ":" not in s_num and re.fullmatch(r"[0-9]+(\.[0-9]+)?", s_num):
@@ -76,7 +70,6 @@ def _parse_time_to_hhmm(x) -> str:
     except Exception:
         pass
 
-    # HH:MM(:SS)
     try:
         parts = s.split(":")
         if len(parts) >= 2:
@@ -92,7 +85,6 @@ def _parse_time_to_hhmm(x) -> str:
     except Exception:
         pass
 
-    # datetime/time
     try:
         dt = pd.to_datetime(x, errors="coerce")
         if pd.notna(dt):
@@ -107,11 +99,6 @@ def _parse_time_to_hhmm(x) -> str:
 # Teléfono helpers
 # =========================
 def _clean_phone(x) -> str:
-    """
-    Limpieza conservadora:
-    - Mantiene dígitos
-    - Permite '+' al inicio
-    """
     if x is None:
         return ""
     try:
@@ -166,6 +153,42 @@ def _norm_acceso(x) -> str:
     if "presencial" in s_low:
         return "Presencial"
     return s[:1].upper() + s[1:]
+
+
+def _detect_acceso_col(df: pd.DataFrame) -> str | None:
+    """
+    Detecta la columna 'Acceso' del maestro de forma robusta:
+    1) Por nombre (exacto / contiene 'acceso')
+    2) Por contenido (la que más veces contiene presencial/hoomvip/candado)
+    """
+    if df is None or df.empty:
+        return None
+
+    # 1) Por nombre
+    for c in df.columns:
+        if str(c).strip().lower() == "acceso":
+            return c
+    for c in df.columns:
+        if "acceso" in str(c).strip().lower():
+            return c
+
+    # 2) Por contenido
+    pat = r"(presencial|hoomvip|candado)"
+    best = None
+    best_score = 0
+    for c in df.columns:
+        try:
+            s = df[c].astype(str).str.lower()
+            score = int(s.str.contains(pat, na=False).sum())
+            if score > best_score:
+                best_score = score
+                best = c
+        except Exception:
+            continue
+
+    if best_score > 0:
+        return best
+    return None
 
 
 # =========================
@@ -380,7 +403,6 @@ def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
             return c
         if "check" in cl and "in" in cl:
             return c
-
     try:
         return _col_by_excel_letter(avantio_df, "D")
     except Exception:
@@ -447,7 +469,6 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
     out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
-
     out = out.merge(av_small, on=["APARTAMENTO_KEY", "Día"], how="left")
 
     out["Nº Adultos"] = pd.to_numeric(out["AV_ADULTOS"], errors="coerce").fillna(out["Nº Adultos"]).fillna(0).astype(int)
@@ -460,7 +481,7 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
 
 
 # =========================
-# Maestro coords: detectar columna "local..." incluso con erratas
+# Localización helper (para sacar lat/lng)
 # =========================
 def _find_loc_col(cols) -> str | None:
     for c in cols:
@@ -560,7 +581,7 @@ def main():
         st.error("Odoo: no se pudieron leer datos del stock.quant.")
         st.stop()
 
-    # Normaliza APARTAMENTO
+    # Normaliza APARTAMENTO (Avantio)
     if "Alojamiento" in avantio_df.columns:
         avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     elif "APARTAMENTO" in avantio_df.columns:
@@ -576,9 +597,10 @@ def main():
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     # =========================
-    # Maestro apt_almacen
+    # Maestro apt_almacen (Apartamentos e Inventarios)
     # =========================
     ap_map = masters["apt_almacen"].copy()
+
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
@@ -586,18 +608,16 @@ def main():
 
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
+    ap_map["APARTAMENTO_KEY"] = ap_map["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Acceso: dato fijo en la 4ª columna (D). Si existe "Acceso" por nombre, úsala.
-    if "Acceso" in ap_map.columns:
-        ap_map["Acceso"] = ap_map["Acceso"].apply(_norm_acceso)
+    # ✅ Acceso: NO usamos "columna D". Detectamos columna real por nombre o contenido.
+    acc_col = _detect_acceso_col(ap_map)
+    if acc_col is None:
+        ap_map["Acceso"] = "Presencial"
     else:
-        try:
-            col_d = _col_by_excel_letter(ap_map, "D")  # 4ª columna
-            ap_map["Acceso"] = ap_map[col_d].apply(_norm_acceso)
-        except Exception:
-            ap_map["Acceso"] = "Presencial"
+        ap_map["Acceso"] = ap_map[acc_col].apply(_norm_acceso)
 
-    # Coordenadas
+    # Coordenadas desde "Localización"
     for c in ["LAT", "LNG"]:
         if c not in ap_map.columns:
             ap_map[c] = pd.NA
@@ -618,15 +638,13 @@ def main():
             ap_map.loc[miss, "LAT"] = [p[0] for p in loc_pairs]
             ap_map.loc[miss, "LNG"] = [p[1] for p in loc_pairs]
 
-    ap_map["APARTAMENTO_KEY"] = ap_map["APARTAMENTO"].map(_apt_key)
-
     ap_map = (
         ap_map[["APARTAMENTO", "APARTAMENTO_KEY", "ALMACEN", "LAT", "LNG", "Acceso"]]
         .dropna(subset=["APARTAMENTO_KEY", "ALMACEN"])
         .drop_duplicates(subset=["APARTAMENTO_KEY"], keep="first")
     )
 
-    # Merge coords/almacén a Avantio (para rutas)
+    # Merge coords/almacén a Avantio (rutas)
     avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
 
     # =========================
@@ -672,7 +690,7 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Merge Acceso por KEY (dato fijo)
+    # ✅ Acceso fijo del maestro (merge por KEY)
     oper_all = oper_all.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left")
     oper_all["Acceso"] = oper_all["Acceso"].apply(_norm_acceso)
 
