@@ -137,7 +137,7 @@ def _clean_phone(x) -> str:
 # =========================
 def _norm_acceso(x) -> str:
     """
-    Normaliza el campo Acceso del maestro:
+    Normaliza:
     - Presencial
     - Hoomvip
     - Hoomvip + Candado
@@ -498,23 +498,12 @@ def main():
 **Sube 2 archivos diarios:**
 - **Avantio (Entradas)**: .xls / .xlsx / .csv / (xls HTML de Avantio)
 - **Odoo (stock.quant)**: .xlsx / .csv
-
-📌 Maestros:
-- Por defecto se cargan desde `data/` (repo).
-- Si subes el maestro "Apartamentos e Inventarios" en la sidebar, se usa el subido.
 """
         )
 
     st.sidebar.header("Archivos diarios")
     avantio_file = st.sidebar.file_uploader("Avantio (Entradas)", type=["xls", "xlsx", "csv", "html"])
     odoo_file = st.sidebar.file_uploader("Odoo (stock.quant)", type=["xlsx", "csv"])
-
-    # ✅ Maestro opcional para que NO dependa de GitHub mientras pruebas cambios
-    apt_master_file = st.sidebar.file_uploader(
-        "Maestro: Apartamentos e Inventarios (opcional)",
-        type=["xlsx", "xls"],
-        help="Si lo subes, se usará este archivo en vez del maestro del repo (data/).",
-    )
 
     with st.sidebar.expander("Avanzado (opcional)", expanded=True):
         st.subheader("Periodo operativo")
@@ -571,7 +560,7 @@ def main():
         st.error("Odoo: no se pudieron leer datos del stock.quant.")
         st.stop()
 
-    # Normaliza APARTAMENTO en Avantio
+    # Normaliza APARTAMENTO
     if "Alojamiento" in avantio_df.columns:
         avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     elif "APARTAMENTO" in avantio_df.columns:
@@ -582,19 +571,14 @@ def main():
 
     avantio_df["APARTAMENTO_KEY"] = avantio_df["APARTAMENTO"].map(_apt_key)
 
-    # Maestros (zonas + café)
+    # Maestros
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
     # =========================
-    # Maestro apt_almacen (Apartamentos e Inventarios)
+    # Maestro apt_almacen
     # =========================
-    if apt_master_file is not None:
-        ap_map = pd.read_excel(apt_master_file)
-        st.sidebar.success("Apt/Inventarios: usando maestro subido ✅")
-    else:
-        ap_map = masters["apt_almacen"].copy()
-
+    ap_map = masters["apt_almacen"].copy()
     need = {"APARTAMENTO", "ALMACEN"}
     if not need.issubset(set(ap_map.columns)):
         st.error(f"Maestro apt_almacen: faltan columnas {need}. Columnas: {list(ap_map.columns)}")
@@ -603,10 +587,15 @@ def main():
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
 
-    # Acceso
-    if "Acceso" not in ap_map.columns:
-        ap_map["Acceso"] = "Presencial"
-    ap_map["Acceso"] = ap_map["Acceso"].apply(_norm_acceso)
+    # ✅ Acceso: dato fijo en la 4ª columna (D). Si existe "Acceso" por nombre, úsala.
+    if "Acceso" in ap_map.columns:
+        ap_map["Acceso"] = ap_map["Acceso"].apply(_norm_acceso)
+    else:
+        try:
+            col_d = _col_by_excel_letter(ap_map, "D")  # 4ª columna
+            ap_map["Acceso"] = ap_map[col_d].apply(_norm_acceso)
+        except Exception:
+            ap_map["Acceso"] = "Presencial"
 
     # Coordenadas
     for c in ["LAT", "LNG"]:
@@ -629,7 +618,6 @@ def main():
             ap_map.loc[miss, "LAT"] = [p[0] for p in loc_pairs]
             ap_map.loc[miss, "LNG"] = [p[1] for p in loc_pairs]
 
-    # ✅ KEY robusta para cruces
     ap_map["APARTAMENTO_KEY"] = ap_map["APARTAMENTO"].map(_apt_key)
 
     ap_map = (
@@ -638,10 +626,7 @@ def main():
         .drop_duplicates(subset=["APARTAMENTO_KEY"], keep="first")
     )
 
-    # Debug (te dice en 1s si hay algo distinto a Presencial en el maestro)
-    st.sidebar.write("DEBUG maestro Acceso:", ap_map["Acceso"].value_counts(dropna=False).to_dict())
-
-    # Merge ALMACEN/LAT/LNG al Avantio por nombre (rutas/almacén)
+    # Merge coords/almacén a Avantio (para rutas)
     avantio_df = avantio_df.merge(ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]], on="APARTAMENTO", how="left")
 
     # =========================
@@ -675,7 +660,7 @@ def main():
     )
 
     # =========================
-    # ✅ DASHBOARD ARRIBA + "CLICK" (botones) para ver listados
+    # DASHBOARD KPIs + detalle
     # =========================
     if "kpi_open" not in st.session_state:
         st.session_state["kpi_open"] = ""
@@ -687,29 +672,23 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # ✅ Acceso: merge por KEY
+    # ✅ Merge Acceso por KEY (dato fijo)
     oper_all = oper_all.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left")
     oper_all["Acceso"] = oper_all["Acceso"].apply(_norm_acceso)
 
-    # Debug post-merge
-    st.sidebar.write("DEBUG operativa Acceso:", oper_all["Acceso"].value_counts(dropna=False).to_dict())
-
-    # Guest fields + Teléfono
+    # Enriquecemos (adultos/niños/checkin/teléfono)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
 
-    # Filas del día foco
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
-    # Presenciales calculados para el DÍA FOCO (tu lógica original)
+    # Presenciales (tu lógica original)
     presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
-
     pres_df = oper_all[
         (oper_all["Día"] == foco_day)
         & (oper_all["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"]))
         & (oper_all["APARTAMENTO_KEY"].isin(presencial_keys))
     ].copy()
-
     pres_label = "HOY" if foco_day == today_real else pd.to_datetime(foco_day).strftime("%d/%m/%Y")
 
     kpis = dash.get("kpis", {})
@@ -748,7 +727,6 @@ def main():
         if st.button("Ver presenciales", key="kpi_btn_presenciales"):
             st.session_state["kpi_open"] = "presenciales"
 
-    # Render del listado "clicado"
     kpi_open = st.session_state.get("kpi_open", "")
     if kpi_open:
         st.divider()
@@ -778,97 +756,6 @@ def main():
             _kpi_table(pres_df, f"Check-ins presenciales · {pres_label}")
 
         st.caption("Para cerrar, pulsa otro KPI o recarga la página.")
-
-    # =========================
-    # 🔎 BUSCADOR PRINCIPAL (MULTISELECT)
-    # =========================
-    st.divider()
-    st.subheader("🔎 Buscar apartamento · Resumen (Limpieza + Operativa + Reposición)")
-    st.caption("Selecciona uno o varios apartamentos del listado (es buscable).")
-
-    apt_options = []
-    try:
-        apt_options = (
-            masters["apt_almacen"]["APARTAMENTO"].dropna().astype(str).str.strip().tolist()
-            if "apt_almacen" in masters and "APARTAMENTO" in masters["apt_almacen"].columns
-            else []
-        )
-    except Exception:
-        apt_options = []
-
-    apt_options = sorted([a for a in apt_options if a and a.lower() not in {"nan", "none"}])
-
-    if "apt_selected" not in st.session_state:
-        st.session_state["apt_selected"] = []
-
-    selected_apts = st.multiselect(
-        "Apartamentos",
-        options=apt_options,
-        default=st.session_state["apt_selected"],
-        key="apt_selected",
-        placeholder="Escribe para buscar…",
-    )
-
-    apt_keys_sel = [_apt_key(a) for a in selected_apts]
-
-    # Cargar sheet + construir último informe por apto
-    last_view = pd.DataFrame()
-    try:
-        sheet_df = read_sheet_df()
-        if sheet_df is not None and not sheet_df.empty:
-            last_view = build_last_report_view(sheet_df)
-            last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
-    except Exception as e:
-        st.warning("No pude construir el último informe por apartamento desde Google Sheet.")
-        st.exception(e)
-
-    if apt_keys_sel:
-        st.markdown("### 🧹 Última limpieza (según Marca temporal)")
-        if last_view is None or last_view.empty:
-            st.info("No hay datos de limpieza disponibles.")
-        else:
-            one = last_view[last_view["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
-            if one.empty:
-                st.info("No encuentro último informe para esos apartamentos en la Sheet.")
-            else:
-                show_cols = ["Apartamento", "Último informe", "LLAVES", "OTRAS REPOSICIONES", "INCIDENCIAS/TAREAS A REALIZAR"]
-                show_cols = [c for c in show_cols if c in one.columns]
-                st.dataframe(one[show_cols].reset_index(drop=True), use_container_width=True, height="content")
-
-        st.markdown("### 🧾 Parte Operativo (apartamentos seleccionados)")
-        op_one = oper_all[oper_all["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
-        if op_one.empty:
-            st.info("No hay filas de operativa para esos apartamentos en el periodo seleccionado.")
-        else:
-            if zonas_sel:
-                op_one = op_one[op_one["ZONA"].isin(zonas_sel)].copy()
-            if estados_sel:
-                op_one = op_one[op_one["Estado"].isin(estados_sel)].copy()
-
-            op_one = op_one.sort_values(["Día", "ZONA", "__prio", "APARTAMENTO"], ascending=[True, True, True, True])
-            op_show = op_one.drop(columns=["APARTAMENTO_KEY"], errors="ignore").copy()
-            _render_operativa_table(op_show, key="apt_oper_multiselect", styled=True)
-
-        st.markdown("### 📦 Reposición (apartamentos seleccionados)")
-        if op_one.empty:
-            st.info("Sin reposición (no hay operativa para esos apartamentos).")
-        else:
-            cols_rep = [c for c in ["Lista_reponer", "Completar con"] if c in op_one.columns]
-            rep_rows = op_one[cols_rep + ["Día", "ZONA", "APARTAMENTO", "Acceso"]].copy() if cols_rep else pd.DataFrame()
-            if rep_rows.empty:
-                st.info("No veo columnas de reposición en la operativa para esos apartamentos.")
-            else:
-                rep_rows["has_rep"] = rep_rows[cols_rep].astype(str).apply(
-                    lambda r: any(x.strip().lower() not in {"", "nan", "none"} for x in r),
-                    axis=1,
-                )
-                rep_rows = rep_rows[rep_rows["has_rep"]].drop(columns=["has_rep"], errors="ignore")
-                if rep_rows.empty:
-                    st.info("No hay reposición indicada para esos apartamentos en el periodo.")
-                else:
-                    _render_operativa_table(rep_rows.reset_index(drop=True), key="apt_rep_multiselect", styled=False)
-    else:
-        st.caption("Selecciona uno o varios apartamentos para ver el resumen.")
 
     # =========================
     # Descarga Excel
