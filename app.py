@@ -104,6 +104,36 @@ def _parse_time_to_hhmm(x) -> str:
 
 
 # =========================
+# Teléfono helpers
+# =========================
+def _clean_phone(x) -> str:
+    """
+    Limpieza conservadora:
+    - Mantiene dígitos
+    - Permite '+' al inicio
+    - Quita espacios y separadores raros
+    """
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, float) and pd.isna(x):
+            return ""
+    except Exception:
+        pass
+
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+
+    s = s.replace("\u00A0", " ").strip()  # nbsp
+    has_plus = s.startswith("+")
+    digits = re.sub(r"\D+", "", s)
+    if not digits:
+        return ""
+    return ("+" if has_plus else "") + digits
+
+
+# =========================
 # Google Maps helpers
 # =========================
 def _coord_str(lat, lng):
@@ -191,6 +221,9 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
 
     if "APARTAMENTO" in view.columns:
         colcfg["APARTAMENTO"] = st.column_config.TextColumn("APARTAMENTO", width="medium", max_chars=5000)
+
+    if "Teléfono" in view.columns:
+        colcfg["Teléfono"] = st.column_config.TextColumn("Teléfono", width="medium", max_chars=200)
 
     if styled:
         st.dataframe(_style_operativa(view), use_container_width=True, height="content", column_config=colcfg)
@@ -294,6 +327,7 @@ def _kpi_table(df: pd.DataFrame, title: str):
     Detalle KPI:
     - QUITAMOS 'Próxima Entrada'
     - AÑADIMOS 'Nº Adultos', 'Nº Niños', 'Hora Check-in'
+    - AÑADIMOS 'Teléfono'
     """
     if df is None or df.empty:
         st.info("Sin resultados.")
@@ -306,6 +340,7 @@ def _kpi_table(df: pd.DataFrame, title: str):
             "ZONA",
             "APARTAMENTO",
             "Cliente",
+            "Teléfono",
             "Nº Adultos",
             "Nº Niños",
             "Hora Check-in",
@@ -321,7 +356,7 @@ def _kpi_table(df: pd.DataFrame, title: str):
 
 
 # =========================
-# Enriquecimiento: adultos/niños/hora check-in desde Avantio (Entradas)
+# Enriquecimiento: adultos/niños/hora check-in/teléfono desde Avantio (Entradas)
 # =========================
 def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
     """
@@ -344,10 +379,11 @@ def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
 
 def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Añade a la operativa:
+    Añade a la operativa (desde Entradas):
       - Nº Adultos (H)
       - Nº Niños (I)
       - Hora Check-in (Z) default 16:00
+      - Teléfono (N)
 
     Match por: APARTAMENTO_KEY + Día == fecha_entrada (date)
     Blindado: no revienta si faltan columnas o si no hay match.
@@ -361,6 +397,8 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         out["Nº Niños"] = 0
     if "Hora Check-in" not in out.columns:
         out["Hora Check-in"] = "16:00"
+    if "Teléfono" not in out.columns:
+        out["Teléfono"] = ""
 
     if out is None or out.empty:
         return out
@@ -384,6 +422,7 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         col_ad = _col_by_excel_letter(av, "H")
         col_ch = _col_by_excel_letter(av, "I")
         col_ci = _col_by_excel_letter(av, "Z")
+        col_tel = _col_by_excel_letter(av, "N")  # ✅ TELÉFONO (columna N)
     except Exception:
         return out
 
@@ -397,12 +436,13 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     av["AV_ADULTOS"] = pd.to_numeric(av[col_ad], errors="coerce").fillna(0).astype(int)
     av["AV_NINOS"] = pd.to_numeric(av[col_ch], errors="coerce").fillna(0).astype(int)
     av["AV_CHECKIN"] = av[col_ci].apply(_parse_time_to_hhmm)
+    av["AV_TEL"] = av[col_tel].apply(_clean_phone)
 
     av_small = (
         av.dropna(subset=["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .sort_values(["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .groupby(["APARTAMENTO_KEY", "_CHECKIN_DATE"], as_index=False)
-        .agg({"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first"})
+        .agg({"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first", "AV_TEL": "first"})
         .rename(columns={"_CHECKIN_DATE": "Día"})
     )
 
@@ -414,13 +454,20 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     out = out.merge(av_small, on=["APARTAMENTO_KEY", "Día"], how="left")
 
     # Coalesce + defaults
-    out["Nº Adultos"] = pd.to_numeric(out["AV_ADULTOS"], errors="coerce").fillna(out["Nº Adultos"]).fillna(0).astype(int)
-    out["Nº Niños"] = pd.to_numeric(out["AV_NINOS"], errors="coerce").fillna(out["Nº Niños"]).fillna(0).astype(int)
+    out["Nº Adultos"] = (
+        pd.to_numeric(out["AV_ADULTOS"], errors="coerce").fillna(out["Nº Adultos"]).fillna(0).astype(int)
+    )
+    out["Nº Niños"] = (
+        pd.to_numeric(out["AV_NINOS"], errors="coerce").fillna(out["Nº Niños"]).fillna(0).astype(int)
+    )
 
     # Hora check-in: si viene vacía -> 16:00
     out["Hora Check-in"] = out["AV_CHECKIN"].fillna(out["Hora Check-in"]).apply(_parse_time_to_hhmm)
 
-    out = out.drop(columns=["AV_ADULTOS", "AV_NINOS", "AV_CHECKIN"], errors="ignore")
+    # Teléfono
+    out["Teléfono"] = out["AV_TEL"].fillna(out["Teléfono"]).fillna("")
+
+    out = out.drop(columns=["AV_ADULTOS", "AV_NINOS", "AV_CHECKIN", "AV_TEL"], errors="ignore")
     return out
 
 
@@ -601,7 +648,7 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # Enriquecemos la operativa con Adultos/Niños/Hora Check-in (desde Entradas)
+    # Enriquecemos la operativa con Adultos/Niños/Hora Check-in/Teléfono (desde Entradas)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
 
     # Filas del "día foco"
