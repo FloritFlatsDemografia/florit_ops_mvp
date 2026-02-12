@@ -5,6 +5,7 @@ from urllib.parse import quote
 import re
 import unicodedata
 import os
+import inspect
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
@@ -509,6 +510,157 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     return out
 
 
+# =========================
+# Informe de limpieza (Drive/APPI) - robusto y visible
+# =========================
+def _get_secret_any(keys: list[str]) -> str | None:
+    # 1) st.secrets
+    for k in keys:
+        try:
+            v = st.secrets.get(k, None)
+            if v:
+                return str(v).strip()
+        except Exception:
+            pass
+    # 2) env
+    for k in keys:
+        v = os.environ.get(k)
+        if v:
+            return str(v).strip()
+    return None
+
+
+def render_informe_limpieza(read_sheet_df_func, build_last_report_view_func):
+    st.divider()
+    st.subheader("🧽 Informe de limpieza (Drive / APPI)")
+    st.caption("Si esto falla por credenciales/ID, aquí verás el error (no vuelve a ‘desaparecer’).")
+
+    cA, cB = st.columns([1, 2])
+    with cA:
+        force_reload = st.button("🔄 Recargar informe", key="btn_reload_cleaning_report")
+    with cB:
+        show_debug = st.checkbox("Mostrar debug", value=False, key="chk_debug_cleaning_report")
+
+    # Cache simple en session_state
+    if "cleaning_report_payload" not in st.session_state:
+        st.session_state["cleaning_report_payload"] = None
+
+    if force_reload:
+        st.session_state["cleaning_report_payload"] = None
+
+    if st.session_state["cleaning_report_payload"] is not None:
+        payload = st.session_state["cleaning_report_payload"]
+    else:
+        # Intenta resolver IDs típicos
+        sheet_id = _get_secret_any(
+            ["CLEANING_REPORT_SHEET_ID", "APPI_SHEET_ID", "INFORME_LIMPIEZA_SHEET_ID", "SHEET_ID_LIMPIEZA"]
+        )
+        folder_id = _get_secret_any(
+            ["CLEANING_REPORT_FOLDER_ID", "APPI_FOLDER_ID", "INFORME_LIMPIEZA_FOLDER_ID", "FOLDER_ID_LIMPIEZA"]
+        )
+        sheet_name = _get_secret_any(["CLEANING_REPORT_TAB", "APPI_TAB", "INFORME_LIMPIEZA_TAB"]) or None
+
+        try:
+            sig = inspect.signature(build_last_report_view_func)
+            kwargs = {}
+
+            # Pasamos lo que el builder declare
+            for p in sig.parameters.values():
+                nm = p.name.lower()
+
+                if nm in {"read_sheet_df", "reader", "read_df"}:
+                    kwargs[p.name] = read_sheet_df_func
+                elif nm in {"sheet_id", "spreadsheet_id", "gsheet_id", "id_sheet"} and sheet_id:
+                    kwargs[p.name] = sheet_id
+                elif nm in {"folder_id", "drive_folder_id"} and folder_id:
+                    kwargs[p.name] = folder_id
+                elif nm in {"sheet_name", "tab", "worksheet", "worksheet_name"} and sheet_name:
+                    kwargs[p.name] = sheet_name
+
+            payload = build_last_report_view_func(**kwargs)
+            st.session_state["cleaning_report_payload"] = payload
+
+        except TypeError as e:
+            # Fallback: llamadas comunes
+            try:
+                if sheet_id:
+                    payload = build_last_report_view_func(read_sheet_df_func, sheet_id)
+                else:
+                    payload = build_last_report_view_func(read_sheet_df_func)
+                st.session_state["cleaning_report_payload"] = payload
+            except Exception as e2:
+                st.error("Error construyendo Informe de limpieza.")
+                st.exception(e2)
+                if show_debug:
+                    st.write("sheet_id detectado:", sheet_id)
+                    st.write("folder_id detectado:", folder_id)
+                    st.write("sheet_name detectado:", sheet_name)
+                    st.write("Firma build_last_report_view:", str(inspect.signature(build_last_report_view_func)))
+                return
+        except Exception as e:
+            st.error("Error construyendo Informe de limpieza.")
+            st.exception(e)
+            if show_debug:
+                st.write("sheet_id detectado:", sheet_id)
+                st.write("folder_id detectado:", folder_id)
+                st.write("sheet_name detectado:", sheet_name)
+                st.write("Firma build_last_report_view:", str(inspect.signature(build_last_report_view_func)))
+            return
+
+    # Render del payload (acepta varios formatos)
+    try:
+        df = None
+        excel_bytes = None
+        meta = None
+
+        if isinstance(payload, pd.DataFrame):
+            df = payload
+        elif isinstance(payload, dict):
+            # formatos frecuentes
+            df = payload.get("df") or payload.get("data") or payload.get("table")
+            excel_bytes = payload.get("excel") or payload.get("xlsx") or payload.get("bytes")
+            meta = payload.get("meta") or payload.get("info")
+        elif isinstance(payload, (tuple, list)) and len(payload) >= 1:
+            # (df, excel_bytes?, meta?)
+            df = payload[0]
+            if len(payload) >= 2:
+                excel_bytes = payload[1]
+            if len(payload) >= 3:
+                meta = payload[2]
+
+        if meta and show_debug:
+            st.write("Meta:", meta)
+
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            st.warning("Informe cargado pero sin datos (o formato no reconocido).")
+            if show_debug:
+                st.write("Tipo payload:", type(payload))
+                st.write("Payload raw:", payload)
+            return
+
+        if not isinstance(df, pd.DataFrame):
+            # último intento: convertir
+            df = pd.DataFrame(df)
+
+        st.dataframe(df, use_container_width=True, height="content")
+
+        if excel_bytes:
+            st.download_button(
+                "⬇️ Descargar Informe (Excel)",
+                data=excel_bytes,
+                file_name="informe_limpieza.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_informe_limpieza",
+            )
+
+    except Exception as e:
+        st.error("No se pudo renderizar el Informe de limpieza (formato inesperado).")
+        st.exception(e)
+        if show_debug:
+            st.write("Tipo payload:", type(payload))
+            st.write("Payload raw:", payload)
+
+
 def main():
     from src.loaders import load_masters_repo
     from src.parsers import parse_avantio_entradas, parse_odoo_stock
@@ -608,7 +760,6 @@ def main():
 
     # Asegura columnas base
     if "APARTAMENTO" not in ap_map.columns:
-        # intenta detectar columna con nombre parecido
         for c in ap_map.columns:
             if "apart" in str(c).lower():
                 ap_map = ap_map.rename(columns={c: "APARTAMENTO"})
@@ -721,9 +872,6 @@ def main():
         st.write("Distribución Acceso en maestro:")
         st.dataframe(ap_map["Acceso"].value_counts(dropna=False).reset_index().rename(columns={"index": "Acceso", "Acceso": "n"}))
 
-        missing = oper_all[oper_all["APARTAMENTO_KEY"].notna() & oper_all["Acceso"].eq("Presencial")].copy()
-        # ojo: aquí "Presencial" incluye presenciales reales; por eso mostramos además los NO encontrados:
-        # detectamos no encontrados mirando el merge original antes de norm: recreamos rápido
         tmp = dash["operativa"].copy()
         tmp["APARTAMENTO_KEY"] = tmp["APARTAMENTO"].map(_apt_key)
         tmp = tmp.merge(ap_map[["APARTAMENTO_KEY", "Acceso"]], on="APARTAMENTO_KEY", how="left", indicator=True)
@@ -815,6 +963,11 @@ def main():
         file_name=dash["excel_filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    # =========================
+    # ✅ INFORME DE LIMPIEZA (RESTURADO)
+    # =========================
+    render_informe_limpieza(read_sheet_df, build_last_report_view)
 
     # PARTE OPERATIVO COMPLETO (sin cambios respecto a tu lógica previa)
     st.divider()
