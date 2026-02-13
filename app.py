@@ -9,8 +9,9 @@ import os
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
-# ✅ Ajuste solicitado: ventana para considerar "apto/listo" según última limpieza
-CLEAN_READY_LOOKBACK_DAYS = 3  # <- antes 5, ahora 3
+# ✅ NUEVO CRITERIO: 🟢 solo si la última limpieza es EXACTAMENTE el día foco (mismo día de la fila)
+# (lo dejamos como “lookback” por compatibilidad, pero 0 = mismo día)
+CLEAN_READY_LOOKBACK_DAYS = 0
 
 
 # =========================
@@ -433,14 +434,13 @@ def build_cleaning_master_from_sheet(sheet_df: pd.DataFrame) -> pd.DataFrame:
     tmp = tmp.rename(columns={ts_col: "TS_RAW", apt_col: "APT_RAW"})
     tmp["APARTAMENTO_KEY"] = tmp["APT_RAW"].map(_apt_key)
 
-    # dayfirst=True por tu formato dd/mm/yyyy HH:MM:SS
+    # dayfirst=True por formato dd/mm/yyyy HH:MM:SS
     tmp["LAST_CLEAN_TS"] = pd.to_datetime(tmp["TS_RAW"], errors="coerce", dayfirst=True)
     tmp = tmp.dropna(subset=["APARTAMENTO_KEY", "LAST_CLEAN_TS"]).copy()
     tmp = tmp[tmp["APARTAMENTO_KEY"].astype(str).str.strip().ne("")].copy()
 
     master = (
-        tmp.sort_values("LAST_CLEAN_TS")
-        .groupby("APARTAMENTO_KEY", as_index=False)["LAST_CLEAN_TS"]
+        tmp.groupby("APARTAMENTO_KEY", as_index=False)["LAST_CLEAN_TS"]
         .max()
         .reset_index(drop=True)
     )
@@ -448,13 +448,17 @@ def build_cleaning_master_from_sheet(sheet_df: pd.DataFrame) -> pd.DataFrame:
     return master
 
 
-def add_cleaning_ready_columns(oper_df: pd.DataFrame, cleaning_master: pd.DataFrame, lookback_days: int = 3) -> pd.DataFrame:
+def add_cleaning_ready_columns(
+    oper_df: pd.DataFrame,
+    cleaning_master: pd.DataFrame,
+    lookback_days: int = 0,
+) -> pd.DataFrame:
     """
     Añade a oper_df:
-      - '🧹' (🟢/🔴) en función de última limpieza y el día de la fila (col 'Día')
+      - '🧹' (🟢/🟠) según si la última limpieza es EXACTAMENTE el mismo día que 'Día'
       - 'Última limp' (dd/mm HH:MM)
-    Criterio (ventana):
-      última_limpieza entre [Día - lookback_days, Día] (inclusive)
+
+    Nota: 'lookback_days' queda por compatibilidad, pero el criterio actual es igualdad de día.
     """
     if oper_df is None or oper_df.empty:
         return oper_df
@@ -465,7 +469,7 @@ def add_cleaning_ready_columns(oper_df: pd.DataFrame, cleaning_master: pd.DataFr
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
     if cleaning_master is None or cleaning_master.empty:
-        out["🧹"] = "🔴"
+        out["🧹"] = "🟠"
         out["Última limp"] = ""
         return out
 
@@ -476,10 +480,9 @@ def add_cleaning_ready_columns(oper_df: pd.DataFrame, cleaning_master: pd.DataFr
     row_day = pd.to_datetime(out.get("Día"), errors="coerce").dt.normalize()
     last_day = pd.to_datetime(out.get("LAST_CLEAN_TS"), errors="coerce").dt.normalize()
 
-    min_day = row_day - pd.Timedelta(days=int(lookback_days))
-    ready = (last_day.notna()) & (row_day.notna()) & (last_day >= min_day) & (last_day <= row_day)
+    ready = (last_day.notna()) & (row_day.notna()) & (last_day == row_day)
 
-    out["🧹"] = ready.map(lambda x: "🟢" if x else "🔴")
+    out["🧹"] = ready.map(lambda x: "🟢" if x else "🟠")
     out["Última limp"] = out["Última limp"].fillna("")
 
     return out
@@ -1012,7 +1015,7 @@ def main():
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
     oper_all = add_whatsapp_links_to_df(oper_all, wa_master)
 
-    # ✅ Añade 🧹 + Última limp usando ventana de 3 días
+    # ✅ NUEVO: 🟢 solo si última limpieza == día de la fila (en KPI será foco_day)
     oper_all = add_cleaning_ready_columns(oper_all, cleaning_master, lookback_days=CLEAN_READY_LOOKBACK_DAYS)
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
