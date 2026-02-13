@@ -9,6 +9,9 @@ import os
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
 
+# ✅ Ajuste solicitado: ventana para considerar "apto/listo" según última limpieza
+CLEAN_READY_LOOKBACK_DAYS = 3  # <- antes 5, ahora 3
+
 
 # =========================
 # Apartamento key (matching robusto)
@@ -237,7 +240,7 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     """
     Espera archivo: data/whatsapp_instrucciones.xlsx
 
-    Columnas esperadas (según tu Excel):
+    Columnas esperadas:
       - Apartamentos
       - WA ES
       - WA EN
@@ -258,7 +261,6 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Normaliza nombres (por si vienen con espacios / mayúsculas)
     ren = {}
     for c in df.columns:
         cl = str(c).strip().lower()
@@ -277,9 +279,9 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
         elif cl in {"wa_youtube", "wa youtube", "youtube", "wa_yt"}:
             ren[c] = "WA_YOUTUBE"
 
-        elif cl in {"primer_contacto_es", "primer contacto es", "primer_contacto (es)", "primer_contacto_es "}:
+        elif cl in {"primer_contacto_es", "primer contacto es", "primer_contacto (es)"}:
             ren[c] = "PRIMER_CONTACTO_ES"
-        elif cl in {"primer_contacto_en", "primer contacto en", "primer_contacto (en)", "primer_contacto_en "}:
+        elif cl in {"primer_contacto_en", "primer contacto en", "primer_contacto (en)"}:
             ren[c] = "PRIMER_CONTACTO_EN"
 
         elif cl in {"activo", "active"}:
@@ -288,8 +290,7 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     if ren:
         df = df.rename(columns=ren)
 
-    need = {"Apartamentos"}
-    if not need.issubset(set(df.columns)):
+    if "Apartamentos" not in df.columns:
         return pd.DataFrame()
 
     df["Apartamentos"] = df["Apartamentos"].astype(str).str.strip()
@@ -298,7 +299,6 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     if "ACTIVO" not in df.columns:
         df["ACTIVO"] = 1
 
-    # Limpia nans + asegura columnas
     for c in ["WA ES", "WA EN", "WA_URL_MAPS", "WA_YOUTUBE", "PRIMER_CONTACTO_ES", "PRIMER_CONTACTO_EN"]:
         if c not in df.columns:
             df[c] = ""
@@ -314,21 +314,19 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
 def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.DataFrame:
     """
     Añade columnas (4):
-      - WA_ES_LINK   (instrucciones ES)
-      - WA_EN_LINK   (instrucciones EN)
-      - PRIMER_ES_LINK (primer contacto ES)
-      - PRIMER_EN_LINK (primer contacto EN)
+      - WA_ES_LINK
+      - WA_EN_LINK
+      - PRIMER_ES_LINK
+      - PRIMER_EN_LINK
     """
     if df is None or df.empty:
         return df
 
     out = df.copy()
 
-    # Garantiza keys
     if "APARTAMENTO_KEY" not in out.columns and "APARTAMENTO" in out.columns:
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
-    # Si no hay master, crea columnas vacías
     if wa_master is None or wa_master.empty:
         out["WA_ES_LINK"] = ""
         out["WA_EN_LINK"] = ""
@@ -353,7 +351,6 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
 
     out = out.merge(wam, on="APARTAMENTO_KEY", how="left")
 
-    # ===== Links instrucciones =====
     def _row_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
@@ -380,26 +377,17 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
         u = _wa_send_url(tel, msg)
         return u or ""
 
-    # ===== Links primer contacto =====
     def _row_p_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(
-            nombre=nombre,
-            body=r.get("PRIMER_CONTACTO_ES", ""),
-            lang="ES",
-        )
+        msg = _compose_first_contact(nombre=nombre, body=r.get("PRIMER_CONTACTO_ES", ""), lang="ES")
         u = _wa_send_url(tel, msg)
         return u or ""
 
     def _row_p_en(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(
-            nombre=nombre,
-            body=r.get("PRIMER_CONTACTO_EN", ""),
-            lang="EN",
-        )
+        msg = _compose_first_contact(nombre=nombre, body=r.get("PRIMER_CONTACTO_EN", ""), lang="EN")
         u = _wa_send_url(tel, msg)
         return u or ""
 
@@ -412,88 +400,61 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
 
 
 # =========================
-# Limpieza: estado listo/no listo (Opción A: emoji)
+# ✅ Limpieza (READY) desde Google Sheet (cruda)
 # =========================
-def _detect_last_clean_ts_col(df: pd.DataFrame) -> str | None:
-    """
-    Busca la columna de timestamp del último informe en el DF de build_last_report_view.
-    Preferencias típicas:
-      - "Último informe"
-      - "Marca temporal"
-      - cualquier columna que contenga "ultimo" + "informe" o "marca" + "temporal"
-    """
+def _find_col_case_insensitive(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty:
         return None
-
-    cols = list(df.columns)
-
-    # Preferencias exactas
-    for cand in ["Último informe", "Ultimo informe", "Marca temporal", "Marca Temporal", "Timestamp"]:
-        if cand in cols:
-            return cand
-
-    # Heurística
-    for c in cols:
-        cl = str(c).strip().lower()
-        if "ultimo" in cl and "informe" in cl:
-            return c
-        if "último" in cl and "informe" in cl:
-            return c
-        if "marca" in cl and "temporal" in cl:
-            return c
-        if "timestamp" in cl:
-            return c
-
+    low = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        key = str(cand).strip().lower()
+        if key in low:
+            return low[key]
     return None
 
 
-def build_cleaning_map(last_view: pd.DataFrame) -> pd.DataFrame:
+def build_cleaning_master_from_sheet(sheet_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Devuelve DF:
-      - APARTAMENTO_KEY
-      - LAST_CLEAN_DT (datetime)
-    Tomado de last_view (build_last_report_view).
+    Construye maestro de última limpieza por apartamento usando la sheet cruda.
+    Espera columnas típicas:
+      - 'Marca temporal' (timestamp)
+      - 'Apartamento'
     """
-    if last_view is None or last_view.empty:
-        return pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+    if sheet_df is None or sheet_df.empty:
+        return pd.DataFrame()
 
-    df = last_view.copy()
+    ts_col = _find_col_case_insensitive(sheet_df, ["Marca temporal", "marca temporal", "timestamp", "time stamp"])
+    apt_col = _find_col_case_insensitive(sheet_df, ["Apartamento", "apartamento", "apto", "apartment"])
 
-    # Col apt
-    apt_col = None
-    for cand in ["Apartamento", "APARTAMENTO", "Apartamentos", "Alojamiento"]:
-        if cand in df.columns:
-            apt_col = cand
-            break
-    if apt_col is None:
-        return pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+    if ts_col is None or apt_col is None:
+        return pd.DataFrame()
 
-    ts_col = _detect_last_clean_ts_col(df)
-    if ts_col is None:
-        return pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+    tmp = sheet_df[[ts_col, apt_col]].copy()
+    tmp = tmp.rename(columns={ts_col: "TS_RAW", apt_col: "APT_RAW"})
+    tmp["APARTAMENTO_KEY"] = tmp["APT_RAW"].map(_apt_key)
 
-    df["APARTAMENTO_KEY"] = df[apt_col].map(_apt_key)
-    df["LAST_CLEAN_DT"] = pd.to_datetime(df[ts_col], errors="coerce")
+    # dayfirst=True por tu formato dd/mm/yyyy HH:MM:SS
+    tmp["LAST_CLEAN_TS"] = pd.to_datetime(tmp["TS_RAW"], errors="coerce", dayfirst=True)
+    tmp = tmp.dropna(subset=["APARTAMENTO_KEY", "LAST_CLEAN_TS"]).copy()
+    tmp = tmp[tmp["APARTAMENTO_KEY"].astype(str).str.strip().ne("")].copy()
 
-    df = df.dropna(subset=["APARTAMENTO_KEY"]).copy()
-    df = df[df["APARTAMENTO_KEY"].astype(str).str.strip().ne("")]
-
-# take latest per apartment
-    out = (
-        df.groupby("APARTAMENTO_KEY", as_index=False)["LAST_CLEAN_DT"]
+    master = (
+        tmp.sort_values("LAST_CLEAN_TS")
+        .groupby("APARTAMENTO_KEY", as_index=False)["LAST_CLEAN_TS"]
         .max()
         .reset_index(drop=True)
     )
+    master["Última limp"] = master["LAST_CLEAN_TS"].dt.strftime("%d/%m %H:%M")
+    return master
 
-    return out
 
-
-def add_cleaning_status_to_operativa(oper_df: pd.DataFrame, clean_map: pd.DataFrame, window_days: int = 5) -> pd.DataFrame:
+def add_cleaning_ready_columns(oper_df: pd.DataFrame, cleaning_master: pd.DataFrame, lookback_days: int = 3) -> pd.DataFrame:
     """
-    Añade:
-      - "Limpieza" -> "🟢" si último informe <= window_days antes del día de la fila (incluye el mismo día)
-                     "🔴" si no
-      - "Última limpieza" -> string dd/mm HH:MM (si existe)
+    Añade a oper_df:
+      - '🧹' (🟢/🔴) en función de última limpieza y el día de la fila (col 'Día')
+      - 'Última limp' (dd/mm HH:MM)
+    Criterio (ventana):
+      última_limpieza entre [Día - lookback_days, Día] (inclusive)
     """
     if oper_df is None or oper_df.empty:
         return oper_df
@@ -503,60 +464,24 @@ def add_cleaning_status_to_operativa(oper_df: pd.DataFrame, clean_map: pd.DataFr
     if "APARTAMENTO_KEY" not in out.columns and "APARTAMENTO" in out.columns:
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
-    # Día a date
-    if "Día" in out.columns:
-        out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
-
-    if clean_map is None or clean_map.empty:
-        out["Limpieza"] = "🔴"
-        out["Última limpieza"] = ""
+    if cleaning_master is None or cleaning_master.empty:
+        out["🧹"] = "🔴"
+        out["Última limp"] = ""
         return out
 
-    cm = clean_map.copy()
-    if "APARTAMENTO_KEY" not in cm.columns or "LAST_CLEAN_DT" not in cm.columns:
-        out["Limpieza"] = "🔴"
-        out["Última limpieza"] = ""
-        return out
+    cm = cleaning_master.copy()
+    cm = cm.drop_duplicates(subset=["APARTAMENTO_KEY"], keep="first")
+    out = out.merge(cm[["APARTAMENTO_KEY", "LAST_CLEAN_TS", "Última limp"]], on="APARTAMENTO_KEY", how="left")
 
-    out = out.merge(cm, on="APARTAMENTO_KEY", how="left")
+    row_day = pd.to_datetime(out.get("Día"), errors="coerce").dt.normalize()
+    last_day = pd.to_datetime(out.get("LAST_CLEAN_TS"), errors="coerce").dt.normalize()
 
-    # Cálculo ready por fila (respecto al Día de esa fila)
-    last_dt = pd.to_datetime(out["LAST_CLEAN_DT"], errors="coerce")
-    last_date = last_dt.dt.date
+    min_day = row_day - pd.Timedelta(days=int(lookback_days))
+    ready = (last_day.notna()) & (row_day.notna()) & (last_day >= min_day) & (last_day <= row_day)
 
-    # delta días: (día_fila - last_clean_date)
-    def _delta_days(row_day, clean_day):
-        if row_day is None or pd.isna(row_day) or clean_day is None or pd.isna(clean_day):
-            return None
-        try:
-            return (row_day - clean_day).days
-        except Exception:
-            return None
+    out["🧹"] = ready.map(lambda x: "🟢" if x else "🔴")
+    out["Última limp"] = out["Última limp"].fillna("")
 
-    deltas = []
-    for rd, cd in zip(out.get("Día", [None] * len(out)), last_date.tolist()):
-        deltas.append(_delta_days(rd, cd))
-
-    out["_DELTA_CLEAN_DAYS"] = deltas
-
-    # 🟢 si 0..window_days
-    out["Limpieza"] = out["_DELTA_CLEAN_DAYS"].apply(
-        lambda d: "🟢" if isinstance(d, int) and (0 <= d <= int(window_days)) else "🔴"
-    )
-
-    # formatea última limpieza
-    def _fmt_dt(x):
-        try:
-            dt = pd.to_datetime(x, errors="coerce")
-            if pd.isna(dt):
-                return ""
-            return dt.strftime("%d/%m %H:%M")
-        except Exception:
-            return ""
-
-    out["Última limpieza"] = out["LAST_CLEAN_DT"].apply(_fmt_dt)
-
-    out = out.drop(columns=["LAST_CLEAN_DT", "_DELTA_CLEAN_DAYS"], errors="ignore")
     return out
 
 
@@ -628,7 +553,7 @@ def _style_operativa(df: pd.DataFrame):
 
 
 # =========================
-# Render helper (NO HTML) + no cortar texto
+# Render helper
 # =========================
 def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     if df is None or df.empty:
@@ -638,23 +563,13 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     view = df.copy()
     colcfg = {}
 
-    # Limpieza status (emoji)
-    if "Limpieza" in view.columns:
-        colcfg["Limpieza"] = st.column_config.TextColumn(
-            "🧹",
-            help="🟢 = hay informe de limpieza en los últimos N días (incluye hoy). 🔴 = no hay informe reciente.",
-            width="small",
-            max_chars=5,
-        )
-    if "Última limpieza" in view.columns:
-        colcfg["Última limpieza"] = st.column_config.TextColumn(
-            "Última limpieza",
-            help="Marca temporal del último informe en la Sheet.",
-            width="small",
-            max_chars=30,
-        )
+    # Limpieza status
+    if "🧹" in view.columns:
+        colcfg["🧹"] = st.column_config.TextColumn("🧹", width="small", max_chars=2)
+    if "Última limp" in view.columns:
+        colcfg["Última limp"] = st.column_config.TextColumn("Última limp", width="small", max_chars=50)
 
-    # WhatsApp links (si existen)
+    # WhatsApp links
     if "PRIMER_ES_LINK" in view.columns:
         colcfg["PRIMER_ES_LINK"] = st.column_config.LinkColumn(
             "1º ES",
@@ -782,9 +697,8 @@ def _kpi_table(df: pd.DataFrame, title: str):
         st.info("Sin resultados.")
         return
 
-    # Queremos columnas al principio: limpieza + WA
     cols_pref = []
-    for c in ["Limpieza", "Última limpieza", "PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
+    for c in ["🧹", "Última limp", "PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
         if c in df.columns:
             cols_pref.append(c)
 
@@ -859,7 +773,7 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         col_ad = _col_by_excel_letter(av, "H")
         col_ch = _col_by_excel_letter(av, "I")
         col_ci = _col_by_excel_letter(av, "Z")
-        col_tel = _col_by_excel_letter(av, "N")  # TELÉFONO
+        col_tel = _col_by_excel_letter(av, "N")
     except Exception:
         return out
 
@@ -939,10 +853,6 @@ def main():
         period_days = st.number_input("Nº días", min_value=1, max_value=14, value=2, step=1)
 
         st.divider()
-        st.subheader("Limpieza (estado listo)")
-        clean_window_days = st.number_input("Ventana (días)", min_value=1, max_value=14, value=5, step=1)
-
-        st.divider()
         st.subheader("Reposición")
         mode = st.radio(
             "Modo",
@@ -971,7 +881,6 @@ def main():
         st.exception(e)
         st.stop()
 
-    # ✅ Cargar maestro de WhatsApp (desde data/)
     wa_master = load_whatsapp_master_from_data()
     if wa_master is None or wa_master.empty:
         st.sidebar.warning("WhatsApp maestro: no encontrado o vacío (data/whatsapp_instrucciones.xlsx).")
@@ -990,16 +899,12 @@ def main():
         st.info("Sube Avantio + Odoo para generar el parte operativo.")
         st.stop()
 
-    # =========================
-    # Parse ficheros
-    # =========================
     avantio_df = parse_avantio_entradas(avantio_file)
     odoo_df = parse_odoo_stock(odoo_file)
     if odoo_df is None or odoo_df.empty:
         st.error("Odoo: no se pudieron leer datos del stock.quant.")
         st.stop()
 
-    # Normaliza APARTAMENTO
     if "Alojamiento" in avantio_df.columns:
         avantio_df["APARTAMENTO"] = avantio_df["Alojamiento"].astype(str).str.strip()
     elif "APARTAMENTO" in avantio_df.columns:
@@ -1010,7 +915,6 @@ def main():
 
     avantio_df["APARTAMENTO_KEY"] = avantio_df["APARTAMENTO"].map(_apt_key)
 
-    # Maestros
     avantio_df = avantio_df.merge(masters["zonas"], on="APARTAMENTO", how="left")
     avantio_df = avantio_df.merge(masters["cafe"], on="APARTAMENTO", how="left")
 
@@ -1045,7 +949,6 @@ def main():
 
     avantio_df = avantio_df.merge(ap_map, on="APARTAMENTO", how="left")
 
-    # Stock normalize
     odoo_norm = normalize_products(odoo_df)
     if "Ubicación" in odoo_norm.columns:
         odoo_norm = odoo_norm.rename(columns={"Ubicación": "ALMACEN"})
@@ -1074,19 +977,23 @@ def main():
     )
 
     # =========================
-    # Cargar limpieza (Google Sheet) UNA vez + mapa
+    # ✅ Cargar limpieza desde Google Sheet (cruda) y crear maestro de última limpieza
     # =========================
+    sheet_df = None
     last_view = pd.DataFrame()
-    clean_map = pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+    cleaning_master = pd.DataFrame()
+
     try:
         sheet_df = read_sheet_df()
         if sheet_df is not None and not sheet_df.empty:
+            cleaning_master = build_cleaning_master_from_sheet(sheet_df)
+
+            # Vista bonita (la que ya usabas en buscador)
             last_view = build_last_report_view(sheet_df)
-            if last_view is not None and not last_view.empty:
-                # build_cleaning_map es robusto (detecta columna de timestamp)
-                clean_map = build_cleaning_map(last_view)
+            if last_view is not None and not last_view.empty and "Apartamento" in last_view.columns:
+                last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
     except Exception as e:
-        st.warning("No pude cargar el último informe de limpieza desde Google Sheet (para estado listo).")
+        st.warning("No pude leer / procesar la Sheet de limpieza.")
         st.exception(e)
 
     # =========================
@@ -1102,14 +1009,11 @@ def main():
     oper_all = dash["operativa"].copy()
     oper_all["APARTAMENTO_KEY"] = oper_all["APARTAMENTO"].map(_apt_key)
 
-    # Enriquecemos operativa (adultos/niños/hora/teléfono)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
-
-    # ✅ Añadir links de WhatsApp (4 columnas)
     oper_all = add_whatsapp_links_to_df(oper_all, wa_master)
 
-    # ✅ Añadir estado de limpieza (emoji) + última limpieza
-    oper_all = add_cleaning_status_to_operativa(oper_all, clean_map, window_days=int(clean_window_days))
+    # ✅ Añade 🧹 + Última limp usando ventana de 3 días
+    oper_all = add_cleaning_ready_columns(oper_all, cleaning_master, lookback_days=CLEAN_READY_LOOKBACK_DAYS)
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
@@ -1160,7 +1064,6 @@ def main():
         if st.button("Ver presenciales", key="kpi_btn_presenciales"):
             st.session_state["kpi_open"] = "presenciales"
 
-    # Render del listado "clicado"
     kpi_open = st.session_state.get("kpi_open", "")
     if kpi_open:
         st.divider()
@@ -1223,20 +1126,12 @@ def main():
 
     apt_keys_sel = [_apt_key(a) for a in selected_apts]
 
-    # last_view ya está cargado arriba (si se pudo)
-    if not last_view.empty:
-        # asegura key por si quieres filtrar
-        if "APARTAMENTO_KEY" not in last_view.columns:
-            # intenta columna "Apartamento"
-            if "Apartamento" in last_view.columns:
-                last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
-
     if apt_keys_sel:
         st.markdown("### 🧹 Última limpieza (según Marca temporal)")
         if last_view is None or last_view.empty:
             st.info("No hay datos de limpieza disponibles.")
         else:
-            one = last_view[last_view.get("APARTAMENTO_KEY", pd.Series([], dtype=str)).isin(apt_keys_sel)].copy()
+            one = last_view[last_view["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
             if one.empty:
                 st.info("No encuentro último informe para esos apartamentos en la Sheet.")
             else:
@@ -1279,9 +1174,6 @@ def main():
     else:
         st.caption("Selecciona uno o varios apartamentos para ver el resumen.")
 
-    # =========================
-    # Descarga Excel
-    # =========================
     st.download_button(
         "⬇️ Descargar Excel (Operativa)",
         data=dash["excel_all"],
@@ -1300,7 +1192,7 @@ def main():
     operativa["APARTAMENTO_KEY"] = operativa["APARTAMENTO"].map(_apt_key)
     operativa = enrich_operativa_with_guest_fields(operativa, avantio_df)
     operativa = add_whatsapp_links_to_df(operativa, wa_master)
-    operativa = add_cleaning_status_to_operativa(operativa, clean_map, window_days=int(clean_window_days))
+    operativa = add_cleaning_ready_columns(operativa, cleaning_master, lookback_days=CLEAN_READY_LOOKBACK_DAYS)
 
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
