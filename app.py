@@ -318,8 +318,6 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
       - WA_EN_LINK   (instrucciones EN)
       - PRIMER_ES_LINK (primer contacto ES)
       - PRIMER_EN_LINK (primer contacto EN)
-
-    usando Teléfono + Cliente + WA master por APARTAMENTO_KEY
     """
     if df is None or df.empty:
         return df
@@ -414,6 +412,155 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
 
 
 # =========================
+# Limpieza: estado listo/no listo (Opción A: emoji)
+# =========================
+def _detect_last_clean_ts_col(df: pd.DataFrame) -> str | None:
+    """
+    Busca la columna de timestamp del último informe en el DF de build_last_report_view.
+    Preferencias típicas:
+      - "Último informe"
+      - "Marca temporal"
+      - cualquier columna que contenga "ultimo" + "informe" o "marca" + "temporal"
+    """
+    if df is None or df.empty:
+        return None
+
+    cols = list(df.columns)
+
+    # Preferencias exactas
+    for cand in ["Último informe", "Ultimo informe", "Marca temporal", "Marca Temporal", "Timestamp"]:
+        if cand in cols:
+            return cand
+
+    # Heurística
+    for c in cols:
+        cl = str(c).strip().lower()
+        if "ultimo" in cl and "informe" in cl:
+            return c
+        if "último" in cl and "informe" in cl:
+            return c
+        if "marca" in cl and "temporal" in cl:
+            return c
+        if "timestamp" in cl:
+            return c
+
+    return None
+
+
+def build_cleaning_map(last_view: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve DF:
+      - APARTAMENTO_KEY
+      - LAST_CLEAN_DT (datetime)
+    Tomado de last_view (build_last_report_view).
+    """
+    if last_view is None or last_view.empty:
+        return pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+
+    df = last_view.copy()
+
+    # Col apt
+    apt_col = None
+    for cand in ["Apartamento", "APARTAMENTO", "Apartamentos", "Alojamiento"]:
+        if cand in df.columns:
+            apt_col = cand
+            break
+    if apt_col is None:
+        return pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+
+    ts_col = _detect_last_clean_ts_col(df)
+    if ts_col is None:
+        return pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+
+    df["APARTAMENTO_KEY"] = df[apt_col].map(_apt_key)
+    df["LAST_CLEAN_DT"] = pd.to_datetime(df[ts_col], errors="coerce")
+
+    df = df.dropna(subset=["APARTAMENTO_KEY"]).copy()
+    df = df[df["APARTAMENTO_KEY"].astype(str).str.strip().ne("")]
+
+//  take latest per apartment
+    out = (
+        df.groupby("APARTAMENTO_KEY", as_index=False)["LAST_CLEAN_DT"]
+        .max()
+        .reset_index(drop=True)
+    )
+
+    return out
+
+
+def add_cleaning_status_to_operativa(oper_df: pd.DataFrame, clean_map: pd.DataFrame, window_days: int = 5) -> pd.DataFrame:
+    """
+    Añade:
+      - "Limpieza" -> "🟢" si último informe <= window_days antes del día de la fila (incluye el mismo día)
+                     "🔴" si no
+      - "Última limpieza" -> string dd/mm HH:MM (si existe)
+    """
+    if oper_df is None or oper_df.empty:
+        return oper_df
+
+    out = oper_df.copy()
+
+    if "APARTAMENTO_KEY" not in out.columns and "APARTAMENTO" in out.columns:
+        out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
+
+    # Día a date
+    if "Día" in out.columns:
+        out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
+
+    if clean_map is None or clean_map.empty:
+        out["Limpieza"] = "🔴"
+        out["Última limpieza"] = ""
+        return out
+
+    cm = clean_map.copy()
+    if "APARTAMENTO_KEY" not in cm.columns or "LAST_CLEAN_DT" not in cm.columns:
+        out["Limpieza"] = "🔴"
+        out["Última limpieza"] = ""
+        return out
+
+    out = out.merge(cm, on="APARTAMENTO_KEY", how="left")
+
+    # Cálculo ready por fila (respecto al Día de esa fila)
+    last_dt = pd.to_datetime(out["LAST_CLEAN_DT"], errors="coerce")
+    last_date = last_dt.dt.date
+
+    # delta días: (día_fila - last_clean_date)
+    def _delta_days(row_day, clean_day):
+        if row_day is None or pd.isna(row_day) or clean_day is None or pd.isna(clean_day):
+            return None
+        try:
+            return (row_day - clean_day).days
+        except Exception:
+            return None
+
+    deltas = []
+    for rd, cd in zip(out.get("Día", [None] * len(out)), last_date.tolist()):
+        deltas.append(_delta_days(rd, cd))
+
+    out["_DELTA_CLEAN_DAYS"] = deltas
+
+    # 🟢 si 0..window_days
+    out["Limpieza"] = out["_DELTA_CLEAN_DAYS"].apply(
+        lambda d: "🟢" if isinstance(d, int) and (0 <= d <= int(window_days)) else "🔴"
+    )
+
+    # formatea última limpieza
+    def _fmt_dt(x):
+        try:
+            dt = pd.to_datetime(x, errors="coerce")
+            if pd.isna(dt):
+                return ""
+            return dt.strftime("%d/%m %H:%M")
+        except Exception:
+            return ""
+
+    out["Última limpieza"] = out["LAST_CLEAN_DT"].apply(_fmt_dt)
+
+    out = out.drop(columns=["LAST_CLEAN_DT", "_DELTA_CLEAN_DAYS"], errors="ignore")
+    return out
+
+
+# =========================
 # Google Maps helpers
 # =========================
 def _coord_str(lat, lng):
@@ -490,6 +637,22 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
 
     view = df.copy()
     colcfg = {}
+
+    # Limpieza status (emoji)
+    if "Limpieza" in view.columns:
+        colcfg["Limpieza"] = st.column_config.TextColumn(
+            "🧹",
+            help="🟢 = hay informe de limpieza en los últimos N días (incluye hoy). 🔴 = no hay informe reciente.",
+            width="small",
+            max_chars=5,
+        )
+    if "Última limpieza" in view.columns:
+        colcfg["Última limpieza"] = st.column_config.TextColumn(
+            "Última limpieza",
+            help="Marca temporal del último informe en la Sheet.",
+            width="small",
+            max_chars=30,
+        )
 
     # WhatsApp links (si existen)
     if "PRIMER_ES_LINK" in view.columns:
@@ -619,9 +782,9 @@ def _kpi_table(df: pd.DataFrame, title: str):
         st.info("Sin resultados.")
         return
 
-    # Queremos columnas de WA al principio, si existen
+    # Queremos columnas al principio: limpieza + WA
     cols_pref = []
-    for c in ["PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
+    for c in ["Limpieza", "Última limpieza", "PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
         if c in df.columns:
             cols_pref.append(c)
 
@@ -776,6 +939,10 @@ def main():
         period_days = st.number_input("Nº días", min_value=1, max_value=14, value=2, step=1)
 
         st.divider()
+        st.subheader("Limpieza (estado listo)")
+        clean_window_days = st.number_input("Ventana (días)", min_value=1, max_value=14, value=5, step=1)
+
+        st.divider()
         st.subheader("Reposición")
         mode = st.radio(
             "Modo",
@@ -907,6 +1074,22 @@ def main():
     )
 
     # =========================
+    # Cargar limpieza (Google Sheet) UNA vez + mapa
+    # =========================
+    last_view = pd.DataFrame()
+    clean_map = pd.DataFrame(columns=["APARTAMENTO_KEY", "LAST_CLEAN_DT"])
+    try:
+        sheet_df = read_sheet_df()
+        if sheet_df is not None and not sheet_df.empty:
+            last_view = build_last_report_view(sheet_df)
+            if last_view is not None and not last_view.empty:
+                # build_cleaning_map es robusto (detecta columna de timestamp)
+                clean_map = build_cleaning_map(last_view)
+    except Exception as e:
+        st.warning("No pude cargar el último informe de limpieza desde Google Sheet (para estado listo).")
+        st.exception(e)
+
+    # =========================
     # ✅ DASHBOARD ARRIBA + "CLICK" para ver listados
     # =========================
     if "kpi_open" not in st.session_state:
@@ -924,6 +1107,9 @@ def main():
 
     # ✅ Añadir links de WhatsApp (4 columnas)
     oper_all = add_whatsapp_links_to_df(oper_all, wa_master)
+
+    # ✅ Añadir estado de limpieza (emoji) + última limpieza
+    oper_all = add_cleaning_status_to_operativa(oper_all, clean_map, window_days=int(clean_window_days))
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
@@ -1037,22 +1223,20 @@ def main():
 
     apt_keys_sel = [_apt_key(a) for a in selected_apts]
 
-    last_view = pd.DataFrame()
-    try:
-        sheet_df = read_sheet_df()
-        if sheet_df is not None and not sheet_df.empty:
-            last_view = build_last_report_view(sheet_df)
-            last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
-    except Exception as e:
-        st.warning("No pude construir el último informe por apartamento desde Google Sheet.")
-        st.exception(e)
+    # last_view ya está cargado arriba (si se pudo)
+    if not last_view.empty:
+        # asegura key por si quieres filtrar
+        if "APARTAMENTO_KEY" not in last_view.columns:
+            # intenta columna "Apartamento"
+            if "Apartamento" in last_view.columns:
+                last_view["APARTAMENTO_KEY"] = last_view["Apartamento"].map(_apt_key)
 
     if apt_keys_sel:
         st.markdown("### 🧹 Última limpieza (según Marca temporal)")
         if last_view is None or last_view.empty:
             st.info("No hay datos de limpieza disponibles.")
         else:
-            one = last_view[last_view["APARTAMENTO_KEY"].isin(apt_keys_sel)].copy()
+            one = last_view[last_view.get("APARTAMENTO_KEY", pd.Series([], dtype=str)).isin(apt_keys_sel)].copy()
             if one.empty:
                 st.info("No encuentro último informe para esos apartamentos en la Sheet.")
             else:
@@ -1116,6 +1300,7 @@ def main():
     operativa["APARTAMENTO_KEY"] = operativa["APARTAMENTO"].map(_apt_key)
     operativa = enrich_operativa_with_guest_fields(operativa, avantio_df)
     operativa = add_whatsapp_links_to_df(operativa, wa_master)
+    operativa = add_cleaning_status_to_operativa(operativa, clean_map, window_days=int(clean_window_days))
 
     if zonas_sel:
         operativa = operativa[operativa["ZONA"].isin(zonas_sel)].copy()
