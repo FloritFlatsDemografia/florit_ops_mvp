@@ -152,10 +152,8 @@ def _wa_send_url(phone_digits: str, text: str) -> str | None:
         return None
     msg = (text or "").strip()
     if not msg:
-        # aún así abrimos chat sin texto si hay teléfono
         msg = ""
     base = "https://api.whatsapp.com/send"
-    # NOTE: WhatsApp acepta 'phone' con país (ej 346xxxxxxx) y 'text' URL-encoded
     return f"{base}?phone={quote(phone_digits)}&text={quote(msg)}&type=phone_number&app_absent=0"
 
 
@@ -175,8 +173,8 @@ def _safe_str(x) -> str:
 
 def _compose_wa_message(nombre: str, body: str, url_maps: str, url_youtube: str, lang: str) -> str:
     """
-    Mensaje final:
-    - Hola {Nombre},
+    Mensaje final (instrucciones):
+    - Hola/Hi {Nombre}!
     - body (WA_ES/WA_EN)
     - Maps
     - YouTube
@@ -199,12 +197,8 @@ def _compose_wa_message(nombre: str, body: str, url_maps: str, url_youtube: str,
     if body:
         parts.append(body.strip())
 
-    # URLs aparte (mejor clicabilidad y claridad)
     if url_maps:
-        if lang.upper() == "EN":
-            parts.append(f"📍 Google Maps: {url_maps}")
-        else:
-            parts.append(f"📍 Google Maps: {url_maps}")
+        parts.append(f"📍 Google Maps: {url_maps}")
 
     if url_youtube:
         if lang.upper() == "EN":
@@ -215,15 +209,42 @@ def _compose_wa_message(nombre: str, body: str, url_maps: str, url_youtube: str,
     return "\n\n".join([p for p in parts if p and p.strip()])
 
 
+def _compose_first_contact(nombre: str, body: str, lang: str) -> str:
+    """
+    Mensaje final (primer contacto):
+    - Hola/Hi {Nombre}!
+    - body (PRIMER_CONTACTO_ES/EN)
+    """
+    body = _safe_str(body)
+
+    greet = ""
+    if nombre:
+        if lang.upper() == "EN":
+            greet = f"Hi {nombre}!\n\n"
+        else:
+            greet = f"Hola {nombre}!\n\n"
+
+    parts = []
+    if greet:
+        parts.append(greet.rstrip())
+    if body:
+        parts.append(body.strip())
+
+    return "\n\n".join([p for p in parts if p and p.strip()])
+
+
 def load_whatsapp_master_from_data() -> pd.DataFrame:
     """
     Espera archivo: data/whatsapp_instrucciones.xlsx
+
     Columnas esperadas (según tu Excel):
       - Apartamentos
       - WA ES
       - WA EN
       - WA_URL_MAPS
       - WA_YOUTUBE
+      - PRIMER_CONTACTO_ES
+      - PRIMER_CONTACTO_EN
       - ACTIVO
     """
     path = os.path.join("data", "whatsapp_instrucciones.xlsx")
@@ -241,16 +262,26 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     ren = {}
     for c in df.columns:
         cl = str(c).strip().lower()
+
         if cl in {"apartamentos", "apartamento", "apartment"}:
             ren[c] = "Apartamentos"
+
         elif cl in {"wa es", "wa_es", "waes"}:
             ren[c] = "WA ES"
         elif cl in {"wa en", "wa_en", "waen"}:
             ren[c] = "WA EN"
+
         elif cl in {"wa_url_maps", "wa maps", "wa_maps", "wa url maps"}:
             ren[c] = "WA_URL_MAPS"
+
         elif cl in {"wa_youtube", "wa youtube", "youtube", "wa_yt"}:
             ren[c] = "WA_YOUTUBE"
+
+        elif cl in {"primer_contacto_es", "primer contacto es", "primer_contacto (es)", "primer_contacto_es "}:
+            ren[c] = "PRIMER_CONTACTO_ES"
+        elif cl in {"primer_contacto_en", "primer contacto en", "primer_contacto (en)", "primer_contacto_en "}:
+            ren[c] = "PRIMER_CONTACTO_EN"
+
         elif cl in {"activo", "active"}:
             ren[c] = "ACTIVO"
 
@@ -264,12 +295,11 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     df["Apartamentos"] = df["Apartamentos"].astype(str).str.strip()
     df["APARTAMENTO_KEY"] = df["Apartamentos"].map(_apt_key)
 
-    # ACTIVO default = 1 si no existe
     if "ACTIVO" not in df.columns:
         df["ACTIVO"] = 1
 
-    # Limpia nans
-    for c in ["WA ES", "WA EN", "WA_URL_MAPS", "WA_YOUTUBE"]:
+    # Limpia nans + asegura columnas
+    for c in ["WA ES", "WA EN", "WA_URL_MAPS", "WA_YOUTUBE", "PRIMER_CONTACTO_ES", "PRIMER_CONTACTO_EN"]:
         if c not in df.columns:
             df[c] = ""
         df[c] = df[c].apply(_safe_str)
@@ -283,9 +313,12 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
 
 def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.DataFrame:
     """
-    Añade columnas:
-      - WA_ES_LINK
-      - WA_EN_LINK
+    Añade columnas (4):
+      - WA_ES_LINK   (instrucciones ES)
+      - WA_EN_LINK   (instrucciones EN)
+      - PRIMER_ES_LINK (primer contacto ES)
+      - PRIMER_EN_LINK (primer contacto EN)
+
     usando Teléfono + Cliente + WA master por APARTAMENTO_KEY
     """
     if df is None or df.empty:
@@ -297,20 +330,32 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
     if "APARTAMENTO_KEY" not in out.columns and "APARTAMENTO" in out.columns:
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
-    # Merge WA master
+    # Si no hay master, crea columnas vacías
     if wa_master is None or wa_master.empty:
-        # deja columnas vacías
         out["WA_ES_LINK"] = ""
         out["WA_EN_LINK"] = ""
+        out["PRIMER_ES_LINK"] = ""
+        out["PRIMER_EN_LINK"] = ""
         return out
 
     wam = wa_master[wa_master["ACTIVO"].eq(1)].copy()
-    keep_cols = ["APARTAMENTO_KEY", "WA ES", "WA EN", "WA_URL_MAPS", "WA_YOUTUBE"]
+    keep_cols = [
+        "APARTAMENTO_KEY",
+        "WA ES",
+        "WA EN",
+        "WA_URL_MAPS",
+        "WA_YOUTUBE",
+        "PRIMER_CONTACTO_ES",
+        "PRIMER_CONTACTO_EN",
+    ]
+    for c in keep_cols:
+        if c not in wam.columns:
+            wam[c] = ""
     wam = wam[keep_cols].copy()
 
     out = out.merge(wam, on="APARTAMENTO_KEY", how="left")
 
-    # Construye links
+    # ===== Links instrucciones =====
     def _row_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
@@ -337,10 +382,34 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
         u = _wa_send_url(tel, msg)
         return u or ""
 
+    # ===== Links primer contacto =====
+    def _row_p_es(r):
+        tel = _wa_phone_digits(r.get("Teléfono", ""))
+        nombre = _first_name(r.get("Cliente", ""))
+        msg = _compose_first_contact(
+            nombre=nombre,
+            body=r.get("PRIMER_CONTACTO_ES", ""),
+            lang="ES",
+        )
+        u = _wa_send_url(tel, msg)
+        return u or ""
+
+    def _row_p_en(r):
+        tel = _wa_phone_digits(r.get("Teléfono", ""))
+        nombre = _first_name(r.get("Cliente", ""))
+        msg = _compose_first_contact(
+            nombre=nombre,
+            body=r.get("PRIMER_CONTACTO_EN", ""),
+            lang="EN",
+        )
+        u = _wa_send_url(tel, msg)
+        return u or ""
+
     out["WA_ES_LINK"] = out.apply(_row_es, axis=1)
     out["WA_EN_LINK"] = out.apply(_row_en, axis=1)
+    out["PRIMER_ES_LINK"] = out.apply(_row_p_es, axis=1)
+    out["PRIMER_EN_LINK"] = out.apply(_row_p_en, axis=1)
 
-    # Limpia columnas raw si quieres (yo las dejo por si debug; en el KPI no las mostraremos)
     return out
 
 
@@ -420,21 +489,35 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
         return
 
     view = df.copy()
-
     colcfg = {}
 
     # WhatsApp links (si existen)
+    if "PRIMER_ES_LINK" in view.columns:
+        colcfg["PRIMER_ES_LINK"] = st.column_config.LinkColumn(
+            "1º ES",
+            help="Primer contacto (ES) con saludo + nombre",
+            display_text="Abrir",
+            width="small",
+        )
+    if "PRIMER_EN_LINK" in view.columns:
+        colcfg["PRIMER_EN_LINK"] = st.column_config.LinkColumn(
+            "1º EN",
+            help="First contact (EN) with greeting + name",
+            display_text="Open",
+            width="small",
+        )
+
     if "WA_ES_LINK" in view.columns:
         colcfg["WA_ES_LINK"] = st.column_config.LinkColumn(
             "WA ES",
-            help="Abrir WhatsApp con mensaje en Español",
+            help="Instrucciones llegada (ES) con saludo + nombre + links",
             display_text="Abrir",
             width="small",
         )
     if "WA_EN_LINK" in view.columns:
         colcfg["WA_EN_LINK"] = st.column_config.LinkColumn(
             "WA EN",
-            help="Open WhatsApp with English message",
+            help="Arrival instructions (EN) with greeting + name + links",
             display_text="Open",
             width="small",
         )
@@ -536,9 +619,9 @@ def _kpi_table(df: pd.DataFrame, title: str):
         st.info("Sin resultados.")
         return
 
-    # Queremos WA columnas al principio, si existen
+    # Queremos columnas de WA al principio, si existen
     cols_pref = []
-    for c in ["WA_ES_LINK", "WA_EN_LINK"]:
+    for c in ["PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
         if c in df.columns:
             cols_pref.append(c)
 
@@ -679,7 +762,7 @@ def main():
 - Apartamentos e Inventarios (ALMACEN + Localización)
 - Café por apartamento
 - Stock mínimo/máximo
-- whatsapp_instrucciones.xlsx (WA ES/EN por apartamento)
+- whatsapp_instrucciones.xlsx (WA + 1er contacto por apartamento)
 """
         )
 
@@ -824,7 +907,7 @@ def main():
     )
 
     # =========================
-    # ✅ DASHBOARD ARRIBA + "CLICK" (botones) para ver listados
+    # ✅ DASHBOARD ARRIBA + "CLICK" para ver listados
     # =========================
     if "kpi_open" not in st.session_state:
         st.session_state["kpi_open"] = ""
@@ -839,7 +922,7 @@ def main():
     # Enriquecemos operativa (adultos/niños/hora/teléfono)
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
 
-    # ✅ Añadir links de WhatsApp a TODA la operativa (así lo usamos en KPI y en tablas si quieres)
+    # ✅ Añadir links de WhatsApp (4 columnas)
     oper_all = add_whatsapp_links_to_df(oper_all, wa_master)
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
