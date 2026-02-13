@@ -4,9 +4,12 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import re
 import unicodedata
+import os
 
 ORIGIN_LAT = 39.45702028460933
 ORIGIN_LNG = -0.38498336081567713
+
+WA_MASTER_PATH = os.path.join("data", "whatsapp_instrucciones.xlsx")
 
 
 # =========================
@@ -131,6 +134,120 @@ def _clean_phone(x) -> str:
     if not digits:
         return ""
     return ("+" if has_plus else "") + digits
+
+
+def _phone_to_wa_digits(phone: str) -> str:
+    """
+    WhatsApp wa.me requiere SOLO dígitos, sin '+'.
+    Heurística:
+      - Si viene 00XX..., se quita el 00
+      - Si viene con +, se quita
+      - Si tiene 9 dígitos, asumimos España y añadimos 34
+    """
+    if phone is None:
+        return ""
+    s = str(phone).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+    digits = re.sub(r"\D+", "", s)
+
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    # si parece un móvil ES sin prefijo
+    if len(digits) == 9:
+        digits = "34" + digits
+
+    return digits
+
+
+def _first_name(cliente: str) -> str:
+    if cliente is None:
+        return ""
+    s = str(cliente).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+    w = s.split()
+    if not w:
+        return ""
+    return w[0].capitalize()
+
+
+# =========================
+# WhatsApp master (data/whatsapp_instrucciones.xlsx)
+# =========================
+@st.cache_data
+def _load_wa_master(path: str = WA_MASTER_PATH) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+
+    df = pd.read_excel(path, engine="openpyxl")
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Normaliza nombres
+    if "Apartamentos" in df.columns and "APARTAMENTO" not in df.columns:
+        df = df.rename(columns={"Apartamentos": "APARTAMENTO"})
+    if "Apartamento" in df.columns and "APARTAMENTO" not in df.columns:
+        df = df.rename(columns={"Apartamento": "APARTAMENTO"})
+
+    # Asegura columnas esperadas
+    for c in ["APARTAMENTO", "WA_ES", "WA_EN", "WA_URL_MAPS", "WA_YOUTUBE", "ACTIVO"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    df["APARTAMENTO"] = df["APARTAMENTO"].astype(str).str.strip()
+    df["APARTAMENTO_KEY"] = df["APARTAMENTO"].map(_apt_key)
+
+    # ACTIVO a string "1"/"0"
+    df["ACTIVO"] = df["ACTIVO"].fillna(0)
+    df["ACTIVO"] = df["ACTIVO"].astype(str).str.strip()
+    df["ACTIVO"] = df["ACTIVO"].replace({"1.0": "1", "0.0": "0"})
+
+    # limpia textos
+    for c in ["WA_ES", "WA_EN", "WA_URL_MAPS", "WA_YOUTUBE"]:
+        df[c] = df[c].fillna("").astype(str)
+
+    # deja único por apt_key
+    df = df.dropna(subset=["APARTAMENTO_KEY"]).drop_duplicates(subset=["APARTAMENTO_KEY"], keep="first")
+    return df
+
+
+def _build_wa_message(template: str, nombre: str, apartamento: str, url_maps: str, url_youtube: str) -> str:
+    """
+    Reemplaza placeholders y elimina líneas vacías por URLs inexistentes.
+    Placeholders soportados:
+      {NOMBRE}, {APARTAMENTO}, {WA_URL_MAPS}, {WA_YOUTUBE}
+    """
+    tpl = (template or "").strip()
+    if not tpl:
+        return ""
+
+    msg = tpl
+    msg = msg.replace("{NOMBRE}", (nombre or "").strip())
+    msg = msg.replace("{APARTAMENTO}", (apartamento or "").strip())
+    msg = msg.replace("{WA_URL_MAPS}", (url_maps or "").strip())
+    msg = msg.replace("{WA_YOUTUBE}", (url_youtube or "").strip())
+
+    # Si el template no tenía {NOMBRE} pero queremos saludo, NO lo forzamos (tu control es el Excel)
+    # Limpia líneas donde quede "Video:"/"Maps:" sin http
+    lines = []
+    for ln in msg.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if re.search(r"(video|vídeo|maps|mapa|ubicaci[oó]n)\s*:", t, re.IGNORECASE) and ("http" not in t.lower()):
+            continue
+        lines.append(ln)
+
+    out = "\n".join(lines).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
+def _wa_url(phone_digits: str, message: str) -> str:
+    if not phone_digits:
+        return ""
+    return f"https://wa.me/{phone_digits}?text={quote(message or '', safe='')}"
 
 
 # =========================
@@ -355,6 +472,88 @@ def _kpi_table(df: pd.DataFrame, title: str):
     _render_operativa_table(view, key=f"kpi_{_apt_key(title)}", styled=False)
 
 
+def _render_whatsapp_buttons_for_entradas(df_entradas: pd.DataFrame):
+    """
+    Renderiza botones WA ES/EN por cada fila de ENTRADAS/ENTRADA+SALIDA.
+    Usa data/whatsapp_instrucciones.xlsx (ACTIVO, WA_ES, WA_EN, URLs).
+    Match por APARTAMENTO_KEY.
+    """
+    if df_entradas is None or df_entradas.empty:
+        return
+
+    wa = _load_wa_master(WA_MASTER_PATH)
+    if wa is None or wa.empty:
+        st.warning("No encuentro el maestro WhatsApp en data/whatsapp_instrucciones.xlsx (o está vacío).")
+        return
+
+    # Prepara DF
+    df = df_entradas.copy()
+    if "APARTAMENTO_KEY" not in df.columns:
+        df["APARTAMENTO_KEY"] = df["APARTAMENTO"].map(_apt_key)
+
+    # Merge
+    df = df.merge(
+        wa[["APARTAMENTO_KEY", "WA_ES", "WA_EN", "WA_URL_MAPS", "WA_YOUTUBE", "ACTIVO"]],
+        on="APARTAMENTO_KEY",
+        how="left",
+    )
+
+    st.markdown("### 📲 WhatsApp por entrada")
+    st.caption("Botones ES/EN según maestro. Solo aparece si ACTIVO=1 y hay teléfono.")
+
+    # Cabecera tipo tabla
+    h1, h2, h3, h4, h5 = st.columns([2.2, 2.4, 2.2, 1.1, 1.1])
+    h1.markdown("**Apartamento**")
+    h2.markdown("**Cliente**")
+    h3.markdown("**Teléfono**")
+    h4.markdown("**WA ES**")
+    h5.markdown("**WA EN**")
+    st.divider()
+
+    for i, r in df.reset_index(drop=True).iterrows():
+        apt = str(r.get("APARTAMENTO", "")).strip()
+        cliente = str(r.get("Cliente", "")).strip() if "Cliente" in df.columns else str(r.get("CLIENTE", "")).strip()
+
+        # en tu df la columna es "Cliente" (capital C)
+        if not cliente or cliente.lower() in {"nan", "none"}:
+            cliente = ""
+
+        tel = str(r.get("Teléfono", "")).strip() if "Teléfono" in df.columns else str(r.get("TELEFONO", "")).strip()
+        tel_digits = _phone_to_wa_digits(tel)
+
+        activo = str(r.get("ACTIVO", "")).strip()
+        wa_es_tpl = str(r.get("WA_ES", "")).strip()
+        wa_en_tpl = str(r.get("WA_EN", "")).strip()
+        url_maps = str(r.get("WA_URL_MAPS", "")).strip()
+        url_youtube = str(r.get("WA_YOUTUBE", "")).strip()
+
+        nombre = _first_name(cliente)
+
+        # reglas de visibilidad
+        can_send = (activo == "1") and bool(tel_digits)
+
+        msg_es = _build_wa_message(wa_es_tpl, nombre, apt, url_maps, url_youtube) if wa_es_tpl else ""
+        msg_en = _build_wa_message(wa_en_tpl, nombre, apt, url_maps, url_youtube) if wa_en_tpl else ""
+
+        url_es = _wa_url(tel_digits, msg_es) if (can_send and msg_es) else ""
+        url_en = _wa_url(tel_digits, msg_en) if (can_send and msg_en) else ""
+
+        c1, c2, c3, c4, c5 = st.columns([2.2, 2.4, 2.2, 1.1, 1.1])
+        c1.write(apt)
+        c2.write(cliente if cliente else "—")
+        c3.write(("+" + tel_digits) if tel_digits else "—")
+
+        if url_es:
+            c4.link_button("Enviar", url_es, use_container_width=True)
+        else:
+            c4.write("—")
+
+        if url_en:
+            c5.link_button("Send", url_en, use_container_width=True)
+        else:
+            c5.write("—")
+
+
 # =========================
 # Enriquecimiento: adultos/niños/hora check-in/teléfono desde Avantio (Entradas)
 # =========================
@@ -499,6 +698,7 @@ def main():
 - Apartamentos e Inventarios (ALMACEN + Localización)
 - Café por apartamento
 - Stock mínimo/máximo
+- WhatsApp instrucciones: data/whatsapp_instrucciones.xlsx
 """
         )
 
@@ -711,6 +911,7 @@ def main():
         if kpi_open == "entradas":
             df = oper_foco[oper_foco["Estado"].isin(["ENTRADA", "ENTRADA+SALIDA"])].copy()
             _kpi_table(df, f"Entradas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
+            _render_whatsapp_buttons_for_entradas(df)
 
         elif kpi_open == "salidas":
             df = oper_foco[oper_foco["Estado"].isin(["SALIDA", "ENTRADA+SALIDA"])].copy()
