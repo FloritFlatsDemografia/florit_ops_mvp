@@ -478,7 +478,7 @@ def build_cleaning_map(last_view: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["APARTAMENTO_KEY"]).copy()
     df = df[df["APARTAMENTO_KEY"].astype(str).str.strip().ne("")]
 
-//  take latest per apartment
+# take latest per apartment
     out = (
         df.groupby("APARTAMENTO_KEY", as_index=False)["LAST_CLEAN_DT"]
         .max()
