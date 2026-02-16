@@ -189,10 +189,7 @@ def _compose_wa_message(nombre: str, body: str, url_maps: str, url_youtube: str,
 
     greet = ""
     if nombre:
-        if lang.upper() == "EN":
-            greet = f"Hi {nombre}!\n\n"
-        else:
-            greet = f"Hola {nombre}!\n\n"
+        greet = f"Hi {nombre}!\n\n" if lang.upper() == "EN" else f"Hola {nombre}!\n\n"
 
     parts = []
     if greet:
@@ -205,17 +202,14 @@ def _compose_wa_message(nombre: str, body: str, url_maps: str, url_youtube: str,
         parts.append(f"📍 Google Maps: {url_maps}")
 
     if url_youtube:
-        if lang.upper() == "EN":
-            parts.append(f"🎥 Video: {url_youtube}")
-        else:
-            parts.append(f"🎥 Vídeo: {url_youtube}")
+        parts.append(f"🎥 Video: {url_youtube}" if lang.upper() == "EN" else f"🎥 Vídeo: {url_youtube}")
 
     return "\n\n".join([p for p in parts if p and p.strip()])
 
 
-def _compose_first_contact(nombre: str, body: str, lang: str) -> str:
+def _compose_simple_message(nombre: str, body: str, lang: str) -> str:
     """
-    Mensaje final (genérico con saludo):
+    Mensaje final simple:
     - Hola/Hi {Nombre}!
     - body
     """
@@ -223,10 +217,7 @@ def _compose_first_contact(nombre: str, body: str, lang: str) -> str:
 
     greet = ""
     if nombre:
-        if lang.upper() == "EN":
-            greet = f"Hi {nombre}!\n\n"
-        else:
-            greet = f"Hola {nombre}!\n\n"
+        greet = f"Hi {nombre}!\n\n" if lang.upper() == "EN" else f"Hola {nombre}!\n\n"
 
     parts = []
     if greet:
@@ -241,7 +232,7 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     """
     Espera archivo: data/whatsapp_instrucciones.xlsx
 
-    Columnas esperadas (y/o equivalentes):
+    Columnas esperadas:
       - Apartamentos
       - WA ES
       - WA EN
@@ -249,8 +240,8 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
       - WA_YOUTUBE
       - PRIMER_CONTACTO_ES
       - PRIMER_CONTACTO_EN
-      - 1 DIA ES  (=> CONFIRMACION_ES)
-      - 1 DIA EN  (=> CONFIRMACION_EN)
+      - 1 DIA ES
+      - 1 DIA EN
       - RESEÑAS_ES
       - RESEÑAS_EN
       - ACTIVO
@@ -284,15 +275,15 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
         elif cl in {"wa_youtube", "wa youtube", "youtube", "wa_yt"}:
             ren[c] = "WA_YOUTUBE"
 
-        elif cl in {"primer_contacto_es", "primer contacto es", "primer_contacto (es)", "primer mensaje es"}:
+        elif cl in {"primer_contacto_es", "primer contacto es", "primer_contacto (es)"}:
             ren[c] = "PRIMER_CONTACTO_ES"
-        elif cl in {"primer_contacto_en", "primer contacto en", "primer_contacto (en)", "primer mensaje en"}:
+        elif cl in {"primer_contacto_en", "primer contacto en", "primer_contacto (en)"}:
             ren[c] = "PRIMER_CONTACTO_EN"
 
-        elif cl in {"1 dia es", "1_dia_es", "1dia es", "dia 1 es", "confirmacion es", "confirmación es"}:
-            ren[c] = "CONFIRMACION_ES"
-        elif cl in {"1 dia en", "1_dia_en", "1dia en", "dia 1 en", "confirmacion en", "confirmación en"}:
-            ren[c] = "CONFIRMACION_EN"
+        elif cl in {"1 dia es", "1_dia_es", "1diaes", "confirmacion es", "confirmación es"}:
+            ren[c] = "1 DIA ES"
+        elif cl in {"1 dia en", "1_dia_en", "1diaen", "confirmacion en", "confirmación en"}:
+            ren[c] = "1 DIA EN"
 
         elif cl in {"reseñas_es", "resenas_es", "review_es", "reviews_es"}:
             ren[c] = "RESEÑAS_ES"
@@ -314,19 +305,19 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     if "ACTIVO" not in df.columns:
         df["ACTIVO"] = 1
 
-    # Asegurar columnas
-    for c in [
+    needed = [
         "WA ES",
         "WA EN",
         "WA_URL_MAPS",
         "WA_YOUTUBE",
         "PRIMER_CONTACTO_ES",
         "PRIMER_CONTACTO_EN",
-        "CONFIRMACION_ES",
-        "CONFIRMACION_EN",
+        "1 DIA ES",
+        "1 DIA EN",
         "RESEÑAS_ES",
         "RESEÑAS_EN",
-    ]:
+    ]
+    for c in needed:
         if c not in df.columns:
             df[c] = ""
         df[c] = df[c].apply(_safe_str)
@@ -340,15 +331,11 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
 
 def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.DataFrame:
     """
-    Añade columnas (10):
-      - PRIMER_ES_LINK       (1 MENSAJE ES)
-      - PRIMER_EN_LINK       (1 MENSAJE EN)
-      - WA_ES_LINK           (ENTRADA ES)
-      - WA_EN_LINK           (ENTRADA EN)
-      - CONF_ES_LINK         (CONFIRMACION ES)
-      - CONF_EN_LINK         (CONFIRMACION EN)
-      - RESENAS_ES_LINK      (RESEÑAS ES)
-      - RESENAS_EN_LINK      (RESEÑAS EN)
+    Añade columnas:
+      - WA_ES_LINK / WA_EN_LINK
+      - PRIMER_ES_LINK / PRIMER_EN_LINK
+      - CONFIRM_ES_LINK / CONFIRM_EN_LINK   (1 DIA)
+      - RESEÑAS_ES_LINK / RESEÑAS_EN_LINK
     """
     if df is None or df.empty:
         return df
@@ -358,34 +345,25 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
     if "APARTAMENTO_KEY" not in out.columns and "APARTAMENTO" in out.columns:
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
-    # Defaults si no hay maestro
+    # columnas vacías si no hay master
     if wa_master is None or wa_master.empty:
         for c in [
-            "WA_ES_LINK",
-            "WA_EN_LINK",
-            "PRIMER_ES_LINK",
-            "PRIMER_EN_LINK",
-            "CONF_ES_LINK",
-            "CONF_EN_LINK",
-            "RESENAS_ES_LINK",
-            "RESENAS_EN_LINK",
+            "WA_ES_LINK", "WA_EN_LINK",
+            "PRIMER_ES_LINK", "PRIMER_EN_LINK",
+            "CONFIRM_ES_LINK", "CONFIRM_EN_LINK",
+            "RESEÑAS_ES_LINK", "RESEÑAS_EN_LINK",
         ]:
             out[c] = ""
         return out
 
     wam = wa_master[wa_master["ACTIVO"].eq(1)].copy()
+
     keep_cols = [
         "APARTAMENTO_KEY",
-        "WA ES",
-        "WA EN",
-        "WA_URL_MAPS",
-        "WA_YOUTUBE",
-        "PRIMER_CONTACTO_ES",
-        "PRIMER_CONTACTO_EN",
-        "CONFIRMACION_ES",
-        "CONFIRMACION_EN",
-        "RESEÑAS_ES",
-        "RESEÑAS_EN",
+        "WA ES", "WA EN", "WA_URL_MAPS", "WA_YOUTUBE",
+        "PRIMER_CONTACTO_ES", "PRIMER_CONTACTO_EN",
+        "1 DIA ES", "1 DIA EN",
+        "RESEÑAS_ES", "RESEÑAS_EN",
     ]
     for c in keep_cols:
         if c not in wam.columns:
@@ -394,7 +372,7 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
 
     out = out.merge(wam, on="APARTAMENTO_KEY", how="left")
 
-    def _row_es(r):
+    def _row_wa_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
         msg = _compose_wa_message(
@@ -404,10 +382,9 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
             url_youtube=r.get("WA_YOUTUBE", ""),
             lang="ES",
         )
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_en(r):
+    def _row_wa_en(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
         msg = _compose_wa_message(
@@ -417,59 +394,52 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
             url_youtube=r.get("WA_YOUTUBE", ""),
             lang="EN",
         )
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_p_es(r):
+    def _row_primer_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(nombre=nombre, body=r.get("PRIMER_CONTACTO_ES", ""), lang="ES")
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        msg = _compose_simple_message(nombre=nombre, body=r.get("PRIMER_CONTACTO_ES", ""), lang="ES")
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_p_en(r):
+    def _row_primer_en(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(nombre=nombre, body=r.get("PRIMER_CONTACTO_EN", ""), lang="EN")
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        msg = _compose_simple_message(nombre=nombre, body=r.get("PRIMER_CONTACTO_EN", ""), lang="EN")
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_conf_es(r):
+    def _row_confirm_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(nombre=nombre, body=r.get("CONFIRMACION_ES", ""), lang="ES")
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        msg = _compose_simple_message(nombre=nombre, body=r.get("1 DIA ES", ""), lang="ES")
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_conf_en(r):
+    def _row_confirm_en(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(nombre=nombre, body=r.get("CONFIRMACION_EN", ""), lang="EN")
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        msg = _compose_simple_message(nombre=nombre, body=r.get("1 DIA EN", ""), lang="EN")
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_res_es(r):
+    def _row_resenas_es(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(nombre=nombre, body=r.get("RESEÑAS_ES", ""), lang="ES")
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        msg = _compose_simple_message(nombre=nombre, body=r.get("RESEÑAS_ES", ""), lang="ES")
+        return _wa_send_url(tel, msg) or ""
 
-    def _row_res_en(r):
+    def _row_resenas_en(r):
         tel = _wa_phone_digits(r.get("Teléfono", ""))
         nombre = _first_name(r.get("Cliente", ""))
-        msg = _compose_first_contact(nombre=nombre, body=r.get("RESEÑAS_EN", ""), lang="EN")
-        u = _wa_send_url(tel, msg)
-        return u or ""
+        msg = _compose_simple_message(nombre=nombre, body=r.get("RESEÑAS_EN", ""), lang="EN")
+        return _wa_send_url(tel, msg) or ""
 
-    out["WA_ES_LINK"] = out.apply(_row_es, axis=1)
-    out["WA_EN_LINK"] = out.apply(_row_en, axis=1)
-    out["PRIMER_ES_LINK"] = out.apply(_row_p_es, axis=1)
-    out["PRIMER_EN_LINK"] = out.apply(_row_p_en, axis=1)
-    out["CONF_ES_LINK"] = out.apply(_row_conf_es, axis=1)
-    out["CONF_EN_LINK"] = out.apply(_row_conf_en, axis=1)
-    out["RESENAS_ES_LINK"] = out.apply(_row_res_es, axis=1)
-    out["RESENAS_EN_LINK"] = out.apply(_row_res_en, axis=1)
+    out["WA_ES_LINK"] = out.apply(_row_wa_es, axis=1)
+    out["WA_EN_LINK"] = out.apply(_row_wa_en, axis=1)
+    out["PRIMER_ES_LINK"] = out.apply(_row_primer_es, axis=1)
+    out["PRIMER_EN_LINK"] = out.apply(_row_primer_en, axis=1)
+    out["CONFIRM_ES_LINK"] = out.apply(_row_confirm_es, axis=1)
+    out["CONFIRM_EN_LINK"] = out.apply(_row_confirm_en, axis=1)
+    out["RESEÑAS_ES_LINK"] = out.apply(_row_resenas_es, axis=1)
+    out["RESEÑAS_EN_LINK"] = out.apply(_row_resenas_en, axis=1)
 
     return out
 
@@ -531,8 +501,6 @@ def add_cleaning_ready_columns(
     Añade a oper_df:
       - '🧹' (🟢/🟠) según si la última limpieza es EXACTAMENTE el mismo día que 'Día'
       - 'Última limp' (dd/mm HH:MM)
-
-    Nota: 'lookback_days' queda por compatibilidad, pero el criterio actual es igualdad de día.
     """
     if oper_df is None or oper_df.empty:
         return oper_df
@@ -646,7 +614,7 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     if "Última limp" in view.columns:
         colcfg["Última limp"] = st.column_config.TextColumn("Última limp", width="small", max_chars=50)
 
-    # WhatsApp links (renombrados)
+    # Links (renombrados)
     if "PRIMER_ES_LINK" in view.columns:
         colcfg["PRIMER_ES_LINK"] = st.column_config.LinkColumn(
             "1 MENSAJE ES",
@@ -665,44 +633,44 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
     if "WA_ES_LINK" in view.columns:
         colcfg["WA_ES_LINK"] = st.column_config.LinkColumn(
             "ENTRADA ES",
-            help="Instrucciones llegada (ES) con saludo + nombre + links",
+            help="Instrucciones entrada (ES) con saludo + nombre + links",
             display_text="Abrir",
             width="small",
         )
     if "WA_EN_LINK" in view.columns:
         colcfg["WA_EN_LINK"] = st.column_config.LinkColumn(
             "ENTRADA EN",
-            help="Arrival instructions (EN) with greeting + name + links",
+            help="Entry instructions (EN) with greeting + name + links",
             display_text="Open",
             width="small",
         )
 
-    if "CONF_ES_LINK" in view.columns:
-        colcfg["CONF_ES_LINK"] = st.column_config.LinkColumn(
+    if "CONFIRM_ES_LINK" in view.columns:
+        colcfg["CONFIRM_ES_LINK"] = st.column_config.LinkColumn(
             "CONFIRMACION ES",
-            help="Mensaje confirmación (ES) con saludo + nombre",
+            help="Mensaje confirmación (ES) 1 día antes",
             display_text="Abrir",
             width="small",
         )
-    if "CONF_EN_LINK" in view.columns:
-        colcfg["CONF_EN_LINK"] = st.column_config.LinkColumn(
+    if "CONFIRM_EN_LINK" in view.columns:
+        colcfg["CONFIRM_EN_LINK"] = st.column_config.LinkColumn(
             "CONFIRMACION EN",
-            help="Confirmation message (EN) with greeting + name",
+            help="Confirmation message (EN) 1 day before",
             display_text="Open",
             width="small",
         )
 
-    if "RESENAS_ES_LINK" in view.columns:
-        colcfg["RESENAS_ES_LINK"] = st.column_config.LinkColumn(
+    if "RESEÑAS_ES_LINK" in view.columns:
+        colcfg["RESEÑAS_ES_LINK"] = st.column_config.LinkColumn(
             "RESEÑAS ES",
-            help="Solicitar reseña (ES) con saludo + nombre",
+            help="Solicitar reseña (ES)",
             display_text="Abrir",
             width="small",
         )
-    if "RESENAS_EN_LINK" in view.columns:
-        colcfg["RESENAS_EN_LINK"] = st.column_config.LinkColumn(
+    if "RESEÑAS_EN_LINK" in view.columns:
+        colcfg["RESEÑAS_EN_LINK"] = st.column_config.LinkColumn(
             "RESEÑAS EN",
-            help="Request review (EN) with greeting + name",
+            help="Request review (EN)",
             display_text="Open",
             width="small",
         )
@@ -802,35 +770,22 @@ def build_sugerencia_df(operativa: pd.DataFrame, zonas_sel: list[str], include_c
 def _kpi_table(df: pd.DataFrame, title: str, kpi_kind: str):
     """
     kpi_kind: 'entradas' | 'salidas' | 'turnovers' | 'ocupados' | 'vacios' | 'presenciales'
-    Reglas pedidas:
-      - KPI Entradas: mostrar 1 MENSAJE + ENTRADA + CONFIRMACION (ES/EN)
-      - KPI Salidas: SOLO RESEÑAS (ES/EN) (y limpieza 🧹 / Última limp)
     """
     if df is None or df.empty:
         st.info("Sin resultados.")
         return
 
-    cols_pref = []
-    # siempre permitimos limpieza si existe
-    for c in ["🧹", "Última limp"]:
-        if c in df.columns:
-            cols_pref.append(c)
-
-    if kpi_kind == "entradas":
-        for c in ["PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK", "CONF_ES_LINK", "CONF_EN_LINK"]:
-            if c in df.columns:
-                cols_pref.append(c)
-
-    elif kpi_kind == "salidas":
-        for c in ["RESENAS_ES_LINK", "RESENAS_EN_LINK"]:
-            if c in df.columns:
-                cols_pref.append(c)
-
+    # Prefijos por KPI
+    if kpi_kind == "salidas":
+        pref = ["🧹", "Última limp", "RESEÑAS_ES_LINK", "RESEÑAS_EN_LINK"]
+    elif kpi_kind == "entradas":
+        pref = ["🧹", "Última limp", "PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK", "CONFIRM_ES_LINK", "CONFIRM_EN_LINK"]
+    elif kpi_kind == "turnovers":
+        pref = ["🧹", "Última limp", "WA_ES_LINK", "WA_EN_LINK", "RESEÑAS_ES_LINK", "RESEÑAS_EN_LINK"]
     else:
-        # resto de KPIs: mantenemos el set "clásico" (primer mensaje + entrada)
-        for c in ["PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
-            if c in df.columns:
-                cols_pref.append(c)
+        pref = ["🧹", "Última limp"]
+
+    cols_pref = [c for c in pref if c in df.columns]
 
     cols_show = [
         c
@@ -857,6 +812,7 @@ def _kpi_table(df: pd.DataFrame, title: str, kpi_kind: str):
 
 # =========================
 # Enriquecimiento: adultos/niños/hora check-in/teléfono desde Avantio (Entradas)
+# ✅ FIX: también matchea por FECHA SALIDA para KPI SALIDAS
 # =========================
 def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
     for c in avantio_df.columns:
@@ -867,6 +823,19 @@ def _detect_checkin_datetime_col(avantio_df: pd.DataFrame) -> str | None:
             return c
     try:
         return _col_by_excel_letter(avantio_df, "D")
+    except Exception:
+        return None
+
+
+def _detect_checkout_datetime_col(avantio_df: pd.DataFrame) -> str | None:
+    for c in avantio_df.columns:
+        cl = str(c).lower()
+        if "fecha" in cl and "salida" in cl:
+            return c
+        if "check" in cl and "out" in cl:
+            return c
+    try:
+        return _col_by_excel_letter(avantio_df, "F")
     except Exception:
         return None
 
@@ -899,6 +868,7 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     av["APARTAMENTO"] = av["APARTAMENTO"].astype(str).str.strip()
     av["APARTAMENTO_KEY"] = av["APARTAMENTO"].map(_apt_key)
 
+    # Columnas por letra (según tu Avantio actual)
     try:
         col_ad = _col_by_excel_letter(av, "H")
         col_ch = _col_by_excel_letter(av, "I")
@@ -907,42 +877,100 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     except Exception:
         return out
 
-    dtcol = _detect_checkin_datetime_col(av)
-    if dtcol is None:
+    dt_in = _detect_checkin_datetime_col(av)
+    dt_out = _detect_checkout_datetime_col(av)
+
+    if dt_in is None and dt_out is None:
         return out
 
-    av["_CHECKIN_DT"] = pd.to_datetime(av[dtcol], errors="coerce")
-    av["_CHECKIN_DATE"] = av["_CHECKIN_DT"].dt.date
+    if dt_in is not None:
+        av["_CHECKIN_DT"] = pd.to_datetime(av[dt_in], errors="coerce")
+        av["_CHECKIN_DATE"] = av["_CHECKIN_DT"].dt.date
+    else:
+        av["_CHECKIN_DATE"] = pd.NaT
+
+    if dt_out is not None:
+        av["_CHECKOUT_DT"] = pd.to_datetime(av[dt_out], errors="coerce")
+        av["_CHECKOUT_DATE"] = av["_CHECKOUT_DT"].dt.date
+    else:
+        av["_CHECKOUT_DATE"] = pd.NaT
 
     av["AV_ADULTOS"] = pd.to_numeric(av[col_ad], errors="coerce").fillna(0).astype(int)
     av["AV_NINOS"] = pd.to_numeric(av[col_ch], errors="coerce").fillna(0).astype(int)
     av["AV_CHECKIN"] = av[col_ci].apply(_parse_time_to_hhmm)
     av["AV_TEL"] = av[col_tel].apply(_clean_phone)
 
-    av_small = (
+    # --- Mapeo por FECHA ENTRADA
+    av_in = (
         av.dropna(subset=["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .sort_values(["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .groupby(["APARTAMENTO_KEY", "_CHECKIN_DATE"], as_index=False)
         .agg({"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first", "AV_TEL": "first"})
         .rename(columns={"_CHECKIN_DATE": "Día"})
     )
+    av_in = av_in.rename(columns={
+        "AV_ADULTOS": "AV_ADULTOS_IN",
+        "AV_NINOS": "AV_NINOS_IN",
+        "AV_CHECKIN": "AV_CHECKIN_IN",
+        "AV_TEL": "AV_TEL_IN",
+    })
+
+    # --- Mapeo por FECHA SALIDA (✅ clave para KPI SALIDAS)
+    av_out = (
+        av.dropna(subset=["APARTAMENTO_KEY", "_CHECKOUT_DATE"])
+        .sort_values(["APARTAMENTO_KEY", "_CHECKOUT_DATE"])
+        .groupby(["APARTAMENTO_KEY", "_CHECKOUT_DATE"], as_index=False)
+        .agg({"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first", "AV_TEL": "first"})
+        .rename(columns={"_CHECKOUT_DATE": "Día"})
+    )
+    av_out = av_out.rename(columns={
+        "AV_ADULTOS": "AV_ADULTOS_OUT",
+        "AV_NINOS": "AV_NINOS_OUT",
+        "AV_CHECKIN": "AV_CHECKIN_OUT",
+        "AV_TEL": "AV_TEL_OUT",
+    })
 
     if "APARTAMENTO_KEY" not in out.columns:
         out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
 
     out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
-    out = out.merge(av_small, on=["APARTAMENTO_KEY", "Día"], how="left")
 
-    out["Nº Adultos"] = (
-        pd.to_numeric(out["AV_ADULTOS"], errors="coerce").fillna(out["Nº Adultos"]).fillna(0).astype(int)
-    )
-    out["Nº Niños"] = (
-        pd.to_numeric(out["AV_NINOS"], errors="coerce").fillna(out["Nº Niños"]).fillna(0).astype(int)
-    )
-    out["Hora Check-in"] = out["AV_CHECKIN"].fillna(out["Hora Check-in"]).apply(_parse_time_to_hhmm)
-    out["Teléfono"] = out["AV_TEL"].fillna(out["Teléfono"]).fillna("")
+    # Merge doble
+    out = out.merge(av_in, on=["APARTAMENTO_KEY", "Día"], how="left")
+    out = out.merge(av_out, on=["APARTAMENTO_KEY", "Día"], how="left")
 
-    out = out.drop(columns=["AV_ADULTOS", "AV_NINOS", "AV_CHECKIN", "AV_TEL"], errors="ignore")
+    # Elegir fuente según Estado (si es salida, prioriza OUT)
+    estado = out.get("Estado", "").astype(str)
+
+    def _pick(row, col_in, col_out):
+        est = str(row.get("Estado", ""))
+        if est in {"SALIDA", "ENTRADA+SALIDA"}:
+            v = row.get(col_out)
+            if pd.notna(v) and str(v).strip() not in {"", "nan", "None"}:
+                return v
+        v = row.get(col_in)
+        if pd.notna(v) and str(v).strip() not in {"", "nan", "None"}:
+            return v
+        v = row.get(col_out)
+        return v
+
+    out["Nº Adultos"] = out.apply(lambda r: _pick(r, "AV_ADULTOS_IN", "AV_ADULTOS_OUT"), axis=1)
+    out["Nº Niños"] = out.apply(lambda r: _pick(r, "AV_NINOS_IN", "AV_NINOS_OUT"), axis=1)
+    out["Hora Check-in"] = out.apply(lambda r: _pick(r, "AV_CHECKIN_IN", "AV_CHECKIN_OUT"), axis=1)
+    out["Teléfono"] = out.apply(lambda r: _pick(r, "AV_TEL_IN", "AV_TEL_OUT"), axis=1)
+
+    out["Nº Adultos"] = pd.to_numeric(out["Nº Adultos"], errors="coerce").fillna(0).astype(int)
+    out["Nº Niños"] = pd.to_numeric(out["Nº Niños"], errors="coerce").fillna(0).astype(int)
+    out["Hora Check-in"] = out["Hora Check-in"].fillna("16:00").apply(_parse_time_to_hhmm)
+    out["Teléfono"] = out["Teléfono"].fillna("").apply(_clean_phone)
+
+    out = out.drop(
+        columns=[
+            "AV_ADULTOS_IN", "AV_NINOS_IN", "AV_CHECKIN_IN", "AV_TEL_IN",
+            "AV_ADULTOS_OUT", "AV_NINOS_OUT", "AV_CHECKIN_OUT", "AV_TEL_OUT",
+        ],
+        errors="ignore",
+    )
     return out
 
 
@@ -973,7 +1001,7 @@ def main():
 - Apartamentos e Inventarios (ALMACEN + Localización)
 - Café por apartamento
 - Stock mínimo/máximo
-- whatsapp_instrucciones.xlsx (WA + 1er contacto + confirmación + reseñas por apartamento)
+- whatsapp_instrucciones.xlsx (mensajes + reseñas por apartamento)
 """
         )
 
@@ -1145,8 +1173,6 @@ def main():
 
     oper_all = enrich_operativa_with_guest_fields(oper_all, avantio_df)
     oper_all = add_whatsapp_links_to_df(oper_all, wa_master)
-
-    # ✅ 🟢 solo si última limpieza == día de la fila (en KPI será foco_day)
     oper_all = add_cleaning_ready_columns(oper_all, cleaning_master, lookback_days=CLEAN_READY_LOOKBACK_DAYS)
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
