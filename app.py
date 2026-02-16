@@ -249,6 +249,8 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
       - WA_YOUTUBE
       - PRIMER_CONTACTO_ES
       - PRIMER_CONTACTO_EN
+      - RESEÑAS_ES
+      - RESEÑAS_EN
       - ACTIVO
     """
     path = os.path.join("data", "whatsapp_instrucciones.xlsx")
@@ -285,6 +287,12 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
         elif cl in {"primer_contacto_en", "primer contacto en", "primer_contacto (en)"}:
             ren[c] = "PRIMER_CONTACTO_EN"
 
+        # ✅ NUEVO: reseñas (acepta con o sin ñ)
+        elif cl in {"reseñas_es", "resenas_es", "resena_es", "review_es", "reviews_es"}:
+            ren[c] = "RESEÑAS_ES"
+        elif cl in {"reseñas_en", "resenas_en", "resena_en", "review_en", "reviews_en"}:
+            ren[c] = "RESEÑAS_EN"
+
         elif cl in {"activo", "active"}:
             ren[c] = "ACTIVO"
 
@@ -300,7 +308,16 @@ def load_whatsapp_master_from_data() -> pd.DataFrame:
     if "ACTIVO" not in df.columns:
         df["ACTIVO"] = 1
 
-    for c in ["WA ES", "WA EN", "WA_URL_MAPS", "WA_YOUTUBE", "PRIMER_CONTACTO_ES", "PRIMER_CONTACTO_EN"]:
+    for c in [
+        "WA ES",
+        "WA EN",
+        "WA_URL_MAPS",
+        "WA_YOUTUBE",
+        "PRIMER_CONTACTO_ES",
+        "PRIMER_CONTACTO_EN",
+        "RESEÑAS_ES",
+        "RESEÑAS_EN",
+    ]:
         if c not in df.columns:
             df[c] = ""
         df[c] = df[c].apply(_safe_str)
@@ -396,6 +413,63 @@ def add_whatsapp_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.Da
     out["WA_EN_LINK"] = out.apply(_row_en, axis=1)
     out["PRIMER_ES_LINK"] = out.apply(_row_p_es, axis=1)
     out["PRIMER_EN_LINK"] = out.apply(_row_p_en, axis=1)
+
+    return out
+
+
+# =========================
+# ✅ NUEVO: links de RESEÑAS (solo se aplicará en KPI "Salidas")
+# =========================
+def add_reviews_links_to_df(df: pd.DataFrame, wa_master: pd.DataFrame) -> pd.DataFrame:
+    """
+    Añade SOLO para el DF que le pases (ej. KPI Salidas):
+      - RESENAS_ES_LINK
+      - RESENAS_EN_LINK
+
+    Usa plantillas del maestro:
+      - RESEÑAS_ES
+      - RESEÑAS_EN
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    if "APARTAMENTO_KEY" not in out.columns and "APARTAMENTO" in out.columns:
+        out["APARTAMENTO_KEY"] = out["APARTAMENTO"].map(_apt_key)
+
+    if wa_master is None or wa_master.empty:
+        out["RESENAS_ES_LINK"] = ""
+        out["RESENAS_EN_LINK"] = ""
+        return out
+
+    wam = wa_master[wa_master["ACTIVO"].eq(1)].copy()
+    for c in ["RESEÑAS_ES", "RESEÑAS_EN"]:
+        if c not in wam.columns:
+            wam[c] = ""
+        wam[c] = wam[c].apply(_safe_str)
+
+    wam = wam[["APARTAMENTO_KEY", "RESEÑAS_ES", "RESEÑAS_EN"]].copy()
+    out = out.merge(wam, on="APARTAMENTO_KEY", how="left")
+
+    def _row_rev_es(r):
+        tel = _wa_phone_digits(r.get("Teléfono", ""))
+        nombre = _first_name(r.get("Cliente", ""))
+        msg = _compose_first_contact(nombre=nombre, body=r.get("RESEÑAS_ES", ""), lang="ES")
+        u = _wa_send_url(tel, msg)
+        return u or ""
+
+    def _row_rev_en(r):
+        tel = _wa_phone_digits(r.get("Teléfono", ""))
+        nombre = _first_name(r.get("Cliente", ""))
+        msg = _compose_first_contact(nombre=nombre, body=r.get("RESEÑAS_EN", ""), lang="EN")
+        u = _wa_send_url(tel, msg)
+        return u or ""
+
+    out["RESENAS_ES_LINK"] = out.apply(_row_rev_es, axis=1)
+    out["RESENAS_EN_LINK"] = out.apply(_row_rev_en, axis=1)
+
+    # Para que NO se vean los textos crudos en ninguna tabla
+    out = out.drop(columns=["RESEÑAS_ES", "RESEÑAS_EN"], errors="ignore")
 
     return out
 
@@ -603,6 +677,22 @@ def _render_operativa_table(df: pd.DataFrame, key: str, styled: bool = True):
             width="small",
         )
 
+    # ✅ NUEVO: reseñas (solo aparecerán donde existan estas columnas -> KPI Salidas)
+    if "RESENAS_ES_LINK" in view.columns:
+        colcfg["RESENAS_ES_LINK"] = st.column_config.LinkColumn(
+            "Reseña ES",
+            help="Solicitar reseña (ES) por WhatsApp",
+            display_text="Solicitar",
+            width="small",
+        )
+    if "RESENAS_EN_LINK" in view.columns:
+        colcfg["RESENAS_EN_LINK"] = st.column_config.LinkColumn(
+            "Reseña EN",
+            help="Request a review (EN) via WhatsApp",
+            display_text="Request",
+            width="small",
+        )
+
     for c in ["Lista_reponer", "Completar con", "Producto", "Cliente"]:
         if c in view.columns:
             colcfg[c] = st.column_config.TextColumn(c, width="large", max_chars=10000)
@@ -701,7 +791,17 @@ def _kpi_table(df: pd.DataFrame, title: str):
         return
 
     cols_pref = []
-    for c in ["🧹", "Última limp", "PRIMER_ES_LINK", "PRIMER_EN_LINK", "WA_ES_LINK", "WA_EN_LINK"]:
+    for c in [
+        "🧹",
+        "Última limp",
+        "PRIMER_ES_LINK",
+        "PRIMER_EN_LINK",
+        "WA_ES_LINK",
+        "WA_EN_LINK",
+        # ✅ NUEVO (solo saldrá si existe en df; nosotros solo lo añadimos en KPI Salidas)
+        "RESENAS_ES_LINK",
+        "RESENAS_EN_LINK",
+    ]:
         if c in df.columns:
             cols_pref.append(c)
 
@@ -1078,6 +1178,10 @@ def main():
 
         elif kpi_open == "salidas":
             df = oper_foco[oper_foco["Estado"].isin(["SALIDA", "ENTRADA+SALIDA"])].copy()
+
+            # ✅ ÚNICO sitio donde añadimos las columnas de reseñas
+            df = add_reviews_links_to_df(df, wa_master)
+
             _kpi_table(df, f"Salidas · {pd.to_datetime(foco_day).strftime('%d/%m/%Y')}")
 
         elif kpi_open == "turnovers":
