@@ -1177,7 +1177,7 @@ def main():
 
     oper_foco = oper_all[oper_all["Día"] == foco_day].copy()
 
-    presencial_set = {"APOLO 029", "APOLO 180", "APOLO 197", "SERRANOS"}
+    presencial_set = {"SERRANOS"}
     presencial_keys = {_apt_key(x) for x in presencial_set}
 
     pres_df = oper_all[
