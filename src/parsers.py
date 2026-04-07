@@ -74,7 +74,7 @@ def _promote_header_row(df: pd.DataFrame, max_scan_rows: int = 40) -> pd.DataFra
         return df
 
     new_header = [_normalize_column_name(v) for v in df.iloc[best_idx].tolist()]
-    data = df.iloc[best_idx + 1 :].copy().reset_index(drop=True)
+    data = df.iloc[best_idx + 1:].copy().reset_index(drop=True)
 
     n = min(len(new_header), data.shape[1])
     data = data.iloc[:, :n]
@@ -108,6 +108,28 @@ def _preview_df(df: pd.DataFrame, rows: int = 8) -> str:
         return "<no preview>"
 
 
+def _looks_like_avantio_calendar_view(df: pd.DataFrame) -> bool:
+    """
+    Detecta exportaciones tipo calendario/agenda:
+    Entradas + filas con días, pero sin columnas de reserva.
+    """
+    try:
+        preview = df.head(12).fillna("").astype(str).values.tolist()
+        flat = " | ".join(" ".join(row) for row in preview).lower()
+
+        days = [
+            "lunes", "martes", "miércoles", "miercoles",
+            "jueves", "viernes", "sábado", "sabado", "domingo"
+        ]
+
+        has_entradas = "entradas" in flat
+        day_hits = sum(1 for d in days if d in flat)
+
+        return has_entradas and day_hits >= 3
+    except Exception:
+        return False
+
+
 def _finalize_avantio_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         raise ValueError("Avantio: no se han podido leer datos (archivo vacío o formato no soportado).")
@@ -119,6 +141,14 @@ def _finalize_avantio_df(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in REQUIRED_AVANTIO_COLS if c not in df.columns]
 
     if missing:
+        if _looks_like_avantio_calendar_view(df):
+            raise ValueError(
+                "Avantio: el archivo cargado parece ser una vista de calendario/agenda de 'Entradas', "
+                "no un listado tabular de reservas. Exporta desde Avantio un informe/listado que incluya "
+                "las columnas 'Alojamiento', 'Fecha entrada hora' y 'Fecha salida hora'. "
+                f"Detectadas={detected[:50]}. Preview={_preview_df(df)}"
+            )
+
         raise ValueError(
             "Avantio: faltan columnas requeridas: "
             f"{missing}. Detectadas={detected[:50]}. "
@@ -244,12 +274,7 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
     name = getattr(uploaded_file, "name", "") or ""
     lower_name = name.lower()
 
-    # 1) CSV
-    if lower_name.endswith(".csv"):
-        df = _read_csv_robust(b)
-        return _finalize_avantio_df(df)
-
-    # 2) HTML disfrazado de XLS
+    # 1) SIEMPRE comprobar antes si el contenido es HTML, aunque el nombre termine en .csv
     if _is_html_bytes(b):
         try:
             tables = pd.read_html(BytesIO(b), header=None)
@@ -258,7 +283,12 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
         except Exception as e:
             raise ValueError(f"Avantio: error leyendo HTML/XLS: {e}") from e
 
-    # 3) Excel real: intento con header=None primero
+    # 2) CSV real
+    if lower_name.endswith(".csv"):
+        df = _read_csv_robust(b)
+        return _finalize_avantio_df(df)
+
+    # 3) Excel real
     try:
         raw = pd.read_excel(BytesIO(b), header=None)
         raw = raw.dropna(how="all").reset_index(drop=True)
@@ -266,7 +296,6 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
         df = _finalize_avantio_df(df)
         return df
     except Exception as e1:
-        # fallback: lectura clásica por si el archivo ya trae cabecera real
         try:
             df = pd.read_excel(BytesIO(b))
             df = _finalize_avantio_df(df)
