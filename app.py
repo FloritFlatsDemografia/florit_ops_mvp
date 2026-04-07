@@ -840,6 +840,14 @@ def _detect_checkout_datetime_col(avantio_df: pd.DataFrame) -> str | None:
         return None
 
 
+def _find_col_contains(df: pd.DataFrame, patterns: list[str]) -> str | None:
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if all(p.lower() in cl for p in patterns):
+            return c
+    return None
+
+
 def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: pd.DataFrame) -> pd.DataFrame:
     out = operativa_df.copy()
 
@@ -868,14 +876,30 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     av["APARTAMENTO"] = av["APARTAMENTO"].astype(str).str.strip()
     av["APARTAMENTO_KEY"] = av["APARTAMENTO"].map(_apt_key)
 
-    # Columnas por letra (según tu Avantio actual)
-    try:
-        col_ad = _col_by_excel_letter(av, "H")
-        col_ch = _col_by_excel_letter(av, "I")
-        col_ci = _col_by_excel_letter(av, "Z")
-        col_tel = _col_by_excel_letter(av, "N")
-    except Exception:
-        return out
+    # Detección robusta por nombre de columna
+    col_ad = _find_col_contains(av, ["adult"])
+    if col_ad is None:
+        col_ad = _find_col_contains(av, ["adultos"])
+
+    col_ch = _find_col_contains(av, ["niñ"])
+    if col_ch is None:
+        col_ch = _find_col_contains(av, ["ninos"])
+    if col_ch is None:
+        col_ch = _find_col_contains(av, ["children"])
+
+    col_ci = _find_col_contains(av, ["hora", "entrada"])
+    if col_ci is None:
+        col_ci = _find_col_contains(av, ["check", "in"])
+    if col_ci is None:
+        col_ci = _find_col_contains(av, ["entrada"])
+
+    col_tel = _find_col_contains(av, ["tel"])
+    if col_tel is None:
+        col_tel = _find_col_contains(av, ["phone"])
+    if col_tel is None:
+        col_tel = _find_col_contains(av, ["movil"])
+    if col_tel is None:
+        col_tel = _find_col_contains(av, ["móvil"])
 
     dt_in = _detect_checkin_datetime_col(av)
     dt_out = _detect_checkout_datetime_col(av)
@@ -895,17 +919,44 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     else:
         av["_CHECKOUT_DATE"] = pd.NaT
 
-    av["AV_ADULTOS"] = pd.to_numeric(av[col_ad], errors="coerce").fillna(0).astype(int)
-    av["AV_NINOS"] = pd.to_numeric(av[col_ch], errors="coerce").fillna(0).astype(int)
-    av["AV_CHECKIN"] = av[col_ci].apply(_parse_time_to_hhmm)
-    av["AV_TEL"] = av[col_tel].apply(_clean_phone)
+    if col_ad is None:
+        av["AV_ADULTOS"] = 0
+    else:
+        av["AV_ADULTOS"] = pd.to_numeric(av[col_ad], errors="coerce").fillna(0).astype(int)
+
+    if col_ch is None:
+        av["AV_NINOS"] = 0
+    else:
+        av["AV_NINOS"] = pd.to_numeric(av[col_ch], errors="coerce").fillna(0).astype(int)
+
+    if col_ci is None:
+        av["AV_CHECKIN"] = "16:00"
+    else:
+        av["AV_CHECKIN"] = av[col_ci].apply(_parse_time_to_hhmm)
+
+    if col_tel is None:
+        av["AV_TEL"] = ""
+    else:
+        av["AV_TEL"] = av[col_tel].apply(_clean_phone)
+
+    # Intento adicional para cliente si existiera y operativa no lo trae
+    if "Cliente" not in av.columns:
+        col_cli = _find_col_contains(av, ["cliente"])
+        if col_cli is None:
+            col_cli = _find_col_contains(av, ["ocupante"])
+        if col_cli is not None:
+            av["Cliente"] = av[col_cli].astype(str).str.strip()
 
     # --- Mapeo por FECHA ENTRADA
+    agg_map = {"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first", "AV_TEL": "first"}
+    if "Cliente" in av.columns:
+        agg_map["Cliente"] = "first"
+
     av_in = (
         av.dropna(subset=["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .sort_values(["APARTAMENTO_KEY", "_CHECKIN_DATE"])
         .groupby(["APARTAMENTO_KEY", "_CHECKIN_DATE"], as_index=False)
-        .agg({"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first", "AV_TEL": "first"})
+        .agg(agg_map)
         .rename(columns={"_CHECKIN_DATE": "Día"})
     )
     av_in = av_in.rename(columns={
@@ -913,14 +964,15 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         "AV_NINOS": "AV_NINOS_IN",
         "AV_CHECKIN": "AV_CHECKIN_IN",
         "AV_TEL": "AV_TEL_IN",
+        "Cliente": "Cliente_IN",
     })
 
-    # --- Mapeo por FECHA SALIDA (✅ clave para KPI SALIDAS)
+    # --- Mapeo por FECHA SALIDA
     av_out = (
         av.dropna(subset=["APARTAMENTO_KEY", "_CHECKOUT_DATE"])
         .sort_values(["APARTAMENTO_KEY", "_CHECKOUT_DATE"])
         .groupby(["APARTAMENTO_KEY", "_CHECKOUT_DATE"], as_index=False)
-        .agg({"AV_ADULTOS": "first", "AV_NINOS": "first", "AV_CHECKIN": "first", "AV_TEL": "first"})
+        .agg(agg_map)
         .rename(columns={"_CHECKOUT_DATE": "Día"})
     )
     av_out = av_out.rename(columns={
@@ -928,6 +980,7 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
         "AV_NINOS": "AV_NINOS_OUT",
         "AV_CHECKIN": "AV_CHECKIN_OUT",
         "AV_TEL": "AV_TEL_OUT",
+        "Cliente": "Cliente_OUT",
     })
 
     if "APARTAMENTO_KEY" not in out.columns:
@@ -935,12 +988,8 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
 
     out["Día"] = pd.to_datetime(out["Día"], errors="coerce").dt.date
 
-    # Merge doble
     out = out.merge(av_in, on=["APARTAMENTO_KEY", "Día"], how="left")
     out = out.merge(av_out, on=["APARTAMENTO_KEY", "Día"], how="left")
-
-    # Elegir fuente según Estado (si es salida, prioriza OUT)
-    estado = out.get("Estado", "").astype(str)
 
     def _pick(row, col_in, col_out):
         est = str(row.get("Estado", ""))
@@ -959,15 +1008,23 @@ def enrich_operativa_with_guest_fields(operativa_df: pd.DataFrame, avantio_df: p
     out["Hora Check-in"] = out.apply(lambda r: _pick(r, "AV_CHECKIN_IN", "AV_CHECKIN_OUT"), axis=1)
     out["Teléfono"] = out.apply(lambda r: _pick(r, "AV_TEL_IN", "AV_TEL_OUT"), axis=1)
 
+    if "Cliente" not in out.columns:
+        out["Cliente"] = ""
+    out["Cliente"] = out["Cliente"].where(out["Cliente"].astype(str).str.strip().ne(""), None)
+    if "Cliente_IN" in out.columns or "Cliente_OUT" in out.columns:
+        out["Cliente"] = out.apply(lambda r: _pick(r, "Cliente_IN", "Cliente_OUT") if not r.get("Cliente") else r.get("Cliente"), axis=1)
+
     out["Nº Adultos"] = pd.to_numeric(out["Nº Adultos"], errors="coerce").fillna(0).astype(int)
     out["Nº Niños"] = pd.to_numeric(out["Nº Niños"], errors="coerce").fillna(0).astype(int)
     out["Hora Check-in"] = out["Hora Check-in"].fillna("16:00").apply(_parse_time_to_hhmm)
     out["Teléfono"] = out["Teléfono"].fillna("").apply(_clean_phone)
+    out["Cliente"] = out["Cliente"].fillna("").astype(str).str.strip()
 
     out = out.drop(
         columns=[
             "AV_ADULTOS_IN", "AV_NINOS_IN", "AV_CHECKIN_IN", "AV_TEL_IN",
             "AV_ADULTOS_OUT", "AV_NINOS_OUT", "AV_CHECKIN_OUT", "AV_TEL_OUT",
+            "Cliente_IN", "Cliente_OUT",
         ],
         errors="ignore",
     )
@@ -1099,14 +1156,14 @@ def main():
                 return a.strip(), b.strip()
             return None, None
 
-    miss = ap_map["LAT"].isna() | ap_map["LNG"].isna()
-    if miss.any():
-        loc_pairs = ap_map.loc[miss, "Localizacion"].apply(_split_loc)
-        lat_vals = [float("nan") if (p is None or p[0] is None) else p[0] for p in loc_pairs]
-        lng_vals = [float("nan") if (p is None or p[1] is None) else p[1] for p in loc_pairs]
-        ap_map.loc[miss, "LAT"] = pd.to_numeric(lat_vals, errors="coerce")
-        ap_map.loc[miss, "LNG"] = pd.to_numeric(lng_vals, errors="coerce")
-    
+        miss = ap_map["LAT"].isna() | ap_map["LNG"].isna()
+        if miss.any():
+            loc_pairs = ap_map.loc[miss, "Localizacion"].apply(_split_loc)
+            lat_vals = [float("nan") if (p is None or p[0] is None) else p[0] for p in loc_pairs]
+            lng_vals = [float("nan") if (p is None or p[1] is None) else p[1] for p in loc_pairs]
+            ap_map.loc[miss, "LAT"] = pd.to_numeric(lat_vals, errors="coerce")
+            ap_map.loc[miss, "LNG"] = pd.to_numeric(lng_vals, errors="coerce")
+
     ap_map = ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]].dropna(subset=["APARTAMENTO", "ALMACEN"]).drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
