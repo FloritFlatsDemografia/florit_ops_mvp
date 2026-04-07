@@ -1100,13 +1100,14 @@ def main():
             return None, None
 
         miss = ap_map["LAT"].isna() | ap_map["LNG"].isna()
-        if miss.any():
-            loc_pairs = ap_map.loc[miss, "Localizacion"].apply(_split_loc)
-            lat_vals = [float("nan") if (p is None or p[0] is None) else p[0] for p in loc_pairs]
-            lng_vals = [float("nan") if (p is None or p[1] is None) else p[1] for p in loc_pairs]
-            ap_map.loc[miss, "LAT"] = pd.to_numeric(lat_vals, errors="coerce")
-             ap_map.loc[miss, "LNG"] = pd.to_numeric(lng_vals, errors="coerce")
-
+        
+    if miss.any():
+        loc_pairs = ap_map.loc[miss, "Localizacion"].apply(_split_loc)
+        lat_vals = [float("nan") if (p is None or p[0] is None) else p[0] for p in loc_pairs]
+        lng_vals = [float("nan") if (p is None or p[1] is None) else p[1] for p in loc_pairs]
+       ap_map.loc[miss, "LAT"] = pd.to_numeric(lat_vals, errors="coerce")
+       ap_map.loc[miss, "LNG"] = pd.to_numeric(lng_vals, errors="coerce")
+    
     ap_map = ap_map[["APARTAMENTO", "ALMACEN", "LAT", "LNG"]].dropna(subset=["APARTAMENTO", "ALMACEN"]).drop_duplicates()
     ap_map["APARTAMENTO"] = ap_map["APARTAMENTO"].astype(str).str.strip()
     ap_map["ALMACEN"] = ap_map["ALMACEN"].astype(str).str.strip()
