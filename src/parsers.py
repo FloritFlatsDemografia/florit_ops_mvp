@@ -20,6 +20,30 @@ def _normalize_column_name(name) -> str:
     return name
 
 
+def _dedupe_columns(columns) -> list[str]:
+    """
+    Garantiza nombres de columnas únicos.
+    """
+    result = []
+    seen = {}
+
+    for c in columns:
+        c = _normalize_column_name(c)
+
+        if not c or c.lower().startswith("unnamed:"):
+            c = "col"
+
+        if c in seen:
+            seen[c] += 1
+            c = f"{c}_{seen[c]}"
+        else:
+            seen[c] = 0
+
+        result.append(c)
+
+    return result
+
+
 def _rename_avantio_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
 
@@ -35,6 +59,9 @@ def _rename_avantio_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if rename_map:
         df = df.rename(columns=rename_map)
+
+    # Por si el renombrado crea duplicados
+    df.columns = _dedupe_columns(df.columns)
 
     return df
 
@@ -71,32 +98,16 @@ def _promote_header_row(df: pd.DataFrame, max_scan_rows: int = 40) -> pd.DataFra
             best_idx = i
 
     if best_idx is None or best_score < 4:
-        return df
+        return df.copy()
 
     new_header = [_normalize_column_name(v) for v in df.iloc[best_idx].tolist()]
-    data = df.iloc[best_idx + 1:].copy().reset_index(drop=True)
+    data = df.iloc[best_idx + 1 :].copy().reset_index(drop=True)
 
     n = min(len(new_header), data.shape[1])
     data = data.iloc[:, :n]
     new_header = new_header[:n]
 
-    clean_cols = []
-    seen = {}
-
-    for c in new_header:
-        c = _normalize_column_name(c)
-        if not c or c.lower().startswith("unnamed:"):
-            c = "col"
-
-        if c in seen:
-            seen[c] += 1
-            c = f"{c}_{seen[c]}"
-        else:
-            seen[c] = 0
-
-        clean_cols.append(c)
-
-    data.columns = clean_cols
+    data.columns = _dedupe_columns(new_header)
     return data
 
 
@@ -109,10 +120,6 @@ def _preview_df(df: pd.DataFrame, rows: int = 8) -> str:
 
 
 def _looks_like_avantio_calendar_view(df: pd.DataFrame) -> bool:
-    """
-    Detecta exportaciones tipo calendario/agenda:
-    Entradas + filas con días, pero sin columnas de reserva.
-    """
     try:
         preview = df.head(12).fillna("").astype(str).values.tolist()
         flat = " | ".join(" ".join(row) for row in preview).lower()
@@ -130,12 +137,53 @@ def _looks_like_avantio_calendar_view(df: pd.DataFrame) -> bool:
         return False
 
 
+def _coalesce_duplicate_base_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Si existen columnas duplicadas tipo:
+      Alojamiento, Alojamiento_1, Alojamiento_2
+    conserva una sola rellenando huecos de izquierda a derecha.
+    """
+    if df is None or df.empty:
+        return df
+
+    cols = list(df.columns)
+    base_map = {}
+
+    for c in cols:
+        base = re.sub(r"_\d+$", "", c)
+        base_map.setdefault(base, []).append(c)
+
+    out = df.copy()
+
+    for base, variants in base_map.items():
+        if len(variants) <= 1:
+            continue
+
+        series = None
+        for c in variants:
+            s = out[c]
+            if series is None:
+                series = s
+            else:
+                series = series.where(series.notna() & (series.astype(str).str.strip() != ""), s)
+
+        out[base] = series
+        to_drop = [c for c in variants if c != base]
+        out = out.drop(columns=to_drop, errors="ignore")
+
+    out.columns = _dedupe_columns(out.columns)
+    return out
+
+
 def _finalize_avantio_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         raise ValueError("Avantio: no se han podido leer datos (archivo vacío o formato no soportado).")
 
-    df.columns = [_normalize_column_name(c) for c in df.columns]
+    df = df.copy()
+    df.columns = _dedupe_columns(df.columns)
     df = _rename_avantio_columns(df)
+    df = _coalesce_duplicate_base_columns(df)
+    df.columns = _dedupe_columns(df.columns)
 
     detected = list(df.columns)
     missing = [c for c in REQUIRED_AVANTIO_COLS if c not in df.columns]
@@ -190,23 +238,41 @@ def _clean_avantio_html_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
         if t is None or t.empty:
             continue
 
-        t = t.dropna(how="all").reset_index(drop=True)
-        if t.empty:
+        try:
+            t = t.copy()
+            t = t.dropna(how="all").reset_index(drop=True)
+            if t.empty:
+                continue
+
+            # Asegurar columnas simples antes de operar
+            t.columns = _dedupe_columns(t.columns)
+
+            # Promover cabecera interna si existe
+            t = _promote_header_row(t)
+            if t is None or t.empty:
+                continue
+
+            t.columns = _dedupe_columns(t.columns)
+            t = _rename_avantio_columns(t)
+            t = _coalesce_duplicate_base_columns(t)
+            t.columns = _dedupe_columns(t.columns)
+
+            # quitar posibles filas-cabecera repetidas dentro del cuerpo
+            if "ID Reserva" in t.columns:
+                t = t[t["ID Reserva"].astype(str).str.strip().ne("ID Reserva")]
+
+            # filtrar solo si existe de verdad una columna única Alojamiento
+            if "Alojamiento" in t.columns:
+                aloj = t["Alojamiento"]
+                if isinstance(aloj, pd.Series):
+                    t = t[aloj.notna()].copy()
+
+            if not t.empty:
+                frames.append(t)
+
+        except Exception:
+            # si una tabla HTML concreta viene mal, la saltamos y seguimos
             continue
-
-        t = _promote_header_row(t)
-
-        if t is None or t.empty:
-            continue
-
-        t.columns = [_normalize_column_name(c) for c in t.columns]
-        t = _rename_avantio_columns(t)
-
-        if "Alojamiento" in t.columns:
-            t = t[t["Alojamiento"].notna()]
-
-        if not t.empty:
-            frames.append(t)
 
     if not frames:
         return pd.DataFrame()
@@ -217,6 +283,11 @@ def _clean_avantio_html_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
             df[c] = df[c].replace({"nan": None, "None": None, "": None})
+
+    df.columns = _dedupe_columns(df.columns)
+    df = _rename_avantio_columns(df)
+    df = _coalesce_duplicate_base_columns(df)
+    df.columns = _dedupe_columns(df.columns)
 
     return df
 
@@ -234,7 +305,10 @@ def _try_read_csv_with_sep(text: str, sep: str) -> pd.DataFrame | None:
             return None
 
         raw = raw.dropna(how="all").reset_index(drop=True)
+        raw.columns = _dedupe_columns(raw.columns)
+
         df = _promote_header_row(raw)
+        df.columns = _dedupe_columns(df.columns)
         return df
     except Exception:
         return None
@@ -274,7 +348,7 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
     name = getattr(uploaded_file, "name", "") or ""
     lower_name = name.lower()
 
-    # 1) SIEMPRE comprobar antes si el contenido es HTML, aunque el nombre termine en .csv
+    # 1) comprobar HTML antes que extensión
     if _is_html_bytes(b):
         try:
             tables = pd.read_html(BytesIO(b), header=None)
@@ -292,14 +366,14 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
     try:
         raw = pd.read_excel(BytesIO(b), header=None)
         raw = raw.dropna(how="all").reset_index(drop=True)
+        raw.columns = _dedupe_columns(raw.columns)
+
         df = _promote_header_row(raw)
-        df = _finalize_avantio_df(df)
-        return df
+        return _finalize_avantio_df(df)
     except Exception as e1:
         try:
             df = pd.read_excel(BytesIO(b))
-            df = _finalize_avantio_df(df)
-            return df
+            return _finalize_avantio_df(df)
         except Exception as e2:
             raise ValueError(
                 f"Avantio: error leyendo Excel. Intento1={e1} | Intento2={e2}"
@@ -322,7 +396,7 @@ def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    df.columns = [_normalize_column_name(c) for c in df.columns]
+    df.columns = _dedupe_columns(df.columns)
 
     col_ubic = None
     for c in df.columns:
