@@ -12,13 +12,117 @@ def _is_html_bytes(b: bytes) -> bool:
     return (b"<html" in head) or (b"rec-html40" in head) or (b"<table" in head)
 
 
+def _normalize_column_name(name: str) -> str:
+    if name is None:
+        return ""
+    name = str(name).replace("\ufeff", "").strip()
+    name = re.sub(r"\s+", " ", name)
+    return name
+
+
+def _header_score(values: list[str]) -> int:
+    normalized = [_normalize_column_name(v).lower() for v in values]
+    score = 0
+
+    wanted_exact = {
+        "alojamiento",
+        "fecha entrada hora",
+        "fecha salida hora",
+        "fecha entrada",
+        "fecha salida",
+        "id reserva",
+        "localizador",
+    }
+
+    for v in normalized:
+        if v in wanted_exact:
+            score += 2
+
+    joined = " | ".join(normalized)
+    if "alojamiento" in joined:
+        score += 2
+    if "fecha entrada" in joined:
+        score += 2
+    if "fecha salida" in joined:
+        score += 2
+
+    return score
+
+
+def _promote_header_row(df: pd.DataFrame, max_scan_rows: int = 30) -> pd.DataFrame:
+    """
+    Busca una fila interna que sea la cabecera real y la promueve.
+    Funciona para CSV/Excel con títulos previos como 'Entradas'.
+    """
+    if df is None or df.empty:
+        return df
+
+    best_idx = None
+    best_score = -1
+
+    scan_limit = min(len(df), max_scan_rows)
+
+    for i in range(scan_limit):
+        row_vals = df.iloc[i].astype(str).fillna("").tolist()
+        score = _header_score(row_vals)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx is None or best_score < 3:
+        return df
+
+    new_header = [_normalize_column_name(v) for v in df.iloc[best_idx].tolist()]
+    data = df.iloc[best_idx + 1:].copy().reset_index(drop=True)
+
+    n = min(len(new_header), data.shape[1])
+    data = data.iloc[:, :n]
+    new_header = new_header[:n]
+
+    clean_cols = []
+    seen = {}
+
+    for c in new_header:
+        c = _normalize_column_name(c)
+        if not c or c.lower().startswith("unnamed:"):
+            c = ""
+
+        base = c if c else "col"
+        if base in seen:
+            seen[base] += 1
+            final = f"{base}_{seen[base]}"
+        else:
+            seen[base] = 0
+            final = base
+
+        clean_cols.append(final)
+
+    data.columns = clean_cols
+    return data
+
+
+def _rename_avantio_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+
+    for c in df.columns:
+        lc = _normalize_column_name(c).lower()
+
+        if lc == "alojamiento":
+            rename_map[c] = "Alojamiento"
+        elif lc in ["fecha entrada hora", "fecha entrada", "entrada hora", "check in", "check-in"]:
+            rename_map[c] = "Fecha entrada hora"
+        elif lc in ["fecha salida hora", "fecha salida", "salida hora", "check out", "check-out"]:
+            rename_map[c] = "Fecha salida hora"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
+
+
 def _clean_avantio_html_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
     """
     Avantio exporta .xls que en realidad es HTML con muchas tablas.
-    Cada tabla suele tener:
-      fila 0: "Lunes, 2 Febrero 2026"
-      fila 1: cabecera real ("ID Reserva", "Localizador", "Alojamiento", ...)
-      filas 2..n: reservas
     """
     frames = []
 
@@ -30,34 +134,21 @@ def _clean_avantio_html_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
         if t.empty:
             continue
 
-        header_idx = None
-        for i in range(min(len(t), 15)):
-            row = t.iloc[i].astype(str).str.strip().tolist()
-            if any(x == "ID Reserva" for x in row) or any(x == "Alojamiento" for x in row):
-                header_idx = i
-                break
+        t = t.reset_index(drop=True)
+        t = _promote_header_row(t, max_scan_rows=20)
+        t.columns = [_normalize_column_name(c) for c in t.columns]
+        t = _rename_avantio_columns(t)
 
-        if header_idx is None:
+        if "Alojamiento" not in t.columns:
             continue
 
-        header = t.iloc[header_idx].astype(str).str.strip().tolist()
-        data = t.iloc[header_idx + 1:].copy()
+        if "ID Reserva" in t.columns:
+            t = t[t["ID Reserva"].astype(str).str.strip().ne("ID Reserva")]
 
-        if data.shape[1] != len(header):
-            n = min(data.shape[1], len(header))
-            data = data.iloc[:, :n]
-            header = header[:n]
+        t = t[t["Alojamiento"].notna()]
 
-        data.columns = header
-
-        if "ID Reserva" in data.columns:
-            data = data[data["ID Reserva"].astype(str).str.strip().ne("ID Reserva")]
-
-        if "Alojamiento" in data.columns:
-            data = data[data["Alojamiento"].notna()]
-
-        if not data.empty:
-            frames.append(data)
+        if not t.empty:
+            frames.append(t)
 
     if not frames:
         return pd.DataFrame()
@@ -72,103 +163,7 @@ def _clean_avantio_html_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
     return df
 
 
-def _normalize_column_name(name: str) -> str:
-    if name is None:
-        return ""
-    name = str(name).replace("\ufeff", "").strip()
-    name = re.sub(r"\s+", " ", name)
-    return name
-
-
-def _header_score(values: list[str]) -> int:
-    normalized = [_normalize_column_name(v).lower() for v in values]
-    score = 0
-
-    wanted = [
-        "alojamiento",
-        "fecha entrada hora",
-        "fecha salida hora",
-        "fecha entrada",
-        "fecha salida",
-        "id reserva",
-        "localizador",
-    ]
-
-    for w in wanted:
-        if w in normalized:
-            score += 1
-
-    return score
-
-
-def _promote_header_row(df: pd.DataFrame, max_scan_rows: int = 20) -> pd.DataFrame:
-    """
-    Busca si la cabecera real está dentro de las primeras filas del DataFrame,
-    típico en CSV exportados por Avantio con filas previas tipo 'Entradas'.
-    """
-    if df is None or df.empty:
-        return df
-
-    # si ya están las columnas correctas, no tocamos nada
-    current_cols = [_normalize_column_name(c) for c in df.columns]
-    if all(c in current_cols for c in REQUIRED_AVANTIO_COLS):
-        df.columns = current_cols
-        return df
-
-    best_idx = None
-    best_score = -1
-
-    scan_limit = min(len(df), max_scan_rows)
-
-    for i in range(scan_limit):
-        row_vals = df.iloc[i].astype(str).fillna("").tolist()
-        score = _header_score(row_vals)
-
-        if score > best_score:
-            best_score = score
-            best_idx = i
-
-    # exigimos una puntuación mínima para evitar falsos positivos
-    if best_idx is None or best_score < 2:
-        df.columns = current_cols
-        return df
-
-    new_header = [_normalize_column_name(v) for v in df.iloc[best_idx].tolist()]
-    data = df.iloc[best_idx + 1:].copy().reset_index(drop=True)
-
-    # ajustar número de columnas
-    n = min(len(new_header), data.shape[1])
-    data = data.iloc[:, :n]
-    new_header = new_header[:n]
-
-    data.columns = new_header
-
-    # eliminar columnas vacías/unnamed duplicadas
-    cleaned_cols = []
-    seen = {}
-    for c in data.columns:
-        c = _normalize_column_name(c)
-        if not c or c.lower().startswith("unnamed:"):
-            c = ""
-        if c in seen:
-            seen[c] += 1
-            c = f"{c}_{seen[c]}" if c else f"col_{seen[c]}"
-        else:
-            seen[c] = 0
-            c = c if c else "col_0"
-        cleaned_cols.append(c)
-
-    data.columns = cleaned_cols
-    return data
-
-
-def _try_read_csv_with_options(text: str, encoding_used: str) -> pd.DataFrame | None:
-    """
-    Intenta leer CSV de forma robusta:
-    - autodetección de separador
-    - fallback a separadores frecuentes
-    - tolerancia a filas defectuosas
-    """
+def _try_read_csv_with_options(text: str) -> pd.DataFrame | None:
     candidates = []
 
     try:
@@ -184,17 +179,23 @@ def _try_read_csv_with_options(text: str, encoding_used: str) -> pd.DataFrame | 
 
     for sep in candidates:
         try:
-            df = pd.read_csv(
+            # OJO: header=None es la clave
+            raw = pd.read_csv(
                 StringIO(text),
                 sep=sep,
                 engine="python",
                 on_bad_lines="skip",
+                header=None,
             )
 
-            df = _promote_header_row(df)
-            df.columns = [_normalize_column_name(c) for c in df.columns]
+            if raw is None or raw.empty:
+                continue
 
-            if df is not None and not df.empty and len(df.columns) >= 2:
+            df = _promote_header_row(raw, max_scan_rows=30)
+            df.columns = [_normalize_column_name(c) for c in df.columns]
+            df = _rename_avantio_columns(df)
+
+            if len(df.columns) >= 2:
                 return df
 
         except Exception:
@@ -212,7 +213,7 @@ def _read_csv_robust(b: bytes) -> pd.DataFrame:
         except UnicodeDecodeError:
             continue
 
-        df = _try_read_csv_with_options(text, enc)
+        df = _try_read_csv_with_options(text)
         if df is not None and not df.empty:
             return df
 
@@ -240,16 +241,18 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
 
     elif _is_html_bytes(b):
         try:
-            tables = pd.read_html(BytesIO(b))
+            tables = pd.read_html(BytesIO(b), header=None)
             df = _clean_avantio_html_tables(tables)
         except Exception as e:
             raise ValueError(f"Avantio: error leyendo .xls HTML: {e}") from e
 
     else:
         try:
-            # leemos sin asumir cabecera correcta para poder promoverla si hace falta
-            df = pd.read_excel(BytesIO(b))
-            df = _promote_header_row(df)
+            # OJO: header=None es la clave también aquí
+            raw = pd.read_excel(BytesIO(b), header=None)
+            df = _promote_header_row(raw, max_scan_rows=30)
+            df.columns = [_normalize_column_name(c) for c in df.columns]
+            df = _rename_avantio_columns(df)
         except Exception as e:
             raise ValueError(f"Avantio: error leyendo Excel: {e}") from e
 
@@ -257,20 +260,7 @@ def parse_avantio_entradas(uploaded_file) -> pd.DataFrame:
         raise ValueError("Avantio: no se han podido leer datos (archivo vacío o formato no soportado).")
 
     df.columns = [_normalize_column_name(c) for c in df.columns]
-
-    rename_map = {}
-    for c in df.columns:
-        lc = c.lower()
-
-        if lc == "alojamiento":
-            rename_map[c] = "Alojamiento"
-        elif lc in ["fecha entrada hora", "fecha entrada", "entrada hora", "check in", "check-in"]:
-            rename_map[c] = "Fecha entrada hora"
-        elif lc in ["fecha salida hora", "fecha salida", "salida hora", "check out", "check-out"]:
-            rename_map[c] = "Fecha salida hora"
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    df = _rename_avantio_columns(df)
 
     detected = list(df.columns)
     missing = [c for c in REQUIRED_AVANTIO_COLS if c not in df.columns]
@@ -320,9 +310,9 @@ def parse_odoo_stock(uploaded_file) -> pd.DataFrame:
 
     if name.lower().endswith(".csv"):
         try:
-            df = _read_csv_robust(b)
-        except Exception:
             df = pd.read_csv(BytesIO(b))
+        except Exception:
+            df = _read_csv_robust(b)
     else:
         df = pd.read_excel(BytesIO(b))
 
